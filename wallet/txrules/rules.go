@@ -6,6 +6,8 @@
 package txrules
 
 import (
+	"math/big"
+
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
@@ -85,9 +87,11 @@ func CheckOutput(output *wire.TxOut, relayFeePerKb dcrutil.Amount) error {
 		if output.SKAValue == nil || output.SKAValue.Sign() < 0 {
 			return errors.E(errors.Invalid, "SKA transaction output amount is nil or negative")
 		}
-		// SKA max amount check would be against chain params, but for now
-		// we trust the emission limits configured in the chain params.
-		// Dust check is skipped for SKA as it uses different economics.
+		// Minimum 30 atoms for SKA outputs (matches mempool dust threshold)
+		minSKAAmount := big.NewInt(30)
+		if output.SKAValue.Cmp(minSKAAmount) < 0 {
+			return errors.E(errors.Policy, "SKA transaction output amount below minimum (30 atoms)")
+		}
 		return nil
 	}
 
