@@ -5,81 +5,71 @@
 package txrules
 
 import (
+	"math/big"
 	"testing"
 
-	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/wire"
 )
 
-// TestFeeForSerializeSizeWithChainParams tests the new coin-type-aware fee calculation.
-func TestFeeForSerializeSizeWithChainParams(t *testing.T) {
-	// Test parameters similar to simnet
-	chainParams := &chaincfg.Params{
-		SKAMinRelayTxFee: 1000, // 1000 atoms/KB for SKA (lower than VAR)
-	}
-
-	varRelayFee := dcrutil.Amount(10000) // 10000 atoms/KB for VAR
-	txSize := 250                        // 250 byte transaction
+// TestFeeForSerializeSizeSKA tests SKA fee calculation with big.Int.
+func TestFeeForSerializeSizeSKA(t *testing.T) {
+	txSize := 250 // 250 byte transaction
 
 	tests := []struct {
 		name        string
-		coinType    cointype.CoinType
-		expectedFee dcrutil.Amount
-		description string
+		feePerKb    *big.Int
+		expectedFee *big.Int
 	}{
 		{
-			name:        "VAR transaction fee",
-			coinType:    cointype.CoinTypeVAR,
-			expectedFee: varRelayFee * dcrutil.Amount(txSize) / 1000, // 2500 atoms
-			description: "VAR transactions should use provided relay fee rate",
+			name:        "Small SKA fee rate",
+			feePerKb:    big.NewInt(1000), // 1000 atoms/KB
+			expectedFee: big.NewInt(250),  // 1000 * 250 / 1000 = 250
 		},
 		{
-			name:        "SKA transaction fee",
-			coinType:    cointype.CoinType(1),
-			expectedFee: 1000 * dcrutil.Amount(txSize) / 1000, // 250 atoms
-			description: "SKA transactions should use chain-specific fee rate",
+			name:        "Large SKA fee rate (4 SKA/KB)",
+			feePerKb:    big.NewInt(4000000000000000000), // 4e18 atoms/KB
+			expectedFee: big.NewInt(1000000000000000000), // 4e18 * 250 / 1000 = 1e18
 		},
 		{
-			name:        "Unknown coin type",
-			coinType:    cointype.CoinType(99),
-			expectedFee: 1000 * dcrutil.Amount(txSize) / 1000, // 250 atoms (uses SKA rate)
-			description: "Unknown coin types should use SKA fee rate",
+			name:        "Zero size returns min fee",
+			feePerKb:    big.NewInt(1000),
+			expectedFee: big.NewInt(1000), // Returns feePerKb for tiny transactions
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			actualFee := FeeForSerializeSizeWithChainParams(varRelayFee, txSize, test.coinType, chainParams)
+			skaFeePerKb := cointype.NewSKAAmount(test.feePerKb)
 
-			if actualFee != test.expectedFee {
-				t.Errorf("%s: expected fee %d atoms, got %d atoms",
-					test.description, test.expectedFee, actualFee)
+			// For zero size test, use 0
+			size := txSize
+			if test.name == "Zero size returns min fee" {
+				size = 0
 			}
 
-			t.Logf("%s: calculated fee %d atoms for %d byte transaction",
-				test.name, actualFee, txSize)
+			actualFee := FeeForSerializeSizeSKA(skaFeePerKb, size)
+
+			if actualFee.BigInt().Cmp(test.expectedFee) != 0 {
+				t.Errorf("Expected fee %s, got %s", test.expectedFee.String(), actualFee.BigInt().String())
+			}
+
+			t.Logf("%s: fee = %s atoms", test.name, actualFee.BigInt().String())
 		})
 	}
 }
 
-// TestFeeForSerializeSizeWithChainParamsNoSKAFee tests fallback behavior when no SKA fee is configured.
-func TestFeeForSerializeSizeWithChainParamsNoSKAFee(t *testing.T) {
-	// Test parameters with no SKA fee configured
-	chainParams := &chaincfg.Params{
-		SKAMinRelayTxFee: 0, // No SKA fee configured
-	}
+// TestFeeForSerializeSizeVAR tests VAR fee calculation (int64-based).
+func TestFeeForSerializeSizeVAR(t *testing.T) {
+	varRelayFee := dcrutil.Amount(10000) // 10000 atoms/KB
+	txSize := 250                        // 250 byte transaction
 
-	varRelayFee := dcrutil.Amount(10000)
-	txSize := 250
-	expectedFee := varRelayFee * dcrutil.Amount(txSize) / 1000 // Should fallback to VAR fee
-
-	actualFee := FeeForSerializeSizeWithChainParams(varRelayFee, txSize, cointype.CoinType(1), chainParams)
+	actualFee := FeeForSerializeSize(varRelayFee, txSize)
+	expectedFee := dcrutil.Amount(2500) // 10000 * 250 / 1000 = 2500
 
 	if actualFee != expectedFee {
-		t.Errorf("SKA transaction with no configured fee should fallback to VAR fee: expected %d, got %d",
-			expectedFee, actualFee)
+		t.Errorf("VAR fee: expected %d, got %d", expectedFee, actualFee)
 	}
 }
 

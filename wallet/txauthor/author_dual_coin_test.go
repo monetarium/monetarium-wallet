@@ -82,7 +82,7 @@ func TestVARTransactionCreation(t *testing.T) {
 	varUnspents := p2pkhOutputsWithCoinType(cointype.CoinTypeVAR, 1e8)
 	varOutputs := p2pkhOutputsWithCoinType(cointype.CoinTypeVAR, 1e6)
 
-	relayFee := dcrutil.Amount(1e3)
+	relayFee := cointype.SKAAmountFromInt64(1e3)
 	inputSource := makeInputSourceWithCoinType(varUnspents)
 	changeSource := AuthorTestChangeSource{}
 
@@ -93,7 +93,8 @@ func TestVARTransactionCreation(t *testing.T) {
 	}
 
 	// Verify transaction has fee (VAR transactions should have fees)
-	expectedFee := txrules.FeeForSerializeSize(relayFee,
+	relayFeeInt64, _ := relayFee.Int64()
+	expectedFee := txrules.FeeForSerializeSize(dcrutil.Amount(relayFeeInt64),
 		txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, varOutputs, txsizes.P2PKHPkScriptSize))
 
 	if authoredTx.TotalInput < dcrutil.Amount(1e6)+expectedFee {
@@ -127,7 +128,7 @@ func TestSKATransactionCreation(t *testing.T) {
 			skaUnspents := p2pkhOutputsWithCoinType(coinType, inputAmount)
 			skaOutputs := p2pkhOutputsWithCoinType(coinType, outputAmount)
 
-			relayFee := dcrutil.Amount(1e3) // Should be used for regular SKA transactions
+			relayFee := cointype.SKAAmountFromInt64(1e3) // Should be used for regular SKA transactions
 			inputSource := makeInputSourceWithCoinType(skaUnspents)
 			changeSource := AuthorTestChangeSource{}
 
@@ -138,7 +139,8 @@ func TestSKATransactionCreation(t *testing.T) {
 			}
 
 			// Verify transaction has fees (regular SKA transactions should include fees)
-			expectedFee := txrules.FeeForSerializeSize(relayFee,
+			relayFeeInt64, _ := relayFee.Int64()
+			expectedFee := txrules.FeeForSerializeSize(dcrutil.Amount(relayFeeInt64),
 				txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, skaOutputs, txsizes.P2PKHPkScriptSize))
 
 			if authoredTx.TotalInput < outputAmount+expectedFee {
@@ -169,7 +171,7 @@ func TestMixedCoinRejection(t *testing.T) {
 	unspents := p2pkhOutputsWithCoinType(cointype.CoinTypeVAR, 2e6)
 	inputSource := makeInputSourceWithCoinType(unspents)
 	changeSource := AuthorTestChangeSource{}
-	relayFee := dcrutil.Amount(1e3)
+	relayFee := cointype.SKAAmountFromInt64(1e3)
 
 	// This should work in txauthor (validation happens at higher level)
 	_, err := txauthor.NewUnsignedTransaction(mixedOutputs, relayFee, inputSource, changeSource, 100000)
@@ -198,7 +200,7 @@ func TestDualCoinChangeOutput(t *testing.T) {
 			unspents := p2pkhOutputsWithCoinType(tc.coinType, 1e8) // Large input
 			outputs := p2pkhOutputsWithCoinType(tc.coinType, 1e6)  // Small output
 
-			relayFee := dcrutil.Amount(1e3)
+			relayFee := cointype.SKAAmountFromInt64(1e3)
 			// Both VAR and SKA transactions have fees (except emission transactions)
 
 			inputSource := makeInputSourceWithCoinType(unspents)
@@ -247,7 +249,7 @@ func TestEmptyOutputsHandling(t *testing.T) {
 
 	inputSource := makeInputSourceWithCoinType(unspents)
 	changeSource := AuthorTestChangeSource{}
-	relayFee := dcrutil.Amount(1e3)
+	relayFee := cointype.SKAAmountFromInt64(1e3)
 
 	_, err := txauthor.NewUnsignedTransaction(emptyOutputs, relayFee, inputSource, changeSource, 100000)
 	// Note: Empty outputs might be allowed at txauthor level - validation happens elsewhere

@@ -5,14 +5,15 @@
 package wallet
 
 import (
+	"math/big"
 	"testing"
 
-	"github.com/monetarium/monetarium-wallet/wallet/txrules"
-	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/chaincfg"
+	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 )
 
 // TestEmissionVsRegularSKATransactions verifies that the wallet correctly distinguishes
@@ -20,9 +21,15 @@ import (
 func TestEmissionVsRegularSKATransactions(t *testing.T) {
 	t.Log("=== VERIFICATION: Emission vs Regular SKA Transaction Handling ===")
 
-	// Test parameters
+	// Test parameters with per-coin fee configuration
 	chainParams := &chaincfg.Params{
-		SKAMinRelayTxFee: 1000, // 1000 atoms/KB for SKA
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			1: {
+				Active:           true,
+				MinRelayTxFee:    big.NewInt(1000), // 1000 atoms/KB for SKA
+				MaxFeeMultiplier: 2500,
+			},
+		},
 	}
 
 	t.Log("Testing two types of SKA transactions:")
@@ -45,8 +52,10 @@ func TestEmissionVsRegularSKATransactions(t *testing.T) {
 		if coinType == cointype.CoinTypeVAR {
 			feeRate = 10000 // VAR relay fee
 		} else {
-			if chainParams.SKAMinRelayTxFee > 0 {
-				feeRate = dcrutil.Amount(chainParams.SKAMinRelayTxFee)
+			// Look up per-coin config
+			if config, ok := chainParams.SKACoins[coinType]; ok &&
+				config.MinRelayTxFee != nil && config.MinRelayTxFee.Sign() > 0 {
+				feeRate = dcrutil.Amount(config.MinRelayTxFee.Int64())
 			} else {
 				feeRate = 10000 // Fallback
 			}
@@ -120,7 +129,7 @@ func TestEmissionVsRegularSKATransactions(t *testing.T) {
 
 		t.Log("Regular SKA Transaction Flow:")
 		t.Log("  sendtoaddress → sendPairsWithCoinType → makeOutputsWithCoinType → SendOutputs")
-		t.Log("  └── Fee calculation: Uses chainParams.SKAMinRelayTxFee")
+		t.Log("  └── Fee calculation: Uses per-coin SKACoinConfig.MinRelayTxFee")
 
 		t.Log("Emission SKA Transaction Flow:")
 		t.Log("  createauthorizedemission → createAuthorizedSKAEmissionTransaction")

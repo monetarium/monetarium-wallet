@@ -3418,19 +3418,27 @@ func (s *Server) getWalletFee(ctx context.Context, icmd any) (any, error) {
 	}
 
 	// Default to VAR (coin type 0) if not specified
-	coinType := cointype.CoinType(0)
+	ct := cointype.CoinType(0)
 	if cmd.CoinType != nil {
-		coinType = cointype.CoinType(*cmd.CoinType)
+		ct = cointype.CoinType(*cmd.CoinType)
 	}
 
 	// Get effective fee with source indication
-	fee, source, err := w.GetEffectiveFee(ctx, coinType)
+	fee, source, err := w.GetEffectiveFee(ctx, ct)
 	if err != nil {
 		return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
 	}
 
+	// Get atoms per coin for this coin type
+	var atomsPerCoin *big.Int
+	if ct == cointype.CoinTypeVAR {
+		atomsPerCoin = big.NewInt(int64(cointype.AtomsPerVAR))
+	} else {
+		atomsPerCoin = cointype.GetAtomsPerSKACoin()
+	}
+
 	return &types.GetWalletFeeResult{
-		Fee:    fee.ToCoin(),
+		Fee:    fee.ToDecimalString(atomsPerCoin),
 		Source: source,
 	}, nil
 }
@@ -5160,7 +5168,9 @@ func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 	}
 	defer secretsSource.Close()
 
-	atx, err := txauthor.NewUnsignedTransaction(outputs, w.RelayFee(),
+	// Convert VAR relay fee to SKAAmount for NewUnsignedTransaction
+	relayFeeSKA := cointype.SKAAmountFromInt64(int64(w.RelayFee()))
+	atx, err := txauthor.NewUnsignedTransaction(outputs, relayFeeSKA,
 		inputSource, changeSource, params.MaxTxSize)
 	if err != nil {
 		return nil, err
@@ -5693,31 +5703,41 @@ func (s *Server) setTxFee(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
-	// Check that amount is not negative.
-	if cmd.Amount < 0 {
-		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative amount")
+	// Default to VAR (coin type 0) if not specified
+	ct := cointype.CoinType(0)
+	if cmd.CoinType != nil {
+		ct = cointype.CoinType(*cmd.CoinType)
 	}
 
-	relayFee, err := dcrutil.NewAmount(cmd.Amount)
+	// Get atoms per coin for this coin type
+	var atomsPerCoin *big.Int
+	if ct == cointype.CoinTypeVAR {
+		atomsPerCoin = big.NewInt(int64(cointype.AtomsPerVAR))
+	} else {
+		atomsPerCoin = cointype.GetAtomsPerSKACoin()
+	}
+
+	// Parse amount from interface{} (can be float64 or string)
+	feeAtoms, err := coinsToAtomsBig(cmd.Amount, atomsPerCoin)
 	if err != nil {
 		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
 	}
 
-	// Default to VAR (coin type 0) if not specified
-	coinType := cointype.CoinType(0)
-	if cmd.CoinType != nil {
-		coinType = cointype.CoinType(*cmd.CoinType)
+	// Check for negative amount
+	if feeAtoms.Sign() < 0 {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative amount")
 	}
 
 	// If amount is 0, clear manual override to use RPC dynamic fees
-	if cmd.Amount == 0 {
-		w.ClearManualFee(coinType)
+	if feeAtoms.Sign() == 0 {
+		w.ClearManualFee(ct)
 		// A boolean true result is returned upon success.
 		return true, nil
 	}
 
 	// Set manual fee override for the specified coin type
-	w.SetManualFee(coinType, relayFee)
+	relayFee := cointype.NewSKAAmount(feeAtoms)
+	w.SetManualFee(ct, relayFee)
 
 	// A boolean true result is returned upon success.
 	return true, nil

@@ -1207,13 +1207,14 @@ func NewSetTSpendPolicyCmd(hash string, policy string, ticket *string) *SetTSpen
 
 // SetTxFeeCmd defines the settxfee JSON-RPC command.
 type SetTxFeeCmd struct {
-	Amount   float64 // In DCR
-	CoinType *int    `jsonrpcdefault:"0"`
+	// Amount in coins as string (supports big.Int precision for SKA).
+	Amount   string
+	CoinType *int `jsonrpcdefault:"0"`
 }
 
 // NewSetTxFeeCmd returns a new instance which can be used to issue a settxfee
 // JSON-RPC command.
-func NewSetTxFeeCmd(amount float64) *SetTxFeeCmd {
+func NewSetTxFeeCmd(amount string) *SetTxFeeCmd {
 	return &SetTxFeeCmd{
 		Amount: amount,
 	}
@@ -1221,7 +1222,7 @@ func NewSetTxFeeCmd(amount float64) *SetTxFeeCmd {
 
 // NewSetTxFeeCmdWithCoinType returns a new instance which can be used to issue a
 // settxfee JSON-RPC command with a specific coin type.
-func NewSetTxFeeCmdWithCoinType(amount float64, coinType int) *SetTxFeeCmd {
+func NewSetTxFeeCmdWithCoinType(amount string, coinType int) *SetTxFeeCmd {
 	return &SetTxFeeCmd{
 		Amount:   amount,
 		CoinType: &coinType,

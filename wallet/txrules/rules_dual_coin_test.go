@@ -349,7 +349,7 @@ func TestBackwardCompatibility(t *testing.T) {
 
 // TestCheckOutputSKAMinimum tests the 30-atom minimum for SKA outputs
 func TestCheckOutputSKAMinimum(t *testing.T) {
-	relayFeePerKb := dcrutil.Amount(1e4)
+	relayFeePerKb := cointype.SKAAmountFromInt64(1e4)
 	pkScript := make([]byte, 25) // P2PKH script
 
 	testCases := []struct {

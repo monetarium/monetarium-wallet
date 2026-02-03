@@ -5,21 +5,28 @@
 package wallet
 
 import (
+	"math/big"
 	"testing"
 
-	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 )
 
 // TestSendOutputsFeeCalculation tests that SendOutputs now calculates fees correctly
 // for different coin types instead of using fixed VAR fees.
 func TestSendOutputsFeeCalculation(t *testing.T) {
-	// Test parameters similar to simnet
+	// Test parameters similar to simnet with per-coin fee configuration
 	chainParams := &chaincfg.Params{
-		SKAMinRelayTxFee: 1000, // 1000 atoms/KB for SKA (lower than VAR)
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			1: {
+				Active:           true,
+				MinRelayTxFee:    big.NewInt(1000), // 1000 atoms/KB for SKA (lower than VAR)
+				MaxFeeMultiplier: 2500,
+			},
+		},
 	}
 
 	varRelayFee := dcrutil.Amount(10000) // 10000 atoms/KB for VAR
@@ -88,8 +95,10 @@ func TestSendOutputsFeeCalculation(t *testing.T) {
 			if detectedCoinType == cointype.CoinTypeVAR {
 				calculatedFeeRate = varRelayFee
 			} else {
-				if chainParams.SKAMinRelayTxFee > 0 {
-					calculatedFeeRate = dcrutil.Amount(chainParams.SKAMinRelayTxFee)
+				// Look up per-coin config
+				if config, ok := chainParams.SKACoins[detectedCoinType]; ok &&
+					config.MinRelayTxFee != nil && config.MinRelayTxFee.Sign() > 0 {
+					calculatedFeeRate = dcrutil.Amount(config.MinRelayTxFee.Int64())
 				} else {
 					calculatedFeeRate = varRelayFee
 				}
@@ -110,7 +119,13 @@ func TestSendOutputsFeeCalculation(t *testing.T) {
 // and won't fail with "insufficient fee" errors like they did before.
 func TestSKATransactionNoLongerFails(t *testing.T) {
 	chainParams := &chaincfg.Params{
-		SKAMinRelayTxFee: 1000, // SKA has lower fees than VAR
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			1: {
+				Active:           true,
+				MinRelayTxFee:    big.NewInt(1000), // SKA has lower fees than VAR
+				MaxFeeMultiplier: 2500,
+			},
+		},
 	}
 
 	// Create SKA transaction outputs
@@ -125,8 +140,10 @@ func TestSKATransactionNoLongerFails(t *testing.T) {
 	if coinType == cointype.CoinTypeVAR {
 		feeRate = dcrutil.Amount(10000) // VAR relay fee
 	} else {
-		if chainParams.SKAMinRelayTxFee > 0 {
-			feeRate = dcrutil.Amount(chainParams.SKAMinRelayTxFee)
+		// Look up per-coin config
+		if config, ok := chainParams.SKACoins[coinType]; ok &&
+			config.MinRelayTxFee != nil && config.MinRelayTxFee.Sign() > 0 {
+			feeRate = dcrutil.Amount(config.MinRelayTxFee.Int64())
 		} else {
 			feeRate = dcrutil.Amount(10000) // Fallback
 		}
@@ -159,7 +176,13 @@ func TestFixVerifiesOriginalProblem(t *testing.T) {
 	// After: Proper fee calculation based on chain parameters
 
 	chainParams := &chaincfg.Params{
-		SKAMinRelayTxFee: 1000, // simnet: 1000 atoms/KB
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			1: {
+				Active:           true,
+				MinRelayTxFee:    big.NewInt(1000), // simnet: 1000 atoms/KB
+				MaxFeeMultiplier: 2500,
+			},
+		},
 	}
 
 	// Simulate the sendtoaddress flow:
@@ -172,7 +195,8 @@ func TestFixVerifiesOriginalProblem(t *testing.T) {
 
 	// What SendOutputs does now:
 	coinType := txrules.GetCoinTypeFromOutputs(skaOutputs)
-	feeRate := dcrutil.Amount(chainParams.SKAMinRelayTxFee)
+	config := chainParams.SKACoins[coinType]
+	feeRate := dcrutil.Amount(config.MinRelayTxFee.Int64())
 
 	// Calculate fee for a typical transaction size
 	txSize := 300 // bytes (more realistic size for a transaction with inputs/outputs)

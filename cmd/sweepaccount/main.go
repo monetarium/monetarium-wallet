@@ -393,6 +393,8 @@ func sweep(ctx context.Context) error {
 	if err != nil {
 		return errContext(err, "invalid fee rate")
 	}
+	// Convert feeRate to SKAAmount for NewUnsignedTransaction (VAR-only tool)
+	feeRateSKA := cointype.SKAAmountFromInt64(int64(feeRate))
 	for _, previousOutputs := range sourceOutputs {
 		inputSource := makeInputSource(previousOutputs)
 
@@ -406,7 +408,7 @@ func sweep(ctx context.Context) error {
 				accountName: opts.DestinationAccount,
 				rpcClient:   rpcClient,
 			}
-			atx, err = txauthor.NewUnsignedTransaction(nil, feeRate,
+			atx, err = txauthor.NewUnsignedTransaction(nil, feeRateSKA,
 				inputSource, destinationSourceToAccount, activeNet.MaxTxSize)
 		}
 
@@ -414,7 +416,7 @@ func sweep(ctx context.Context) error {
 			destinationSourceToAddress = &destinationScriptSourceToAddress{
 				address: opts.DestinationAddress,
 			}
-			atx, err = txauthor.NewUnsignedTransaction(nil, feeRate,
+			atx, err = txauthor.NewUnsignedTransaction(nil, feeRateSKA,
 				inputSource, destinationSourceToAddress, activeNet.MaxTxSize)
 		}
 

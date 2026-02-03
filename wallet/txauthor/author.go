@@ -102,7 +102,7 @@ func sumSKAOutputValues(outputs []*wire.TxOut) cointype.SKAAmount {
 // output scripts are returned.  If the input source was unable to provide
 // enough input value to pay for every output any necessary fees, an
 // InputSourceError is returned.
-func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
+func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmount,
 	fetchInputs InputSource, fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
 
 	const op errors.Op = "txauthor.NewUnsignedTransaction"
@@ -130,9 +130,9 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 		maxSignedSize = txsizes.EstimateSerializeSize(scriptSizes, outputs, changeScriptSize)
 	}
 
-	// Calculate initial fee for transaction size estimation
+	// Calculate initial fee for transaction size estimation using SKAAmount (big.Int)
 	// SKA emission transactions have zero fees, all other transactions use normal fees
-	targetFee := txrules.FeeForSerializeSize(relayFeePerKb, maxSignedSize)
+	targetFeeSKA := txrules.FeeForSerializeSizeSKA(relayFeePerKb, maxSignedSize)
 
 	// Check if this is an SKA emission transaction (need to create temp tx to check)
 	tempTx := &wire.MsgTx{
@@ -141,7 +141,14 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 		TxOut:   outputs,
 	}
 	if wire.IsSKAEmissionTransaction(tempTx) {
-		targetFee = 0 // SKA emission transactions have zero fees
+		targetFeeSKA = cointype.Zero() // SKA emission transactions have zero fees
+	}
+
+	// Convert to dcrutil.Amount for VAR compatibility (VAR fees always fit in int64)
+	targetFee := dcrutil.Amount(0)
+	if !isSKA {
+		targetFeeInt64, _ := targetFeeSKA.Int64()
+		targetFee = dcrutil.Amount(targetFeeInt64)
 	}
 
 	for {
@@ -161,8 +168,8 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 
 		// Check if we have sufficient balance
 		if isSKA {
-			// For SKA, compare using big.Int
-			targetWithFee := targetSKAAmount.Add(cointype.SKAAmountFromInt64(int64(targetFee)))
+			// For SKA, compare using big.Int (SKAAmount)
+			targetWithFee := targetSKAAmount.Add(targetFeeSKA)
 			if inputDetail.SKAAmount.Cmp(targetWithFee) < 0 {
 				return nil, errors.E(op, errors.InsufficientBalance)
 			}
@@ -181,7 +188,7 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 			maxSignedSize = txsizes.EstimateSerializeSize(scriptSizes, outputs, changeScriptSize)
 		}
 
-		// Calculate fee based on actual transaction size
+		// Calculate fee based on actual transaction size using SKAAmount (big.Int)
 		// Check if this is an SKA emission transaction for final fee calculation
 		tempTxWithInputs := &wire.MsgTx{
 			SerType: wire.TxSerializeFull,
@@ -189,17 +196,20 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 			TxIn:    inputDetail.Inputs,
 			TxOut:   outputs,
 		}
-		maxRequiredFee := txrules.FeeForSerializeSize(relayFeePerKb, maxSignedSize)
+		maxRequiredFeeSKA := txrules.FeeForSerializeSizeSKA(relayFeePerKb, maxSignedSize)
 		if wire.IsSKAEmissionTransaction(tempTxWithInputs) {
-			maxRequiredFee = 0 // SKA emission transactions have zero fees
+			maxRequiredFeeSKA = cointype.Zero() // SKA emission transactions have zero fees
 		}
+
+		// Convert SKAAmount fee to dcrutil.Amount for VAR transactions
+		maxRequiredFeeInt64, _ := maxRequiredFeeSKA.Int64()
+		maxRequiredFee := dcrutil.Amount(maxRequiredFeeInt64)
 
 		// Check remaining amount covers fees
 		if isSKA {
 			remainingSKA := inputDetail.SKAAmount.Sub(targetSKAAmount)
-			requiredFee := cointype.SKAAmountFromInt64(int64(maxRequiredFee))
-			if remainingSKA.Cmp(requiredFee) < 0 {
-				targetFee = maxRequiredFee
+			if remainingSKA.Cmp(maxRequiredFeeSKA) < 0 {
+				targetFeeSKA = maxRequiredFeeSKA
 				continue
 			}
 		} else {
@@ -228,22 +238,22 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb dcrutil.Amount,
 		var changeAmount dcrutil.Amount
 		var changeSKAAmount cointype.SKAAmount
 		if isSKA {
-			changeSKAAmount = inputDetail.SKAAmount.Sub(targetSKAAmount).Sub(
-				cointype.SKAAmountFromInt64(int64(maxRequiredFee)))
+			// SKA: use SKAAmount (big.Int) for full precision
+			changeSKAAmount = inputDetail.SKAAmount.Sub(targetSKAAmount).Sub(maxRequiredFeeSKA)
 		} else {
+			// VAR: use dcrutil.Amount (int64)
 			changeAmount = inputDetail.Amount - targetAmount - maxRequiredFee
 		}
-
-		// For dust amount check, use the same fee rate as transaction
-		dustFeeRate := relayFeePerKb
 
 		// Check if change output should be added
 		var hasChange bool
 		if isSKA {
-			// For SKA, skip dust check (different economics) - just check if non-zero
-			hasChange = !changeSKAAmount.IsZero() && !changeSKAAmount.IsNegative()
+			// For SKA, minimum 30 atoms to avoid dust (28 atoms is minimal transfer fee)
+			hasChange = !changeSKAAmount.IsNegative() && changeSKAAmount.BigInt().Cmp(cointype.MinSKADustAmount) >= 0
 		} else {
-			hasChange = changeAmount != 0 && !txrules.IsDustAmount(changeAmount, changeScriptSize, dustFeeRate)
+			// For VAR, use dust check with fee rate converted to dcrutil.Amount
+			dustFeeRateInt64, _ := relayFeePerKb.Int64()
+			hasChange = changeAmount != 0 && !txrules.IsDustAmount(changeAmount, changeScriptSize, dcrutil.Amount(dustFeeRateInt64))
 		}
 
 		if hasChange {

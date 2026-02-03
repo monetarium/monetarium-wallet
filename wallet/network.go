@@ -31,13 +31,14 @@ type FilterProof = struct {
 }
 
 // FeeEstimates contains dynamic fee estimation data from the network backend.
+// Fee fields are strings to support big.Int precision for SKA coins.
 type FeeEstimates struct {
 	CoinType             uint8
-	MinRelayFee          float64
+	MinRelayFee          string  // Atoms as string (supports big.Int for SKA)
 	DynamicFeeMultiplier float64
-	NormalFee            float64
-	FastFee              float64
-	SlowFee              float64
+	NormalFee            string // Atoms as string (supports big.Int for SKA)
+	FastFee              string // Atoms as string (supports big.Int for SKA)
+	SlowFee              string // Atoms as string (supports big.Int for SKA)
 }
 
 // NetworkBackend provides wallets with Decred network functionality.  Some

@@ -518,14 +518,15 @@ func (r *RPC) GetConfirmationHeight(ctx context.Context, txHash *chainhash.Hash)
 	return grt.BlockHeight, nil
 }
 
-// FeeEstimates contains dynamic fee estimation data from dcrd
+// FeeEstimates contains dynamic fee estimation data from dcrd.
+// Fee fields are strings to support big.Int precision for SKA coins.
 type FeeEstimates struct {
 	CoinType             uint8   `json:"cointype"`
-	MinRelayFee          float64 `json:"minrelayfee"`
+	MinRelayFee          string  `json:"minrelayfee"`   // Atoms as string (supports big.Int for SKA)
 	DynamicFeeMultiplier float64 `json:"dynamicfeemultiplier"`
-	NormalFee            float64 `json:"normalfee"`
-	FastFee              float64 `json:"fastfee"`
-	SlowFee              float64 `json:"slowfee"`
+	NormalFee            string  `json:"normalfee"` // Atoms as string (supports big.Int for SKA)
+	FastFee              string  `json:"fastfee"`   // Atoms as string (supports big.Int for SKA)
+	SlowFee              string  `json:"slowfee"`   // Atoms as string (supports big.Int for SKA)
 }
 
 // GetFeeEstimatesByCoinType queries dynamic fee estimates for the specified coin type

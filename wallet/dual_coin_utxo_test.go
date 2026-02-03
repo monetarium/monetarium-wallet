@@ -111,7 +111,7 @@ func TestTxAuthorFeeHandling(t *testing.T) {
 		scriptSize: 25,
 	}
 
-	relayFeePerKb := dcrutil.Amount(1000) // 1000 atoms per KB
+	relayFeePerKb := cointype.SKAAmountFromInt64(1000) // 1000 atoms per KB
 
 	// Test VAR transaction - should include fees
 	varOutputs := []*wire.TxOut{

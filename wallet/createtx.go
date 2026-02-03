@@ -139,7 +139,7 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 			}
 		}
 
-		// Calculate relay fee based on transaction coin type
+		// Calculate relay fee based on transaction coin type (SKAAmount for big.Int precision)
 		actualRelayFee := w.RelayFeeForCoinType(ctx, txCoinType)
 
 		var err error
@@ -417,7 +417,7 @@ type authorTx struct {
 	changeAccount      uint32
 	minconf            int32
 	randomizeChangeIdx bool
-	txFee              dcrutil.Amount
+	txFee              cointype.SKAAmount // SKAAmount for big.Int precision (supports both VAR and SKA)
 	dontSignTx         bool
 	isTreasury         bool
 
@@ -482,7 +482,7 @@ func (w *Wallet) authorTx(ctx context.Context, op errors.Op, a *authorTx) error 
 			}
 		}
 
-		// Calculate relay fee based on transaction coin type
+		// Calculate relay fee based on transaction coin type (SKAAmount for big.Int precision)
 		actualTxFee := a.txFee
 		if len(a.outputs) > 0 {
 			actualTxFee = w.RelayFeeForCoinType(ctx, a.outputs[0].CoinType)
@@ -762,8 +762,8 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 			changeSize = txsizes.P2PKHPkScriptSize
 		}
 		feeSize = txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, changeSize)
-		feeEst := txrules.FeeForSerializeSize(w.RelayFeeForCoinType(ctx, coinType), feeSize)
-		skaFeeEstActual := cointype.SKAAmountFromInt64(int64(feeEst))
+		relayFeeBig := w.RelayFeeForCoinType(ctx, coinType)
+		skaFeeEstActual := txrules.FeeForSerializeSizeSKA(relayFeeBig, feeSize)
 
 		// Balance check
 		required := skaAmount.Add(skaFeeEstActual)
@@ -809,7 +809,9 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 			changeSize = txsizes.P2PKHPkScriptSize
 		}
 		feeSize = txsizes.EstimateSerializeSize(scriptSizes, msgtx.TxOut, changeSize)
-		feeEst := txrules.FeeForSerializeSize(w.RelayFeeForCoinType(ctx, coinType), feeSize)
+		relayFeeBigVar := w.RelayFeeForCoinType(ctx, coinType)
+		relayFeeInt64Var, _ := relayFeeBigVar.Int64()
+		feeEst := txrules.FeeForSerializeSize(dcrutil.Amount(relayFeeInt64Var), feeSize)
 
 		if totalInput < amount+feeEst {
 			return txToMultisigError(errors.E(op, errors.InsufficientBalance))
@@ -1009,21 +1011,12 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 		count++
 	}
 
-	// Get an initial fee estimate based on the number of selected inputs
-	// and added outputs, with no change.
-	feeRate := w.RelayFeeForCoinType(ctx, coinType)
-	var szEst int
-	if coinType.IsSKA() {
-		szEst = txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, 0)
-	} else {
-		szEst = txsizes.EstimateSerializeSize(scriptSizes, msgtx.TxOut, 0)
-	}
-	feeEst := txrules.FeeForSerializeSize(feeRate, szEst)
-
 	// Set output value based on coin type
+	feeRateBig := w.RelayFeeForCoinType(ctx, coinType)
 	if coinType.IsSKA() {
-		// SKA path: use big.Int arithmetic
-		skaFee := cointype.SKAAmountFromInt64(int64(feeEst))
+		// SKA path: use big.Int arithmetic for full precision
+		szEst := txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, 0)
+		skaFee := txrules.FeeForSerializeSizeSKA(feeRateBig, szEst)
 		skaOutput := totalAddedSKA.Sub(skaFee)
 		if skaOutput.IsNegative() || skaOutput.IsZero() {
 			return nil, errors.E(op, errors.InsufficientBalance)
@@ -1032,6 +1025,10 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 		msgtx.TxOut[0].SKAValue = skaOutput.BigInt()
 	} else {
 		// VAR path: use int64 arithmetic
+		feeRateInt64, _ := feeRateBig.Int64()
+		feeRate := dcrutil.Amount(feeRateInt64)
+		szEst := txsizes.EstimateSerializeSize(scriptSizes, msgtx.TxOut, 0)
+		feeEst := txrules.FeeForSerializeSize(feeRate, szEst)
 		msgtx.TxOut[0].Value = int64(totalAddedVAR - feeEst)
 		if txrules.IsDustOutput(msgtx.TxOut[0], feeRate) {
 			return nil, errors.E(op, errors.InsufficientBalance)
@@ -1233,7 +1230,9 @@ func (w *Wallet) mixedSplit(ctx context.Context, req *PurchaseTicketsRequest, ne
 	if atx.ChangeIndex >= 0 {
 		change = atx.Tx.TxOut[atx.ChangeIndex]
 	}
-	if change != nil && dcrutil.Amount(change.Value) < smallestMixChange(relayFee) {
+	// Convert SKAAmount to dcrutil.Amount for smallestMixChange (mixing is VAR-only)
+	relayFeeInt64, _ := relayFee.Int64()
+	if change != nil && dcrutil.Amount(change.Value) < smallestMixChange(dcrutil.Amount(relayFeeInt64)) {
 		change = nil
 	}
 	gen := w.makeGen(ctx, req.MixedSplitAccount, req.MixedAccountBranch)

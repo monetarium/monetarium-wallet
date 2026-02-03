@@ -99,8 +99,8 @@ type ImportEmissionKeyResult struct {
 
 // GetWalletFeeResult models the data returned from the getwalletfee command.
 type GetWalletFeeResult struct {
-	Fee    float64 `json:"fee"`    // Fee amount in coins per KB
-	Source string  `json:"source"` // Source of the fee: "manual", "rpc", or "static"
+	Fee    string `json:"fee"`    // Fee amount in coins per KB (string for big.Int precision)
+	Source string `json:"source"` // Source of the fee: "manual", "rpc", or "static"
 }
 
 // GetPeerInfoResult models the data returned from the getpeerinfo command.

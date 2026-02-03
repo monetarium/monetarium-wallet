@@ -40,10 +40,10 @@ func (mockNetwork) Err() error                                                  
 func (mockNetwork) GetFeeEstimatesByCoinType(ctx context.Context, coinType uint8) (*FeeEstimates, error) {
 	return &FeeEstimates{
 		CoinType:             coinType,
-		MinRelayFee:          0.0001,
+		MinRelayFee:          "10000",  // Atoms as string
 		DynamicFeeMultiplier: 1.0,
-		NormalFee:            0.0001,
-		FastFee:              0.0002,
-		SlowFee:              0.00005,
+		NormalFee:            "10000",  // Atoms as string
+		FastFee:              "20000",  // Atoms as string
+		SlowFee:              "5000",   // Atoms as string
 	}, nil
 }

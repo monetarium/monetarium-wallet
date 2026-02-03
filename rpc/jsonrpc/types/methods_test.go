@@ -1044,14 +1044,14 @@ func TestWalletSvrCmds(t *testing.T) {
 		{
 			name: "settxfee",
 			newCmd: func() (any, error) {
-				return dcrjson.NewCmd(Method("settxfee"), 0.0001)
+				return dcrjson.NewCmd(Method("settxfee"), "0.0001")
 			},
 			staticCmd: func() any {
-				return NewSetTxFeeCmd(0.0001)
+				return NewSetTxFeeCmd("0.0001")
 			},
-			marshalled: `{"jsonrpc":"1.0","method":"settxfee","params":[0.0001],"id":1}`,
+			marshalled: `{"jsonrpc":"1.0","method":"settxfee","params":["0.0001"],"id":1}`,
 			unmarshalled: &SetTxFeeCmd{
-				Amount:   0.0001,
+				Amount:   "0.0001",
 				CoinType: dcrjson.Int(0), // Default CoinType is 0 (VAR)
 			},
 		},

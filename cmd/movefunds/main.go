@@ -200,7 +200,9 @@ func main() {
 			PkScript: pkScript,
 		},
 	}
-	atx, err := txauthor.NewUnsignedTransaction(txOuts, fee, inputSource, nil, params.MaxTxSize)
+	// Convert fee to SKAAmount for NewUnsignedTransaction (VAR-only tool)
+	feeSKA := cointype.SKAAmountFromInt64(int64(fee))
+	atx, err := txauthor.NewUnsignedTransaction(txOuts, feeSKA, inputSource, nil, params.MaxTxSize)
 	if err != nil {
 		fmt.Printf("failed to create unsigned transaction: %s", err)
 		return
