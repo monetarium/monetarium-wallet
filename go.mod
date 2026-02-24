@@ -14,29 +14,29 @@ require (
 	github.com/jrick/bitset v1.0.0
 	github.com/jrick/logrotate v1.0.0
 	github.com/jrick/wsrpc/v2 v2.3.8
-	github.com/monetarium/monetarium-node/addrmgr v1.0.18
-	github.com/monetarium/monetarium-node/blockchain v1.0.18
-	github.com/monetarium/monetarium-node/blockchain/stake v1.0.18
-	github.com/monetarium/monetarium-node/blockchain/standalone v1.0.18
-	github.com/monetarium/monetarium-node/certgen v1.0.18
-	github.com/monetarium/monetarium-node/chaincfg v1.0.18
-	github.com/monetarium/monetarium-node/chaincfg/chainhash v1.0.18
-	github.com/monetarium/monetarium-node/cointype v1.0.18
-	github.com/monetarium/monetarium-node/connmgr v1.0.18
-	github.com/monetarium/monetarium-node/crypto/blake256 v1.0.18
-	github.com/monetarium/monetarium-node/crypto/rand v1.0.18
-	github.com/monetarium/monetarium-node/crypto/ripemd160 v1.0.18
-	github.com/monetarium/monetarium-node/dcrec v1.0.18
-	github.com/monetarium/monetarium-node/dcrec/secp256k1 v1.0.18
-	github.com/monetarium/monetarium-node/dcrjson v1.0.18
-	github.com/monetarium/monetarium-node/dcrutil v1.0.18
-	github.com/monetarium/monetarium-node/gcs v1.0.18
-	github.com/monetarium/monetarium-node/hdkeychain v1.0.18
-	github.com/monetarium/monetarium-node/mixing v1.0.18
-	github.com/monetarium/monetarium-node/rpc/jsonrpc/types v1.0.18
-	github.com/monetarium/monetarium-node/rpcclient v1.0.18
-	github.com/monetarium/monetarium-node/txscript v1.0.18
-	github.com/monetarium/monetarium-node/wire v1.0.18
+	github.com/monetarium/monetarium-node/addrmgr v1.0.19
+	github.com/monetarium/monetarium-node/blockchain v1.0.19
+	github.com/monetarium/monetarium-node/blockchain/stake v1.0.19
+	github.com/monetarium/monetarium-node/blockchain/standalone v1.0.19
+	github.com/monetarium/monetarium-node/certgen v1.0.19
+	github.com/monetarium/monetarium-node/chaincfg v1.0.19
+	github.com/monetarium/monetarium-node/chaincfg/chainhash v1.0.19
+	github.com/monetarium/monetarium-node/cointype v1.0.19
+	github.com/monetarium/monetarium-node/connmgr v1.0.19
+	github.com/monetarium/monetarium-node/crypto/blake256 v1.0.19
+	github.com/monetarium/monetarium-node/crypto/rand v1.0.19
+	github.com/monetarium/monetarium-node/crypto/ripemd160 v1.0.19
+	github.com/monetarium/monetarium-node/dcrec v1.0.19
+	github.com/monetarium/monetarium-node/dcrec/secp256k1 v1.0.19
+	github.com/monetarium/monetarium-node/dcrjson v1.0.19
+	github.com/monetarium/monetarium-node/dcrutil v1.0.19
+	github.com/monetarium/monetarium-node/gcs v1.0.19
+	github.com/monetarium/monetarium-node/hdkeychain v1.0.19
+	github.com/monetarium/monetarium-node/mixing v1.0.19
+	github.com/monetarium/monetarium-node/rpc/jsonrpc/types v1.0.19
+	github.com/monetarium/monetarium-node/rpcclient v1.0.19
+	github.com/monetarium/monetarium-node/txscript v1.0.19
+	github.com/monetarium/monetarium-node/wire v1.0.19
 	go.etcd.io/bbolt v1.3.11
 	golang.org/x/crypto v0.33.0
 	golang.org/x/sync v0.11.0
