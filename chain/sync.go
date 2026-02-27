@@ -610,7 +610,7 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 
 	// Ensure the RPC server has a compatible API version.
 	var api struct {
-		Version semver `json:"dcrdjsonrpcapi"`
+		Version semver `json:"monetariumjsonrpcapi"`
 	}
 	err = s.rpc.Call(ctx, "version", &api)
 	if err != nil {
