@@ -80,11 +80,11 @@ func normalizeAddress(addr string, defaultPort string) (hostport string, err err
 func walletPort(net *chaincfg.Params) string {
 	switch net.Net {
 	case wire.MainNet:
-		return "9110"
+		return "9510"
 	case wire.TestNet3:
-		return "19110"
+		return "19510"
 	case wire.SimNet:
-		return "19557"
+		return "19957"
 	default:
 		return ""
 	}

@@ -20,25 +20,25 @@ type Params struct {
 // dcrd on the main network (wire.MainNet).
 var MainNetParams = Params{
 	Params:            chaincfg.MainNetParams(),
-	JSONRPCClientPort: "9109",
-	JSONRPCServerPort: "9110",
-	GRPCServerPort:    "9111",
+	JSONRPCClientPort: "9509",
+	JSONRPCServerPort: "9510",
+	GRPCServerPort:    "9511",
 }
 
 // TestNet3Params contains parameters specific running dcrwallet and
 // dcrd on the test network (version 3) (wire.TestNet3).
 var TestNet3Params = Params{
 	Params:            chaincfg.TestNet3Params(),
-	JSONRPCClientPort: "19109",
-	JSONRPCServerPort: "19110",
-	GRPCServerPort:    "19111",
+	JSONRPCClientPort: "19509",
+	JSONRPCServerPort: "19510",
+	GRPCServerPort:    "19511",
 }
 
 // SimNetParams contains parameters specific to the simulation test network
 // (wire.SimNet).
 var SimNetParams = Params{
 	Params:            chaincfg.SimNetParams(),
-	JSONRPCClientPort: "19556",
-	JSONRPCServerPort: "19557",
-	GRPCServerPort:    "19558",
+	JSONRPCClientPort: "19956",
+	JSONRPCServerPort: "19957",
+	GRPCServerPort:    "19958",
 }
