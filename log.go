@@ -43,7 +43,7 @@ func init() {
 
 // subsystemLoggers maps each subsystem identifier to its associated logger.
 var subsystemLoggers = map[string]slog.Logger{
-	"DCRW": loggers.MainLog,
+	"MONW": loggers.MainLog,
 	"LODR": loggers.LoaderLog,
 	"WLLT": loggers.WalletLog,
 	"TKBY": loggers.TkbyLog,

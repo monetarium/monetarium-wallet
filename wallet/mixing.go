@@ -468,7 +468,7 @@ func (w *Wallet) MixAccount(ctx context.Context, changeAccount, mixAccount,
 		var maxResults = cap(w.mixSems.splitSems[0]) * len(splitPoints)
 		// Mixing is VAR-only (like staking)
 		credits, err = w.findEligibleOutputsAmount(dbtx, changeAccount, minconf,
-			targetAmount, tipHeight, minAmount, maxResults, cointype.CoinTypeVAR)
+			targetAmount, cointype.Zero(), tipHeight, minAmount, maxResults, cointype.CoinTypeVAR)
 		return err
 	})
 	if err != nil {

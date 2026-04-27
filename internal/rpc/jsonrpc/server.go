@@ -84,8 +84,11 @@ type handler struct {
 }
 
 // jsonAuthFail sends a message back to the client if the http auth is rejected.
+// Note: HTTP clients that cached Basic-auth credentials under the legacy
+// "dcrwallet RPC" realm will be re-prompted after this rename to "monw RPC".
+// Document this in release notes; no persistent state is affected.
 func jsonAuthFail(w http.ResponseWriter) {
-	w.Header().Add("WWW-Authenticate", `Basic realm="dcrwallet RPC"`)
+	w.Header().Add("WWW-Authenticate", `Basic realm="monw RPC"`)
 	http.Error(w, "401 Unauthorized.", http.StatusUnauthorized)
 }
 
@@ -428,7 +431,7 @@ out:
 			case "stop":
 				log.Debugf("RPC method stop invoked by %s", remoteAddr(ctx))
 				resp := makeResponse(req.ID,
-					"dcrwallet stopping.", nil)
+					"monw stopping.", nil)
 				mresp, err := json.Marshal(resp)
 				// Expected to never fail.
 				if err != nil {
@@ -585,7 +588,7 @@ func (s *Server) postClientRPC(w http.ResponseWriter, r *http.Request) {
 	case "stop":
 		log.Debugf("RPC method stop invoked by %s", r.RemoteAddr)
 		stop = true
-		res = "dcrwallet stopping"
+		res = "monw stopping"
 	default:
 		res, jsonErr = s.handlerClosure(ctx, &req)()
 	}

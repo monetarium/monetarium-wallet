@@ -83,6 +83,8 @@ var helpDescsEnUS = map[string]string{
 	"createauthorizedemission-cointype":        "SKA coin type to emit (1-255)",
 	"createauthorizedemission-emissionkeyname": "Name of the imported emission private key",
 	"createauthorizedemission-passphrase":      "Wallet passphrase for key access",
+	"createauthorizedemission-height":          "Optional: explicit block height to sign into the emission authorization. Defaults to the wallet's local synced tip, which can be stale during reorgs.",
+	"createauthorizedemission-nonce":           "Optional: emission nonce. Defaults to 1 (first emission). Override only when re-authorizing a coin type that has already been emitted.",
 	"createauthorizedemission--result0":        "Hex-encoded bytes of the signed emission transaction",
 
 	// CreateRawTransactionCmd help.
@@ -147,11 +149,14 @@ var helpDescsEnUS = map[string]string{
 
 	// GenerateEmissionKeyCmd help.
 	"generateemissionkey--synopsis": "Generates a new private key for SKA emission authorization.\n" +
-		"The wallet must be unlocked for this request to succeed.",
-	"generateemissionkey-keyname":    "Unique identifier for this emission key",
-	"generateemissionkey-passphrase": "Wallet passphrase for key generation",
-	"generateemissionkey-cointype":   "Optional SKA coin type (1-255) for organization",
-	"generateemissionkey--result0":   "The public key corresponding to the generated private key",
+		"The wallet must be unlocked (via walletpassphrase) for this request to succeed.\n" +
+		"The key is stored in the wallet database under the scrypt-protected master key; " +
+		"the wallet DB is the canonical backup target.",
+	"generateemissionkey-keyname":               "Unique identifier for this emission key",
+	"generateemissionkey-passphrase":            "Passphrase used to encrypt the returned backup blob (only relevant when returnencryptedbackup=true); unrelated to the wallet-unlock passphrase",
+	"generateemissionkey-cointype":              "Optional SKA coin type (1-255) for organization",
+	"generateemissionkey-returnencryptedbackup": "If true, include the encrypted private-key backup in the response; default false",
+	"generateemissionkey--result0":              "The public key corresponding to the generated private key",
 
 	// GetAccountAddressCmd help.
 	"getaccountaddress--synopsis": "DEPRECATED -- Returns the most recent external payment address for an account that has not been seen publicly.\n" +
@@ -795,16 +800,20 @@ var helpDescsEnUS = map[string]string{
 	"redeemmultisigout-tree":      "Tree the transaction is on.",
 	"redeemmultisigout-index":     "Idx of the input transaction",
 	"redeemmultisigout-hash":      "Hash of the input transaction",
+	"redeemmultisigout-cointype":  "Coin type (0=VAR default, 1-255=SKA)",
 
 	"redeemmultisigoutresult-errors":   "Any errors generated.",
 	"redeemmultisigoutresult-complete": "Shows if opperation was completed.",
 	"redeemmultisigoutresult-hex":      "Resulting hash.",
 
 	// RedeemMultiSigouts help.
-	"redeemmultisigouts--synopsis":      "Takes a hash, looks up all unspent outpoints and generates list artially signed transactions spending to either an address specified or internal addresses",
-	"redeemmultisigouts-number":         "Number of outpoints found.",
-	"redeemmultisigouts-toaddress":      "Address to look for (if not internal addresses).",
-	"redeemmultisigouts-fromscraddress": "Input script hash address.",
+	"redeemmultisigouts--synopsis":       "Takes a hash, looks up all unspent outpoints and generates list artially signed transactions spending to either an address specified or internal addresses. At most 256 outpoints are processed per call; the response's truncated field indicates whether more outpoints remain to be redeemed.",
+	"redeemmultisigouts-number":          "Maximum number of outpoints to redeem in this call (server-side cap of 256 applies).",
+	"redeemmultisigouts-toaddress":       "Address to look for (if not internal addresses).",
+	"redeemmultisigouts-fromscraddress":  "Input script hash address.",
+	"redeemmultisigouts-cointype":        "Coin type (0=VAR default, 1-255=SKA)",
+	"redeemmultisigoutsresult-results":   "Resulting partially-signed redemption transactions.",
+	"redeemmultisigoutsresult-truncated": "True when more unspent multisig outputs exist than were processed in this call. Spend the returned transactions and call again to drain the rest.",
 
 	// RenameAccountCmd help.
 	"renameaccount--synopsis":  "Renames an account.",
@@ -868,14 +877,15 @@ var helpDescsEnUS = map[string]string{
 
 	// SendToMultisigCmd help.
 	"sendtomultisig--synopsis": "Authors, signs, and sends a transaction that outputs some amount to a multisig address.\n" +
-		"Unlike sendfrom, outputs are always chosen from the default account.\n" +
-		"A change output is automatically included to send extra output value back to the original account.",
+		"Inputs are drawn from the named account (or \"default\" when fromaccount is empty).\n" +
+		"A change output is automatically included to send extra output value back to the source account.",
 	"sendtomultisig-minconf":     "Minimum number of block confirmations required",
 	"sendtomultisig-nrequired":   "The number of signatures required to redeem outputs paid to this address",
 	"sendtomultisig-pubkeys":     "Pubkey to send to.",
-	"sendtomultisig-fromaccount": "Unused",
-	"sendtomultisig-amount":      "Amount to send to the payment address valued in Monetarium",
+	"sendtomultisig-fromaccount": "Source account name to draw funds from. Empty string defaults to \"default\".",
+	"sendtomultisig-amount":      "Amount to send to the payment address valued in Monetarium. Must be positive.",
 	"sendtomultisig-comment":     "Unused",
+	"sendtomultisig-cointype":    "Coin type (0=VAR default, 1-255=SKA)",
 	"sendtomultisig--result0":    "The transaction hash of the sent transaction",
 
 	// SendToTreasuryCmd help.

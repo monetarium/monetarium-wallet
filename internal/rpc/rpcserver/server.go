@@ -1036,7 +1036,9 @@ func (s *walletServer) UnspentOutputs(req *pb.UnspentOutputsRequest, svr pb.Wall
 		RequiredConfirmations: req.RequiredConfirmations,
 		CoinType:              cointype.CoinTypeVAR, // Default to VAR for backward compatibility
 	}
-	inputDetail, err := s.wallet.SelectInputs(svr.Context(), dcrutil.Amount(req.TargetAmount), policy)
+	// gRPC UnspentOutputs is VAR-only (policy.CoinType == VAR); pass Zero
+	// for the SKA target since the pb carries only int64 TargetAmount.
+	inputDetail, err := s.wallet.SelectInputs(svr.Context(), dcrutil.Amount(req.TargetAmount), cointype.Zero(), policy)
 	// Do not return errors to caller when there was insufficient spendable
 	// outputs available for the target amount.
 	if err != nil && !errors.Is(err, errors.InsufficientBalance) {
@@ -1083,7 +1085,9 @@ func (s *walletServer) FundTransaction(ctx context.Context, req *pb.FundTransact
 		RequiredConfirmations: req.RequiredConfirmations,
 		CoinType:              cointype.CoinTypeVAR, // Default to VAR for backward compatibility
 	}
-	inputDetail, err := s.wallet.SelectInputs(ctx, dcrutil.Amount(req.TargetAmount), policy)
+	// gRPC FundTransaction is VAR-only (policy.CoinType == VAR); pass Zero
+	// for the SKA target since the pb carries only int64 TargetAmount.
+	inputDetail, err := s.wallet.SelectInputs(ctx, dcrutil.Amount(req.TargetAmount), cointype.Zero(), policy)
 	// Do not return errors to caller when there was insufficient spendable
 	// outputs available for the target amount.
 	if err != nil && !errors.Is(err, errors.InsufficientBalance) {
@@ -1604,7 +1608,7 @@ func (s *walletServer) SignTransaction(ctx context.Context, req *pb.SignTransact
 		}
 	}
 
-	invalidSigs, err := s.wallet.SignTransaction(ctx, &tx, txscript.SigHashAll, additionalPkScripts, nil, nil)
+	invalidSigs, _, err := s.wallet.SignTransaction(ctx, &tx, txscript.SigHashAll, additionalPkScripts, nil, nil)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -1669,7 +1673,7 @@ func (s *walletServer) SignTransactions(ctx context.Context, req *pb.SignTransac
 				"Bytes do not represent a valid raw transaction: %v", err)
 		}
 
-		invalidSigs, err := s.wallet.SignTransaction(ctx, &tx, txscript.SigHashAll, additionalPkScripts, nil, nil)
+		invalidSigs, _, err := s.wallet.SignTransaction(ctx, &tx, txscript.SigHashAll, additionalPkScripts, nil, nil)
 		if err != nil {
 			return nil, translateError(err)
 		}
@@ -1753,7 +1757,13 @@ func (s *walletServer) PublishTransaction(ctx context.Context, req *pb.PublishTr
 	}
 
 	if !s.wallet.AllowsHighFees() {
-		highFees, err := txrules.TxPaysHighFees(msgTx)
+		var highFees bool
+		var err error
+		if txrules.GetCoinTypeFromOutputs(msgTx.TxOut).IsSKA() {
+			highFees, err = txrules.TxPaysHighFeesSKA(msgTx, s.wallet.ChainParams())
+		} else {
+			highFees, err = txrules.TxPaysHighFees(msgTx)
+		}
 		if err != nil {
 			return nil, translateError(err)
 		}

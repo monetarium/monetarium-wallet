@@ -7,6 +7,7 @@ package wallet
 import (
 	"context"
 
+	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 	"github.com/monetarium/monetarium-wallet/wallet/txsizes"
@@ -50,8 +51,10 @@ func (w *Wallet) FetchP2SHMultiSigOutput(ctx context.Context, outPoint *wire.Out
 	}
 
 	multiSigOutput := P2SHMultiSigOutput{
-		OutPoint:     *mso.OutPoint,
-		OutputAmount: mso.Amount,
+		OutPoint:        *mso.OutPoint,
+		OutputAmount:    mso.Amount,
+		SKAOutputAmount: mso.SKAAmount,
+		CoinType:        mso.CoinType,
 		ContainingBlock: BlockIdentity{
 			Hash:   mso.BlockHash,
 			Height: int32(mso.BlockHeight),
@@ -74,8 +77,11 @@ func (w *Wallet) FetchP2SHMultiSigOutput(ctx context.Context, outPoint *wire.Out
 }
 
 // PrepareRedeemMultiSigOutTxOutput estimates the tx value for a MultiSigOutTx
-// output and adds it to msgTx.
-func (w *Wallet) PrepareRedeemMultiSigOutTxOutput(msgTx *wire.MsgTx, p2shOutput *P2SHMultiSigOutput, pkScript *[]byte) error {
+// output and adds it to msgTx. For SKA outputs (ct.IsSKA()) the fee and amount
+// are computed with big.Int arithmetic via FeeForSerializeSizeSKA /
+// RelayFeeForCoinType, and the output carries SKAValue with Value=0. For VAR
+// the legacy int64 path is used.
+func (w *Wallet) PrepareRedeemMultiSigOutTxOutput(ctx context.Context, msgTx *wire.MsgTx, p2shOutput *P2SHMultiSigOutput, pkScript *[]byte, ct cointype.CoinType) error {
 	const op errors.Op = "wallet.PrepareRedeemMultiSigOutTxOutput"
 
 	scriptSizes := make([]int, 0, len(msgTx.TxIn))
@@ -84,17 +90,32 @@ func (w *Wallet) PrepareRedeemMultiSigOutTxOutput(msgTx *wire.MsgTx, p2shOutput 
 		scriptSizes = append(scriptSizes, txsizes.RedeemP2SHSigScriptSize)
 	}
 
-	// estimate the output fee
 	txOut := wire.NewTxOut(0, *pkScript)
+	txOut.CoinType = ct
+
+	if ct.IsSKA() {
+		feeSize := txsizes.EstimateSerializeSizeSKA(scriptSizes, []*wire.TxOut{txOut}, 0)
+		relayFee := w.RelayFeeForCoinType(ctx, ct)
+		feeEst := txrules.FeeForSerializeSizeSKA(relayFee, feeSize)
+		if p2shOutput.SKAOutputAmount.Cmp(feeEst) <= 0 {
+			return errors.E(op, errors.Errorf("estimated SKA fee %v is at or above output value %v",
+				feeEst, p2shOutput.SKAOutputAmount))
+		}
+		toReceive := p2shOutput.SKAOutputAmount.Sub(feeEst)
+		txOut.Value = 0
+		txOut.SKAValue = toReceive.BigInt()
+		msgTx.AddTxOut(txOut)
+		return nil
+	}
+
+	// VAR path.
 	feeSize := txsizes.EstimateSerializeSize(scriptSizes, []*wire.TxOut{txOut}, 0)
 	feeEst := txrules.FeeForSerializeSize(w.RelayFee(), feeSize)
 	if feeEst >= p2shOutput.OutputAmount {
 		return errors.E(op, errors.Errorf("estimated fee %v is above output value %v",
 			feeEst, p2shOutput.OutputAmount))
 	}
-
 	toReceive := p2shOutput.OutputAmount - feeEst
-	// set the output value and add to the tx
 	txOut.Value = int64(toReceive)
 	msgTx.AddTxOut(txOut)
 	return nil

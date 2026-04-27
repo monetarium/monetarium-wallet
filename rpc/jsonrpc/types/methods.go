@@ -155,11 +155,20 @@ func NewCreateNewAccountCmd(account string) *CreateNewAccountCmd {
 
 // CreateAuthorizedEmissionCmd describes the command and parameters for creating
 // a cryptographically authorized SKA emission transaction with governance-defined parameters.
+//
+// Height and Nonce are optional operator overrides. By default, Height is the
+// wallet's local synced tip — which may be stale or inconsistent with the
+// node's canonical tip during a reorg; operators can pass an explicit Height
+// to sign at a specific point in the emission window. Nonce defaults to 1
+// (first emission) and should only be overridden when re-authorizing a coin
+// type that has already been emitted once.
 type CreateAuthorizedEmissionCmd struct {
-	CoinType        uint8  `json:"cointype"`        // SKA coin type (1-255)
-	EmissionKeyName string `json:"emissionkeyname"` // Name of imported emission private key
-	Passphrase      string `json:"passphrase"`      // Wallet passphrase for key access
-	// NOTE: Emission addresses, amounts, heights, and windows are defined by governance
+	CoinType        uint8   `json:"cointype"`            // SKA coin type (1-255)
+	EmissionKeyName string  `json:"emissionkeyname"`     // Name of imported emission private key
+	Passphrase      string  `json:"passphrase"`          // Wallet passphrase for key access
+	Height          *int64  `json:"height,omitempty"`    // Optional: explicit block height to sign (defaults to wallet tip)
+	Nonce           *uint64 `json:"nonce,omitempty"`     // Optional: emission nonce (defaults to 1)
+	// NOTE: Emission addresses, amounts, and windows are defined by governance
 	// and retrieved from chain parameters - users cannot specify arbitrary values
 }
 
@@ -175,10 +184,15 @@ func NewCreateAuthorizedEmissionCmd(coinType uint8, emissionKeyName, passphrase 
 
 // GenerateEmissionKeyCmd defines the generateemissionkey JSON-RPC command for
 // generating new private keys for SKA emission authorization (primary flow).
+//
+// Passphrase is used to encrypt the returned backup blob and is unrelated to the
+// wallet-unlock passphrase (the wallet must be separately unlocked via
+// walletpassphrase before this call).
 type GenerateEmissionKeyCmd struct {
-	KeyName    string `json:"keyname"`            // Unique identifier for this emission key
-	Passphrase string `json:"passphrase"`         // Wallet passphrase for key generation
-	CoinType   *uint8 `json:"cointype,omitempty"` // Optional SKA coin type (1-255) - for user organization only
+	KeyName               string `json:"keyname"`                         // Unique identifier for this emission key
+	Passphrase            string `json:"passphrase"`                      // Passphrase used to encrypt the returned backup blob (if requested)
+	CoinType              *uint8 `json:"cointype,omitempty"`              // Optional SKA coin type (1-255) - for user organization only
+	ReturnEncryptedBackup *bool  `json:"returnencryptedbackup,omitempty"` // If true, include the encrypted private-key backup in the response; default false (canonical backup is the wallet DB)
 }
 
 // NewGenerateEmissionKeyCmd returns a new instance which can be used to issue a
@@ -202,10 +216,16 @@ func NewGenerateEmissionKeyCmdWithCoinType(coinType uint8, keyName, passphrase s
 
 // ImportEmissionKeyCmd defines the importemissionkey JSON-RPC command for
 // importing private keys used for SKA emission authorization (emergency/recovery only).
+//
+// Passphrase is the backup-blob passphrase used when the key was exported via
+// generateemissionkey; it is unrelated to the wallet-unlock passphrase (the
+// wallet must be separately unlocked via walletpassphrase before this call).
+// Only v2 ("aes256gcm:v2:...") blobs are accepted; legacy v1 blobs are
+// cryptographically weak and rejected.
 type ImportEmissionKeyCmd struct {
 	KeyName    string `json:"keyname"`            // Unique identifier for this key
-	PrivateKey string `json:"privatekey"`         // Hex-encoded secp256k1 private key or encrypted format
-	Passphrase string `json:"passphrase"`         // Wallet passphrase for encryption
+	PrivateKey string `json:"privatekey"`         // Hex-encoded secp256k1 private key or v2 encrypted backup blob
+	Passphrase string `json:"passphrase"`         // Backup-blob passphrase (only used when PrivateKey is an encrypted blob)
 	CoinType   *uint8 `json:"cointype,omitempty"` // Optional SKA coin type (1-255) - for user organization only
 }
 
@@ -428,8 +448,8 @@ func NewGetReceivedByAccountCmd(account string, minConf *int) *GetReceivedByAcco
 // GetReceivedByAddressCmd defines the getreceivedbyaddress JSON-RPC command.
 type GetReceivedByAddressCmd struct {
 	Address  string
-	MinConf  *int `jsonrpcdefault:"1"`
-	CoinType *int `jsonrpcdefault:"0"`
+	MinConf  *int   `jsonrpcdefault:"1"`
+	CoinType *uint8 `jsonrpcdefault:"0"`
 }
 
 // NewGetReceivedByAddressCmd returns a new instance which can be used to issue
@@ -446,7 +466,7 @@ func NewGetReceivedByAddressCmd(address string, minConf *int) *GetReceivedByAddr
 }
 
 // NewGetReceivedByAddressCmdWithCoinType returns a new instance with coin type specified.
-func NewGetReceivedByAddressCmdWithCoinType(address string, minConf *int, coinType *int) *GetReceivedByAddressCmd {
+func NewGetReceivedByAddressCmdWithCoinType(address string, minConf *int, coinType *uint8) *GetReceivedByAddressCmd {
 	return &GetReceivedByAddressCmd{
 		Address:  address,
 		MinConf:  minConf,
@@ -559,7 +579,7 @@ func NewGetVoteChoicesCmd(tickethash *string) *GetVoteChoicesCmd {
 
 // GetWalletFeeCmd defines the getwalletfee JSON-RPC command.
 type GetWalletFeeCmd struct {
-	CoinType *int `jsonrpcdefault:"0"`
+	CoinType *uint8 `jsonrpcdefault:"0"`
 }
 
 // NewGetWalletFeeCmd returns a new instance which can be used to issue a
@@ -570,7 +590,7 @@ func NewGetWalletFeeCmd() *GetWalletFeeCmd {
 
 // NewGetWalletFeeCmdWithCoinType returns a new instance which can be used to issue a
 // getwalletfee JSON-RPC command with a specific coin type.
-func NewGetWalletFeeCmdWithCoinType(coinType int) *GetWalletFeeCmd {
+func NewGetWalletFeeCmdWithCoinType(coinType uint8) *GetWalletFeeCmd {
 	return &GetWalletFeeCmd{
 		CoinType: &coinType,
 	}
@@ -908,10 +928,11 @@ type CreateUnsignedTicketResult struct {
 // RedeemMultiSigOutCmd is a type handling custom marshaling and
 // unmarshaling of redeemmultisigout JSON RPC commands.
 type RedeemMultiSigOutCmd struct {
-	Hash    string
-	Index   uint32
-	Tree    int8
-	Address *string
+	Hash     string
+	Index    uint32
+	Tree     int8
+	Address  *string
+	CoinType *uint8 `json:"cointype,omitempty"`
 }
 
 // NewRedeemMultiSigOutCmd creates a new RedeemMultiSigOutCmd.
@@ -931,6 +952,7 @@ type RedeemMultiSigOutsCmd struct {
 	FromScrAddress string
 	ToAddress      *string
 	Number         *int
+	CoinType       *uint8 `json:"cointype,omitempty"`
 }
 
 // NewRedeemMultiSigOutsCmd creates a new RedeemMultiSigOutsCmd.
@@ -1072,18 +1094,21 @@ func NewSendToAddressCmdWithCoinType(address, amount string, comment, commentTo 
 }
 
 // SendToMultiSigCmd is a type handling custom marshaling and
-// unmarshaling of sendtomultisig JSON RPC commands.
+// unmarshaling of sendtomultisig JSON RPC commands. The amount is carried as a
+// string so SKA values (up to AtomsPerCoin = 1e18 atoms, far beyond float64's
+// 15–17 significant decimal digits) are transported losslessly.
 type SendToMultiSigCmd struct {
 	FromAccount string
-	Amount      float64
+	Amount      string
 	Pubkeys     []string
-	NRequired   *int `jsonrpcdefault:"1"`
-	MinConf     *int `jsonrpcdefault:"1"`
+	NRequired   *int   `jsonrpcdefault:"1"`
+	MinConf     *int   `jsonrpcdefault:"1"`
 	Comment     *string
+	CoinType    *uint8 `json:"cointype,omitempty"`
 }
 
 // NewSendToMultiSigCmd creates a new SendToMultiSigCmd.
-func NewSendToMultiSigCmd(fromaccount string, amount float64, pubkeys []string,
+func NewSendToMultiSigCmd(fromaccount string, amount string, pubkeys []string,
 	nrequired *int, minConf *int, comment *string) *SendToMultiSigCmd {
 	return &SendToMultiSigCmd{
 		FromAccount: fromaccount,
@@ -1209,7 +1234,7 @@ func NewSetTSpendPolicyCmd(hash string, policy string, ticket *string) *SetTSpen
 type SetTxFeeCmd struct {
 	// Amount in coins as string (supports big.Int precision for SKA).
 	Amount   string
-	CoinType *int `jsonrpcdefault:"0"`
+	CoinType *uint8 `jsonrpcdefault:"0"`
 }
 
 // NewSetTxFeeCmd returns a new instance which can be used to issue a settxfee
@@ -1222,7 +1247,7 @@ func NewSetTxFeeCmd(amount string) *SetTxFeeCmd {
 
 // NewSetTxFeeCmdWithCoinType returns a new instance which can be used to issue a
 // settxfee JSON-RPC command with a specific coin type.
-func NewSetTxFeeCmdWithCoinType(amount string, coinType int) *SetTxFeeCmd {
+func NewSetTxFeeCmdWithCoinType(amount string, coinType uint8) *SetTxFeeCmd {
 	return &SetTxFeeCmd{
 		Amount:   amount,
 		CoinType: &coinType,

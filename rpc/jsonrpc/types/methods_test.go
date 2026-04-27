@@ -279,7 +279,7 @@ func TestWalletSvrCmds(t *testing.T) {
 			unmarshalled: &GetReceivedByAddressCmd{
 				Address:  "1Address",
 				MinConf:  dcrjson.Int(1),
-				CoinType: dcrjson.Int(0), // Default CoinType is 0 (VAR)
+				CoinType: uint8Ptr(0), // Default CoinType is 0 (VAR)
 			},
 		},
 		{
@@ -294,7 +294,7 @@ func TestWalletSvrCmds(t *testing.T) {
 			unmarshalled: &GetReceivedByAddressCmd{
 				Address:  "1Address",
 				MinConf:  dcrjson.Int(6),
-				CoinType: dcrjson.Int(0), // Default CoinType is 0 (VAR)
+				CoinType: uint8Ptr(0), // Default CoinType is 0 (VAR)
 			},
 		},
 		{
@@ -1052,7 +1052,7 @@ func TestWalletSvrCmds(t *testing.T) {
 			marshalled: `{"jsonrpc":"1.0","method":"settxfee","params":["0.0001"],"id":1}`,
 			unmarshalled: &SetTxFeeCmd{
 				Amount:   "0.0001",
-				CoinType: dcrjson.Int(0), // Default CoinType is 0 (VAR)
+				CoinType: uint8Ptr(0), // Default CoinType is 0 (VAR)
 			},
 		},
 		{

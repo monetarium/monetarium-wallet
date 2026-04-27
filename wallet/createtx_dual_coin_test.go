@@ -5,10 +5,13 @@
 package wallet
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/txauthor"
+	"github.com/monetarium/monetarium-wallet/wallet/txrules"
+	"github.com/monetarium/monetarium-wallet/wallet/txsizes"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/wire"
@@ -452,7 +455,7 @@ func TestInputSourceCoinTypeCompatibility(t *testing.T) {
 			inputSource := createMockInputSource(coinType, 1e8)
 
 			target := dcrutil.Amount(5e7)
-			inputDetail, err := inputSource(target)
+			inputDetail, err := inputSource(target, cointype.Zero())
 
 			if err != nil {
 				t.Errorf("Input source failed for coin type %v: %v", coinType, err)
@@ -476,8 +479,50 @@ func TestInputSourceCoinTypeCompatibility(t *testing.T) {
 }
 
 // Mock input source for testing
+// TestSKAMultisigFeeAccountsForChangeOutput regression-tests the fee math
+// in the SKA branch of txToMultisigInternal. Previously the change-output
+// decision used a stale int64 feeEstForTx (≈1e6) heuristic that is ~12
+// orders of magnitude smaller than the actual SKA fee (~1e18 atoms/KB);
+// when that heuristic predicted "no change" but the real fee math left
+// enough leftover to emit one, the fee was computed without accounting
+// for the change output's ~25 bytes. The fix is to always include
+// P2PKHPkScriptSize in the SKA fee estimate. Verify here that the fee
+// for a serialize-size that already accounts for change is strictly
+// greater than the fee for the same outputs without change.
+func TestSKAMultisigFeeAccountsForChangeOutput(t *testing.T) {
+	// One 25-byte input script (mock multisig redemption) and one P2SH
+	// output. This mirrors the per-call shape of txToMultisigInternal.
+	scriptSizes := []int{25}
+	outs := []*wire.TxOut{{
+		Value:    0,
+		PkScript: make([]byte, txsizes.P2SHPkScriptSize),
+		CoinType: cointype.CoinType(1), // SKA-1
+	}}
+
+	feeSizeNoChange := txsizes.EstimateSerializeSizeSKA(scriptSizes, outs, 0)
+	feeSizeWithChange := txsizes.EstimateSerializeSizeSKA(scriptSizes, outs, txsizes.P2PKHPkScriptSize)
+
+	if feeSizeWithChange <= feeSizeNoChange {
+		t.Fatalf("size with change must exceed size without change: with=%d without=%d",
+			feeSizeWithChange, feeSizeNoChange)
+	}
+
+	// Use a representative SKA relay fee (4 SKA/kB on mainnet) and
+	// confirm the fee differential is large enough that under-charging
+	// would leave the tx below relay-rule threshold for the change-emitted
+	// case.
+	relayFee := cointype.NewSKAAmount(new(big.Int).Mul(big.NewInt(4), new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)))
+	feeNoChange := txrules.FeeForSerializeSizeSKA(relayFee, feeSizeNoChange)
+	feeWithChange := txrules.FeeForSerializeSizeSKA(relayFee, feeSizeWithChange)
+
+	if feeWithChange.Cmp(feeNoChange) <= 0 {
+		t.Fatalf("fee with change must exceed fee without change: with=%s without=%s",
+			feeWithChange.String(), feeNoChange.String())
+	}
+}
+
 func createMockInputSource(coinType cointype.CoinType, availableAmount dcrutil.Amount) txauthor.InputSource {
-	return func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
+	return func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
 		if target > availableAmount {
 			return nil, errors.E(errors.InsufficientBalance, "not enough funds")
 		}
@@ -494,5 +539,108 @@ func createMockInputSource(coinType cointype.CoinType, availableAmount dcrutil.A
 			Scripts:           [][]byte{make([]byte, 25)},
 			RedeemScriptSizes: []int{25},
 		}, nil
+	}
+}
+
+// TestTxToMultisigInternalSKAFeePreBudget verifies HIGH-1: txToMultisigInternal's
+// SKA pre-selection fee budget must be derived from the real SKA relay fee, not
+// the int64 VAR heuristic (5e7 atoms on mainnet — ~12 orders of magnitude too
+// small). The pre-budget is what's passed to findEligibleOutputsAmount; if it
+// undershoots the post-selection real fee, the call returns spurious
+// InsufficientBalance even when the wallet has UTXOs that would cover the real
+// fee.
+//
+// This test exercises the pre-budget math directly (without a full wallet) by
+// referencing the same multisigSKAFeePreSelectInputGuess constant the
+// production path uses, so any future drift in that constant flows into the
+// test rather than silently passing.
+func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
+	// Mainnet-representative SKA relay fee: 4 SKA/kB at AtomsPerCoin=1e18 →
+	// 4e18 atoms/kB. This is the value the configured RelayFeeForCoinType
+	// returns for SKA on mainnet.
+	relayFee := cointype.NewSKAAmount(new(big.Int).Mul(
+		big.NewInt(4),
+		new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil),
+	))
+
+	// Target SKA amount: 1 SKA = 1e18 atoms.
+	amountSKA := cointype.NewSKAAmount(new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil))
+
+	// Reproduce the pre-budget computation from txToMultisigInternal,
+	// using the same package-level constant the production path uses.
+	estScriptSizes := make([]int, multisigSKAFeePreSelectInputGuess)
+	for i := range estScriptSizes {
+		estScriptSizes[i] = txsizes.RedeemP2SHSigScriptSize
+	}
+	estTxOuts := []*wire.TxOut{{
+		Value:    0,
+		SKAValue: amountSKA.BigInt(),
+		PkScript: make([]byte, txsizes.P2SHPkScriptSize),
+		CoinType: cointype.CoinType(1),
+	}}
+	preBudgetSize := txsizes.EstimateSerializeSizeSKA(estScriptSizes, estTxOuts, txsizes.P2PKHPkScriptSize)
+	skaFeePreBudget := txrules.FeeForSerializeSizeSKA(relayFee, preBudgetSize)
+
+	// The old buggy pre-budget was 5e7 atoms. The new one must dwarf it,
+	// because real SKA fees are ~1e18 atoms/kB and a typical multisig tx
+	// is a few hundred bytes minimum.
+	oldBuggyBudget := cointype.SKAAmountFromInt64(5e7)
+	if skaFeePreBudget.Cmp(oldBuggyBudget) <= 0 {
+		t.Fatalf("new SKA pre-budget %s must exceed old buggy 5e7 atoms",
+			skaFeePreBudget.String())
+	}
+
+	// The pre-budget must cover the real fee at every selection size the
+	// production path can produce (i.e. up to multisigSKAFeePreSelectInputGuess
+	// inputs). Compare against several N values rather than just the boundary
+	// case; comparing only at N==guess would be structurally `X >= X` because
+	// both sides feed identical inputs into the same formula.
+	//
+	// At N < guess, the pre-budget should strictly exceed the real fee
+	// (over-estimation is intentional — harmless slack so findEligibleOutputsAmount
+	// pulls inputs that comfortably cover the post-selection recompute).
+	// At N == guess, the pre-budget equals the real fee by construction.
+	// We assert >= here so the test stays valid if the constant changes.
+	var (
+		lastFee    cointype.SKAAmount
+		haveLast   bool
+	)
+	for _, n := range []int{1, 10, 25, multisigSKAFeePreSelectInputGuess} {
+		ss := make([]int, n)
+		for i := range ss {
+			ss[i] = txsizes.RedeemP2SHSigScriptSize
+		}
+		sz := txsizes.EstimateSerializeSizeSKA(ss, estTxOuts, txsizes.P2PKHPkScriptSize)
+		fee := txrules.FeeForSerializeSizeSKA(relayFee, sz)
+		if skaFeePreBudget.Cmp(fee) < 0 {
+			t.Fatalf("pre-budget %s must be >= real fee %s for a %d-input shape",
+				skaFeePreBudget.String(), fee.String(), n)
+		}
+		// Strictness: real fee must grow with input count. If it didn't,
+		// EstimateSerializeSizeSKA or FeeForSerializeSizeSKA has regressed.
+		if haveLast && fee.Cmp(lastFee) <= 0 {
+			t.Fatalf("real fee for %d inputs (%s) must exceed prior fee (%s)",
+				n, fee.String(), lastFee.String())
+		}
+		lastFee = fee
+		haveLast = true
+	}
+
+	// Boundary sanity: at N==guess+1, the pre-budget is necessarily
+	// insufficient (this is the regime where the SKA balance check at
+	// line ~781 of createtx.go correctly returns InsufficientBalance).
+	// Verifying this proves the constant is the actual cliff, not just
+	// a number we picked.
+	overSS := make([]int, multisigSKAFeePreSelectInputGuess+1)
+	for i := range overSS {
+		overSS[i] = txsizes.RedeemP2SHSigScriptSize
+	}
+	overSz := txsizes.EstimateSerializeSizeSKA(overSS, estTxOuts, txsizes.P2PKHPkScriptSize)
+	overFee := txrules.FeeForSerializeSizeSKA(relayFee, overSz)
+	if skaFeePreBudget.Cmp(overFee) >= 0 {
+		t.Fatalf("pre-budget %s must NOT cover real fee %s for %d inputs "+
+			"(otherwise multisigSKAFeePreSelectInputGuess is mis-set)",
+			skaFeePreBudget.String(), overFee.String(),
+			multisigSKAFeePreSelectInputGuess+1)
 	}
 }

@@ -101,7 +101,7 @@ var Methods = []struct {
 	{"processunmanagedticket", nil},
 	{"purchaseticket", returnsString},
 	{"redeemmultisigout", []any{(*types.RedeemMultiSigOutResult)(nil)}},
-	{"redeemmultisigouts", []any{(*types.RedeemMultiSigOutResult)(nil)}},
+	{"redeemmultisigouts", []any{(*types.RedeemMultiSigOutsResult)(nil)}},
 	{"renameaccount", nil},
 	{"rescanwallet", nil},
 	{"sendfrom", returnsString},

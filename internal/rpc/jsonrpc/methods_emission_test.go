@@ -401,13 +401,29 @@ func validateCreateAuthorizedEmissionCmd(cmd *types.CreateAuthorizedEmissionCmd)
 	return true
 }
 
+// isValidEncryptedKeyFormat checks only the prefix/shape of an emission-key
+// backup blob. Both v1 (aes256gcm:<iv>:<ct>, 3 parts — insecure, rejected at
+// import) and v2 (aes256gcm:v2:<salt>:<N>:<r>:<p>:<nonce>:<ct>, 8 parts —
+// canonical) are shape-valid here; actual cryptographic rejection of v1
+// happens inside decryptPrivateKeyWithPassphrase.
 func isValidEncryptedKeyFormat(encryptedKey string) bool {
 	if !strings.HasPrefix(encryptedKey, "aes256gcm:") {
 		return false
 	}
 
 	parts := strings.Split(encryptedKey, ":")
-	return len(parts) == 3 && parts[1] != "" && parts[2] != ""
+	if len(parts) == 3 {
+		return parts[1] != "" && parts[2] != ""
+	}
+	if len(parts) == 8 && parts[1] == "v2" {
+		for _, p := range parts[2:] {
+			if p == "" {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func isValidPrivateKeyHex(privateKey string) bool {

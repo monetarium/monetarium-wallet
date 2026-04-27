@@ -1959,11 +1959,15 @@ func (w *Wallet) ConsolidateWithCoinType(ctx context.Context, inputs int, accoun
 	return w.compressWallet(ctx, "wallet.ConsolidateWithCoinType", inputs, account, address, ct)
 }
 
-// CreateMultisigTx creates and signs a multisig transaction.
+// CreateMultisigTx creates and signs a multisig transaction. For VAR coin type
+// the amount parameter drives the send value; for SKA the amountSKA parameter
+// drives it end-to-end as a big.Int so amounts above math.MaxInt64 atoms are
+// preserved losslessly. Callers operating on only one coin should pass 0 /
+// cointype.Zero() for the unused parameter.
 func (w *Wallet) CreateMultisigTx(ctx context.Context, account uint32, amount dcrutil.Amount,
-	pubkeys [][]byte, nrequired int8, minconf int32) (*CreatedTx, stdaddr.Address, []byte, error) {
-	// Default to VAR for multisig transactions
-	return w.txToMultisig(ctx, "wallet.CreateMultisigTx", account, amount, pubkeys, nrequired, minconf, cointype.CoinTypeVAR)
+	amountSKA cointype.SKAAmount, pubkeys [][]byte, nrequired int8, minconf int32,
+	coinType cointype.CoinType) (*CreatedTx, stdaddr.Address, []byte, error) {
+	return w.txToMultisig(ctx, "wallet.CreateMultisigTx", account, amount, amountSKA, pubkeys, nrequired, minconf, coinType)
 }
 
 // PurchaseTicketsRequest describes the parameters for purchasing tickets.
@@ -5445,7 +5449,7 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 	if len(tx.TxIn) == 0 {
 		const minconf = 1
 		// VSP fees are paid in VAR (staking is VAR-only)
-		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, fee, minconf, cointype.CoinTypeVAR)
+		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, fee, cointype.Zero(), minconf, cointype.CoinTypeVAR)
 		if err != nil {
 			return fmt.Errorf("unable to reserve outputs: %w", err)
 		}
@@ -5491,6 +5495,7 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 		Value:    int64(fee),
 		Version:  vers,
 		PkScript: feeScript,
+		CoinType: cointype.CoinTypeVAR, // VSP fees are always VAR; set explicitly
 	})
 	feeRate := w.RelayFee()
 	scriptSizes := make([]int, len(tx.TxIn))
@@ -5509,7 +5514,7 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 
 	feeHash := tx.TxHash()
 
-	sigErrs, err := w.SignTransaction(ctx, tx, txscript.SigHashAll, nil, nil, nil)
+	sigErrs, _, err := w.SignTransaction(ctx, tx, txscript.SigHashAll, nil, nil, nil)
 	if err != nil || len(sigErrs) > 0 {
 		log.Errorf("failed to sign transaction: %v", err)
 		sigErrStr := ""
@@ -5545,7 +5550,7 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 //
 // The transaction pointed to by tx is modified by this function.
 func (w *Wallet) SignTransaction(ctx context.Context, tx *wire.MsgTx, hashType txscript.SigHashType, additionalPrevScripts map[wire.OutPoint][]byte,
-	additionalKeysByAddress map[string]*dcrutil.WIF, p2shRedeemScriptsByAddress map[string][]byte) ([]SignatureError, error) {
+	additionalKeysByAddress map[string]*dcrutil.WIF, p2shRedeemScriptsByAddress map[string][]byte) ([]SignatureError, bool, error) {
 
 	const op errors.Op = "wallet.SignTransaction"
 
@@ -5557,6 +5562,7 @@ func (w *Wallet) SignTransaction(ctx context.Context, tx *wire.MsgTx, hashType t
 	}()
 
 	var signErrors []SignatureError
+	complete := true
 	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
 		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
@@ -5636,6 +5642,7 @@ func (w *Wallet) SignTransaction(ctx context.Context, tx *wire.MsgTx, hashType t
 						InputIndex: uint32(i),
 						Error:      errors.E(op, err),
 					})
+					complete = false
 					continue
 				}
 				txIn.SignatureScript = script
@@ -5651,12 +5658,13 @@ func (w *Wallet) SignTransaction(ctx context.Context, tx *wire.MsgTx, hashType t
 			if err != nil {
 				var multisigNotEnoughSigs bool
 				if errors.Is(err, txscript.ErrInvalidStackOperation) {
-					pkScript := additionalPrevScripts[txIn.PreviousOutPoint]
+					pkScript := prevOutScript
 					class, addr := stdscript.ExtractAddrs(scriptVersionAssumed, pkScript, w.ChainParams())
 					if class == stdscript.STScriptHash && len(addr) > 0 {
 						redeemScript, _ := source.script(addr[0])
 						if stdscript.IsMultiSigScriptV0(redeemScript) {
 							multisigNotEnoughSigs = true
+							complete = false
 						}
 					}
 				} else {
@@ -5671,15 +5679,16 @@ func (w *Wallet) SignTransaction(ctx context.Context, tx *wire.MsgTx, hashType t
 						InputIndex: uint32(i),
 						Error:      errors.E(op, err),
 					})
+					complete = false
 				}
 			}
 		}
 		return errEval
 	})
 	if err != nil {
-		return signErrors, errors.E(op, err)
+		return signErrors, false, errors.E(op, err)
 	}
-	return signErrors, nil
+	return signErrors, complete, nil
 }
 
 // CreateSignature returns the raw signature created by the private key of addr

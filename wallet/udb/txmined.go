@@ -187,6 +187,11 @@ func NewTxRecordFromMsgTx(msgTx *wire.MsgTx, received time.Time) (*TxRecord, err
 
 // MultisigOut represents a spendable multisignature outpoint contain
 // a script hash.
+//
+// Dual-coin: CoinType records whether this multisig output holds VAR or a
+// specific SKA coin type. For VAR outputs the int64 Amount field is the
+// authoritative value and SKAAmount is Zero. For SKA outputs the big.Int
+// SKAAmount field is authoritative and Amount is 0.
 type MultisigOut struct {
 	OutPoint     *wire.OutPoint
 	Tree         int8
@@ -197,6 +202,8 @@ type MultisigOut struct {
 	BlockHash    chainhash.Hash
 	BlockHeight  uint32
 	Amount       dcrutil.Amount
+	CoinType     cointype.CoinType
+	SKAAmount    cointype.SKAAmount
 	Spent        bool
 	SpentBy      chainhash.Hash
 	SpentByIndex uint32
@@ -2028,17 +2035,31 @@ func (s *Store) AddMultisigOut(dbtx walletdb.ReadWriteTx, rec *TxRecord, block *
 	}
 	var p2shScriptHash [ripemd160.Size]byte
 	copy(p2shScriptHash[:], scriptHash)
-	val = valueMultisigOut(p2shScriptHash,
+	txOut := rec.MsgTx.TxOut[index]
+	ct := txOut.CoinType
+	var varAmount dcrutil.Amount
+	skaAmount := cointype.Zero()
+	if ct.IsSKA() && txOut.SKAValue != nil {
+		skaAmount = cointype.NewSKAAmount(txOut.SKAValue)
+	} else {
+		varAmount = dcrutil.Amount(txOut.GetValue())
+	}
+	val, err = valueMultisigOut(p2shScriptHash,
 		uint8(multisigDetails.RequiredSigs),
 		uint8(multisigDetails.NumPubKeys),
 		false,
 		tree,
 		block.Block.Hash,
 		uint32(block.Block.Height),
-		dcrutil.Amount(rec.MsgTx.TxOut[index].GetValue()),
+		varAmount,
 		*empty,     // Unspent
 		0xFFFFFFFF, // Unspent
-		rec.Hash)
+		rec.Hash,
+		ct,
+		skaAmount)
+	if err != nil {
+		return err
+	}
 
 	// Write the output, and insert the unspent key.
 	err = putMultisigOutRawValues(ns, key, val)
@@ -2602,9 +2623,9 @@ func (s *Store) UnspentOutputCount(dbtx walletdb.ReadTx, coinType *cointype.Coin
 		return bucket.KeyN()
 	}
 
-	// Count for all coin types
+	// Count for all coin types (VAR + every active SKA bucket).
 	totalCount := 0
-	for _, ct := range s.getActiveSKACoinTypes() {
+	for _, ct := range s.getAllActiveCoinTypes() {
 		bucketName := bucketUnspentForCoinType(ct)
 		bucket := ns.NestedReadBucket(bucketName)
 		if bucket != nil {
@@ -3382,7 +3403,7 @@ func (s *Store) fastCreditPkScriptLookup(ns walletdb.ReadBucket, credKey []byte,
 // InputSource provides a method (SelectInputs) to incrementally select unspent
 // outputs to use as transaction inputs.
 type InputSource struct {
-	source func(dcrutil.Amount) (*txauthor.InputDetail, error)
+	source func(dcrutil.Amount, cointype.SKAAmount) (*txauthor.InputDetail, error)
 }
 
 // SelectInputs selects transaction inputs to redeem unspent outputs stored in
@@ -3391,8 +3412,12 @@ type InputSource struct {
 // input amount referenced by the previous transaction outputs, a slice of
 // transaction inputs referencing these outputs, and a slice of previous output
 // scripts from each previous output referenced by the corresponding input.
-func (s *InputSource) SelectInputs(target dcrutil.Amount) (*txauthor.InputDetail, error) {
-	return s.source(target)
+//
+// The two target arguments are coin-type-specific and mutually exclusive: pass
+// `target` for VAR with `targetSKA` as cointype.Zero(); pass `targetSKA` for
+// SKA with `target` as 0. See txauthor.InputSource for rationale.
+func (s *InputSource) SelectInputs(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
+	return s.source(target, targetSKA)
 }
 
 // MakeInputSourceWithCoinType creates an InputSource that filters UTXOs by coin type.
@@ -3406,12 +3431,20 @@ func (s *InputSource) SelectInputs(target dcrutil.Amount) (*txauthor.InputDetail
 // The returned InputSource will only select UTXOs matching the specified coin type.
 // If no matching UTXOs exist, the InputSource will return an empty result.
 // Invalid coin types (>255) will cause the InputSource to return an error.
+//
+// "No-target" sentinel: invoking the returned InputSource with `target == 0`
+// (VAR) or `targetSKA.IsZero()` (SKA) signals "drain every eligible UTXO up
+// to maxInputsPerTx" — the inherited wallet idiom used by sweep and
+// consolidation flows. There is no supported way to request a real
+// zero-atom target through this InputSource; callers that need to author a
+// transaction with exactly zero atoms of the active coin type must build
+// it manually.
 func (s *Store) MakeInputSourceWithCoinType(dbtx walletdb.ReadTx, account uint32, minConf,
 	syncHeight int32, ignore func(*wire.OutPoint) bool, coinType cointype.CoinType) InputSource {
 
 	// Validate coin type parameter (0 = VAR, 1-255 = SKA types)
 	if coinType > cointype.CoinTypeMax {
-		return InputSource{source: func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
+		return InputSource{source: func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
 			return nil, errors.E(errors.Invalid, errors.Errorf("invalid coin type: %d", coinType))
 		}}
 	}
@@ -3466,11 +3499,40 @@ func (s *Store) MakeInputSourceWithCoinType(dbtx walletdb.ReadTx, account uint32
 		return false
 	}
 
-	f := func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
-		for currentTotal < target || target == 0 {
+	isSKA := coinType.IsSKA()
+	f := func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
+		// Defensive: reject negative targets up front. The
+		// "consume everything" sentinel is target == 0 (or targetSKA.IsZero());
+		// any negative value indicates a caller programming error.
+		if !isSKA && target < 0 {
+			return nil, errors.E(errors.Invalid,
+				errors.Errorf("negative VAR target: %d", target))
+		}
+		if isSKA && targetSKA.IsNegative() {
+			return nil, errors.E(errors.Invalid,
+				errors.Errorf("negative SKA target"))
+		}
+		// Determine whether we've met the caller's target.
+		// For VAR: currentTotal >= target (and target != 0).
+		// For SKA: currentSKATotal >= targetSKA (and targetSKA != 0).
+		// target/targetSKA == 0 means "no target — exhaust the UTXO set".
+		targetMet := func() bool {
+			if isSKA {
+				if targetSKA.IsZero() {
+					return false
+				}
+				return currentSKATotal.Cmp(targetSKA) >= 0
+			}
+			if target == 0 {
+				return false
+			}
+			return currentTotal >= target
+		}
+		hasTarget := (!isSKA && target != 0) || (isSKA && !targetSKA.IsZero())
+		for !targetMet() {
 			var k, v []byte
 			var err error
-			if minConf != 0 && target != 0 && randTries < numUnspent/2 {
+			if minConf != 0 && hasTarget && randTries < numUnspent/2 {
 				randTries++
 				k, v = s.randomUTXOForCoinType(dbtx, coinType, skip)
 				if k != nil {

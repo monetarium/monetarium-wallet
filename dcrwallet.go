@@ -618,12 +618,12 @@ func readClientCertKey() ([]byte, []byte) {
 	}
 	cert, err := os.ReadFile(cfg.DcrdClientCert.Value)
 	if err != nil {
-		log.Warnf("Cannot open dcrd RPC client certificate: %v", err)
+		log.Warnf("Cannot open MONN RPC client certificate: %v", err)
 		cert = nil
 	}
 	key, err := os.ReadFile(cfg.DcrdClientKey.Value)
 	if err != nil {
-		log.Warnf("Cannot open dcrd RPC client key: %v", err)
+		log.Warnf("Cannot open MONN RPC client key: %v", err)
 		key = nil
 	}
 	return cert, key

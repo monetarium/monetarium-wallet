@@ -282,7 +282,15 @@ func PaysHighFeesSKA(totalInput *big.Int, tx *wire.MsgTx, chainParams *chaincfg.
 // TxPaysHighFeesSKA checks whether an SKA transaction pays excessively high fees.
 // Total SKA input value is determined by summing the SKAValueIn fields of each input.
 // Returns an error if any SKA input is missing its value.
+//
+// SKA emission transactions are exempt: they have a single null input
+// (SKAValueIn=nil) because no SKA exists yet to consume, and they pay zero
+// fees by protocol — a fee in a coin that doesn't exist is impossible.
+// The block validator unconditionally accepts a well-formed emission tx.
 func TxPaysHighFeesSKA(tx *wire.MsgTx, chainParams *chaincfg.Params) (bool, error) {
+	if wire.IsSKAEmissionTransaction(tx) {
+		return false, nil
+	}
 	totalInput := new(big.Int)
 	for i, in := range tx.TxIn {
 		if in.SKAValueIn == nil {

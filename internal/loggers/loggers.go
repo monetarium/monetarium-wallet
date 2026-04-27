@@ -43,7 +43,7 @@ var (
 	// application shutdown.
 	logRotator *rotator.Rotator
 
-	MainLog    = backendLog.Logger("DCRW")
+	MainLog    = backendLog.Logger("MONW")
 	LoaderLog  = backendLog.Logger("LODR")
 	WalletLog  = backendLog.Logger("WLLT")
 	TkbyLog    = backendLog.Logger("TKBY")

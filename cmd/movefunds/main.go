@@ -76,6 +76,7 @@ func makeInputSource(outputs []types.ListUnspentResult) (dcrutil.Amount, txautho
 		inputs            = make([]*wire.TxIn, 0, len(outputs))
 		redeemScriptSizes = make([]int, 0, len(outputs))
 		sourceErr         error
+		skaSkipped        int
 	)
 	for _, output := range outputs {
 		// Handle both float64 (VAR) and string (SKA) amounts
@@ -85,6 +86,7 @@ func makeInputSource(outputs []types.ListUnspentResult) (dcrutil.Amount, txautho
 			amountFloat = v
 		case string:
 			// Skip SKA outputs in movefunds (VAR only tool)
+			skaSkipped++
 			continue
 		default:
 			sourceErr = fmt.Errorf("unexpected amount type %T", output.Amount)
@@ -122,7 +124,14 @@ func makeInputSource(outputs []types.ListUnspentResult) (dcrutil.Amount, txautho
 		sourceErr = noInputValue{}
 	}
 
-	return totalInputValue, func(dcrutil.Amount) (*txauthor.InputDetail, error) {
+	if skaSkipped > 0 {
+		fmt.Fprintf(os.Stderr,
+			"movefunds: warning: skipped %d SKA UTXO(s); this tool moves "+
+				"VAR funds only. Use a wallet RPC (sendfrom / sendmany) "+
+				"with cointype set to move SKA balances.\n", skaSkipped)
+	}
+
+	return totalInputValue, func(dcrutil.Amount, cointype.SKAAmount) (*txauthor.InputDetail, error) {
 		inputDetail := txauthor.InputDetail{
 			Amount:            totalInputValue,
 			Inputs:            inputs,

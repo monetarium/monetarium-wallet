@@ -236,10 +236,16 @@ const (
 	// This change was necessary to support variable-length SKA amounts (big.Int).
 	wireFormatV13Version = 31
 
+	// multisigCoinTypeVersion is the 32nd version of the database. It extends
+	// the persisted P2SH multisig-output record with CoinType (1 byte) and
+	// SKAAmount (length-prefixed big.Int bytes) tail fields. All pre-upgrade
+	// entries are VAR-only and backfilled as CoinType=VAR / SKAAmount=Zero.
+	multisigCoinTypeVersion = 32
+
 	// DBVersion is the latest version of the database that is understood by the
 	// program.  Databases with recorded versions higher than this will fail to
 	// open (meaning any upgrades prevent reverting to older software).
-	DBVersion = wireFormatV13Version
+	DBVersion = multisigCoinTypeVersion
 )
 
 // upgrades maps between old database versions and the upgrade function to
@@ -276,6 +282,7 @@ var upgrades = [...]func(walletdb.ReadWriteTx, []byte, *chaincfg.Params) error{
 	consolidationAddressVersion - 1:       consolidationAddressUpgrade,
 	skaBucketsVersion - 1:                 skaBucketsUpgrade,
 	wireFormatV13Version - 1:              wireFormatV13Upgrade,
+	multisigCoinTypeVersion - 1:           multisigCoinTypeUpgrade,
 }
 
 func lastUsedAddressIndexUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *chaincfg.Params) error {
@@ -2142,5 +2149,76 @@ func wireFormatV13Upgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, para
 	}
 
 	// Update the database version.
+	return unifiedDBMetadata{}.putVersion(metadataBucket, newVersion)
+}
+
+// multisigCoinTypeUpgrade performs an upgrade from version 31 to 32.
+// It extends every persisted P2SH multisig-output record with CoinType +
+// SKAAmount tail fields. All pre-upgrade entries are VAR-only (before the
+// dual-coin multisig path existed) and are backfilled as CoinType=VAR /
+// SKAAmount=Zero. The tail is 2 bytes (CoinType + length prefix) since the
+// length prefix is zero when SKAAmount is empty.
+//
+// Forward-compat note for v32→v33 and beyond: fetchMultisigOut currently
+// distinguishes v1 from v2 by length alone (see multisigOutV1Len in
+// txdb.go). Any future schema bump must add an unambiguous discriminator
+// (leading version byte, or a length-prefixed trailer) so that v3 records
+// cannot share a length with any earlier variant. Continuing the
+// length-probe pattern with a third variant is unsafe and will silently
+// corrupt persisted values.
+func multisigCoinTypeUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *chaincfg.Params) error {
+	const oldVersion = 31
+	const newVersion = 32
+
+	metadataBucket := tx.ReadWriteBucket(unifiedDBMetadata{}.rootBucketKey())
+	dbVersion, err := unifiedDBMetadata{}.getVersion(metadataBucket)
+	if err != nil {
+		return err
+	}
+	if dbVersion != oldVersion {
+		return errors.E(errors.Invalid, errors.Errorf("multisigCoinTypeUpgrade inappropriately called"))
+	}
+
+	txmgrBucket := tx.ReadWriteBucket(wtxmgrBucketKey)
+	if txmgrBucket == nil {
+		return errors.E(errors.IO, "missing transaction manager bucket")
+	}
+	msBucket := txmgrBucket.NestedReadWriteBucket(bucketMultisig)
+	if msBucket == nil {
+		// No multisig bucket yet — nothing to migrate.
+		return unifiedDBMetadata{}.putVersion(metadataBucket, newVersion)
+	}
+
+	// Collect pre-upgrade entries. Modifying the bucket during ForEach is
+	// not supported by all backends, so buffer first.
+	type rec struct {
+		k, v []byte
+	}
+	var toMigrate []rec
+	err = msBucket.ForEach(func(k, v []byte) error {
+		if len(v) == multisigOutV1Len {
+			kc := make([]byte, len(k))
+			copy(kc, k)
+			vc := make([]byte, len(v))
+			copy(vc, v)
+			toMigrate = append(toMigrate, rec{kc, vc})
+		}
+		return nil
+	})
+	if err != nil {
+		return errors.E(errors.IO, err)
+	}
+
+	// Append CoinType=VAR (0) + zero-length SKAAmount tail to each v1 entry.
+	for _, r := range toMigrate {
+		v2 := make([]byte, multisigOutV1Len+2)
+		copy(v2, r.v)
+		v2[multisigOutV1Len] = uint8(cointype.CoinTypeVAR)
+		v2[multisigOutV1Len+1] = 0
+		if err := msBucket.Put(r.k, v2); err != nil {
+			return errors.E(errors.IO, err)
+		}
+	}
+
 	return unifiedDBMetadata{}.putVersion(metadataBucket, newVersion)
 }

@@ -43,7 +43,7 @@ func makeInputSource(unspents []*wire.TxOut) txauthor.InputSource {
 	currentTotal := dcrutil.Amount(0)
 	currentInputs := make([]*wire.TxIn, 0, len(unspents))
 	redeemScriptSizes := make([]int, 0, len(unspents))
-	f := func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
+	f := func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
 		for currentTotal < target && len(unspents) != 0 {
 			u := unspents[0]
 			unspents = unspents[1:]

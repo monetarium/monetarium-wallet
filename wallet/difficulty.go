@@ -6,7 +6,7 @@
 package wallet
 
 // This code was copied from dcrd/blockchain/difficulty.go and modified for
-// dcrwallet's header storage.
+// monetarium-wallet's header storage.
 
 import (
 	"context"

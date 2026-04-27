@@ -117,15 +117,15 @@ type config struct {
 	DisableCoinTypeUpgrades bool                `long:"disablecointypeupgrades" description:"Never upgrade from legacy to SLIP0044 coin type keys"`
 
 	// RPC client options
-	RPCConnect       string                  `short:"c" long:"rpcconnect" description:"Network address of dcrd RPC server"`
-	CAFile           *cfgutil.ExplicitString `long:"cafile" description:"dcrd RPC Certificate Authority"`
+	RPCConnect       string                  `short:"c" long:"rpcconnect" description:"Network address of MONN RPC server"`
+	CAFile           *cfgutil.ExplicitString `long:"cafile" description:"MONN RPC Certificate Authority"`
 	ClientCAFile     *cfgutil.ExplicitString `long:"clientcafile" description:"Certficate Authority to verify TLS client certificates"`
-	DisableClientTLS bool                    `long:"noclienttls" description:"Disable TLS for dcrd RPC; only allowed when connecting to localhost"`
-	DcrdUsername     string                  `long:"dcrdusername" description:"dcrd RPC username; overrides --username"`
-	DcrdPassword     string                  `long:"dcrdpassword" default-mask:"-" description:"dcrd RPC password; overrides --password"`
-	DcrdClientCert   *cfgutil.ExplicitString `long:"dcrdclientcert" description:"TLS client certificate to present to authenticate RPC connections to dcrd"`
-	DcrdClientKey    *cfgutil.ExplicitString `long:"dcrdclientkey" description:"Key for dcrd RPC client certificate"`
-	DcrdAuthType     string                  `long:"dcrdauthtype" description:"Method for dcrd JSON-RPC client authentication (basic or clientcert)"`
+	DisableClientTLS bool                    `long:"noclienttls" description:"Disable TLS for MONN RPC; only allowed when connecting to localhost"`
+	DcrdUsername     string                  `long:"dcrdusername" description:"MONN RPC username; overrides --username"`
+	DcrdPassword     string                  `long:"dcrdpassword" default-mask:"-" description:"MONN RPC password; overrides --password"`
+	DcrdClientCert   *cfgutil.ExplicitString `long:"dcrdclientcert" description:"TLS client certificate to present to authenticate RPC connections to MONN"`
+	DcrdClientKey    *cfgutil.ExplicitString `long:"dcrdclientkey" description:"Key for MONN RPC client certificate"`
+	DcrdAuthType     string                  `long:"dcrdauthtype" description:"Method for MONN JSON-RPC client authentication (basic or clientcert)"`
 
 	// Proxy and Tor settings
 	Proxy        string `long:"proxy" description:"Establish network connections and DNS lookups through a SOCKS5 proxy (e.g. 127.0.0.1:9050)"`
@@ -331,7 +331,7 @@ func parseAndSetDebugLevels(debugLevel string) error {
 //  3. Load configuration file overwriting defaults with any specified options
 //  4. Parse CLI options and overwrite/add any specified options
 //
-// The above results in dcrwallet functioning properly without any config
+// The above results in monetarium-wallet functioning properly without any config
 // settings while still allowing the user to override settings with config files
 // and command line options.  Command line options always take precedence.
 // The bool returned indicates whether or not the wallet was recreated from a

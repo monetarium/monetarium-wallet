@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
@@ -27,7 +28,7 @@ type BlockIdentity struct {
 // None returns whether there is no block described by the instance.  When
 // associated with a transaction, this indicates the transaction is unmined.
 func (b *BlockIdentity) None() bool {
-	// BUG: Because dcrwallet uses both 0 and -1 in various places to refer
+	// BUG: Because monetarium-wallet (inherited from dcrwallet) uses both 0 and -1 in various places to refer
 	// to an unmined transaction this must check against both and may not
 	// ever be usable to represent the genesis block.
 	return *b == BlockIdentity{Height: -1} || *b == BlockIdentity{}
@@ -79,7 +80,9 @@ type P2SHMultiSigOutput struct {
 	// fetching other Transactionoutput data together with the rest of the
 	// multisig info.
 	OutPoint        wire.OutPoint
-	OutputAmount    dcrutil.Amount
+	OutputAmount    dcrutil.Amount    // VAR atoms (int64); 0 for SKA outputs
+	SKAOutputAmount cointype.SKAAmount // SKA atoms (big.Int); Zero for VAR outputs
+	CoinType        cointype.CoinType  // VAR (0) or SKA (1-255)
 	ContainingBlock BlockIdentity
 
 	P2SHAddress  *stdaddr.AddressScriptHashV0

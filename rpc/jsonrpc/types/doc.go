@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 /*
-Package types implements concrete types for the dcrwallet JSON-RPC API.
+Package types implements concrete types for the monetarium-wallet JSON-RPC API.
 
 When communicating via the JSON-RPC protocol, all of the commands need to be
 marshalled to and from the wire in the appropriate format.  This package

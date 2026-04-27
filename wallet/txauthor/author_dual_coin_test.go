@@ -44,11 +44,19 @@ func makeInputSourceWithCoinType(unspents []*wire.TxOut) txauthor.InputSource {
 	currentSKATotal := cointype.Zero()
 	currentInputs := make([]*wire.TxIn, 0, len(unspents))
 	redeemScriptSizes := make([]int, 0, len(unspents))
-	f := func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
-		// For SKA, target=0 means collect all; for VAR, collect until target is met
+	f := func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
+		// Collect UTXOs until the coin-type-appropriate target is met. Break
+		// checks run on the *already-accumulated* totals (before consuming
+		// the next unspent), matching MakeInputSourceWithCoinType semantics.
 		for len(unspents) != 0 {
+			if target > 0 && currentTotal >= target {
+				break
+			}
+			if !targetSKA.IsZero() && currentSKATotal.Cmp(targetSKA) >= 0 {
+				break
+			}
 			u := unspents[0]
-			// Get the value from the appropriate field based on coin type
+			unspents = unspents[1:]
 			var value int64
 			if u.CoinType.IsSKA() && u.SKAValue != nil {
 				value = u.SKAValue.Int64()
@@ -56,11 +64,6 @@ func makeInputSourceWithCoinType(unspents []*wire.TxOut) txauthor.InputSource {
 			} else {
 				value = u.Value
 			}
-			// Check if we have enough for VAR (target > 0)
-			if target > 0 && currentTotal >= target {
-				break
-			}
-			unspents = unspents[1:]
 			nextInput := wire.NewTxIn(&wire.OutPoint{}, value, nil)
 			currentTotal += dcrutil.Amount(value)
 			currentInputs = append(currentInputs, nextInput)

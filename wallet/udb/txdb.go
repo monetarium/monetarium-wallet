@@ -2137,6 +2137,7 @@ func extractRawTicketPickedHeight(v []byte) int32 {
 // [32:36]   Index (uint32)
 //
 // The value is the following:
+// v1 layout (135 bytes, VAR-only):
 // [0:20]    P2SH Hash (20 bytes)
 // [20]      m (in m-of-n) (uint8)
 // [21]      n (in m-of-n) (uint8)
@@ -2152,17 +2153,82 @@ func extractRawTicketPickedHeight(v []byte) int32 {
 // [99:103]  SpentByIndex (uint32)
 // [103:135] TxHash (32 byte hash)
 //
+// v2 layout (>=137 bytes, dual-coin) appends:
+// [135]        CoinType (uint8)
+// [136]        SKAAmount length (uint8, little-endian big.Int magnitude bytes)
+// [137:137+L]  SKAAmount bytes (unsigned big-endian). L==0 for VAR.
+//
 // The structure is set up so that the user may easily spend from any unspent
 // P2SH multisig outpoints they own an address in.
 func keyMultisigOut(hash chainhash.Hash, index uint32) []byte {
 	return canonicalOutPoint(&hash, index)
 }
 
+// multisigOutV1Len is the byte length of the legacy VAR-only MultisigOut value
+// (prior to wallet DB migration adding CoinType + SKAAmount fields).
+//
+// Schema-evolution invariant (read carefully before touching this layout):
+// fetchMultisigOut distinguishes v1 from v2 by length alone — exactly 135
+// bytes is v1, ≥137 bytes is v2 with the [CoinType:1][SKALen:1][SKABytes:N]
+// tail. This length-based discriminator is correct for the v1→v2
+// transition because v1's length is fixed.
+//
+// Any future schema bump MUST NOT extend the layout in a way that allows a
+// new variant to share a length with an existing one. The forbidden lengths
+// for any v3+ writer are:
+//
+//   - exactly multisigOutV1Len     (135). The reader treats this length as
+//     v1 and parses byte-by-byte from the v1 layout; a v3 record at this
+//     length would silently corrupt. This is a writer-side invariant: the
+//     reader CANNOT detect a v3-at-135-bytes record (it has no way to tell
+//     it apart from v1), so the only defense is "v3 writers must never
+//     emit 135 bytes." Enforce this in any v3 writer with a length
+//     assertion and a regression test.
+//   - exactly multisigOutV1Len + 1 (136). The reader rejects this length
+//     explicitly (see fetchMultisigOut below), so a v3 writer that
+//     happens to emit 136 bytes will fail loudly at read time rather
+//     than corrupt. The 135-byte case has no equivalent reader-side
+//     guard.
+//
+// Note that v[0] cannot serve as a version sentinel because it lies inside
+// the 20-byte ripemd160 ScriptHash, where every byte value is legitimate.
+// Two safe options for v3:
+//
+//   1. Append an unambiguous trailer with its own length-prefix, so the
+//      total length is monotonically larger than every prior variant and
+//      readers can probe the trailer before falling back to v2.
+//   2. Restructure the record with a fixed leading magic prefix that
+//      cannot appear at the start of a v1 or v2 record (which would
+//      require lengthening v3 beyond the v1/v2 span and committing to
+//      length-monotonic schema evolution thereafter).
+//
+// Without one of these protections, future readers will silently
+// misinterpret bytes — the failure mode is catastrophic (corrupted
+// multisig values returned as if they were valid). Do not treat this
+// comment as advisory; the in-code 136-byte reject below is the minimum
+// guard, not the maximum.
+const multisigOutV1Len = 135
+
 func valueMultisigOut(sh [ripemd160.Size]byte, m uint8, n uint8,
 	spent bool, tree int8, blockHash chainhash.Hash,
 	blockHeight uint32, amount dcrutil.Amount, spentBy chainhash.Hash,
-	sbi uint32, txHash chainhash.Hash) []byte {
-	v := make([]byte, 135)
+	sbi uint32, txHash chainhash.Hash,
+	coinType cointype.CoinType, skaAmount cointype.SKAAmount) ([]byte, error) {
+	var skaBytes []byte
+	if !skaAmount.IsZero() {
+		skaBytes = skaAmount.Bytes()
+	}
+	if len(skaBytes) > 255 {
+		// 255 bytes of unsigned magnitude is ~10^614 atoms — well past any
+		// conceivable SKA supply. Reaching this branch indicates either a
+		// caller bug or DB corruption upstream; refuse the write rather
+		// than silently truncating, which would persist a corrupted value.
+		return nil, errors.E(errors.IO, errors.Errorf(
+			"SKAAmount magnitude %d bytes exceeds multisig output's "+
+				"single-byte length prefix", len(skaBytes)))
+	}
+
+	v := make([]byte, multisigOutV1Len+2+len(skaBytes))
 
 	copy(v[0:20], sh[0:20])
 	v[20] = m
@@ -2186,15 +2252,30 @@ func valueMultisigOut(sh [ripemd160.Size]byte, m uint8, n uint8,
 
 	copy(v[103:135], txHash[:])
 
-	return v
+	v[135] = uint8(coinType)
+	v[136] = uint8(len(skaBytes))
+	copy(v[137:], skaBytes)
+
+	return v, nil
 }
 
 func fetchMultisigOut(k, v []byte) (*MultisigOut, error) {
 	if len(k) != 36 {
 		return nil, errors.E(errors.IO, "multisig output key len %d", len(k))
 	}
-	if len(v) != 135 {
+	if len(v) < multisigOutV1Len {
 		return nil, errors.E(errors.IO, "multisig output len %d", len(v))
+	}
+	// Reject the 136-byte length: it falls between v1 (135 exactly) and v2
+	// (≥137, with a [CoinType:1][SKALen:1][SKABytes:N] tail where N≥0).
+	// No legitimate writer produces 136 bytes today; rejecting it locks in
+	// the "no length collision" schema invariant in code so a future v3
+	// schema that accidentally produces 136 bytes fails loudly at read
+	// time rather than being silently misinterpreted as malformed v2.
+	// See the comment block above multisigOutV1Len for the full schema
+	// rationale.
+	if len(v) == multisigOutV1Len+1 {
+		return nil, errors.E(errors.IO, "multisig output len %d is reserved (v1=135, v2>=137)", len(v))
 	}
 
 	var mso MultisigOut
@@ -2226,6 +2307,19 @@ func fetchMultisigOut(k, v []byte) (*MultisigOut, error) {
 	mso.SpentByIndex = byteOrder.Uint32(v[99:103])
 
 	copy(mso.TxHash[0:32], v[103:135])
+
+	// Dual-coin tail (v2). Missing for pre-migration entries; treat as VAR.
+	mso.SKAAmount = cointype.Zero()
+	if len(v) >= multisigOutV1Len+2 {
+		mso.CoinType = cointype.CoinType(v[135])
+		skaLen := int(v[136])
+		if len(v) < multisigOutV1Len+2+skaLen {
+			return nil, errors.E(errors.IO, "multisig output ska amount len %d exceeds value len %d", skaLen, len(v))
+		}
+		if skaLen > 0 {
+			mso.SKAAmount = cointype.SKAAmountFromBytes(v[137 : 137+skaLen])
+		}
+	}
 
 	return &mso, nil
 }
@@ -2322,7 +2416,7 @@ func existsMultisigOutCopy(ns walletdb.ReadBucket, k []byte) []byte {
 	if vOrig == nil {
 		return nil
 	}
-	v := make([]byte, 135)
+	v := make([]byte, len(vOrig))
 	copy(v, vOrig)
 	return v
 }

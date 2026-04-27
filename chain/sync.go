@@ -493,7 +493,7 @@ func (s *Syncer) waitRPCSync(ctx context.Context, minHeight int64) error {
 			return nil
 		}
 
-		log.Infof("Waiting for dcrd instance to catch up to minimum block "+
+		log.Infof("Waiting for MONN instance to catch up to minimum block "+
 			"height %d (%d blocks, %d headers, chain synced=%v)",
 			minHeight, info.Blocks, info.Headers, !info.InitialBlockDownload)
 

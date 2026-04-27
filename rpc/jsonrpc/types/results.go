@@ -81,12 +81,16 @@ type CreateAuthorizedEmissionResult struct {
 }
 
 // GenerateEmissionKeyResult models the data returned from the generateemissionkey command.
+//
+// EncryptedPrivateKey is only populated when the request sets
+// ReturnEncryptedBackup=true. The canonical backup is the wallet DB itself
+// (stored under CKTEmission, scrypt-protected by the wallet's master passphrase).
 type GenerateEmissionKeyResult struct {
-	Success             bool   `json:"success"`             // Whether the key was successfully generated
-	CoinType            uint8  `json:"cointype,omitempty"`  // Optional coin type for user reference
-	KeyName             string `json:"keyname"`             // Name identifier for the generated key
-	PublicKey           string `json:"publickey"`           // Hex-encoded public key for governance proposals
-	EncryptedPrivateKey string `json:"encryptedprivatekey"` // AES-256-GCM encrypted private key for backup
+	Success             bool   `json:"success"`                       // Whether the key was successfully generated
+	CoinType            uint8  `json:"cointype,omitempty"`            // Optional coin type for user reference
+	KeyName             string `json:"keyname"`                       // Name identifier for the generated key
+	PublicKey           string `json:"publickey"`                     // Hex-encoded public key for governance proposals
+	EncryptedPrivateKey string `json:"encryptedprivatekey,omitempty"` // Encrypted private-key backup (scrypt+AES-GCM); only present when ReturnEncryptedBackup=true
 }
 
 // ImportEmissionKeyResult models the data returned from the importemissionkey command.
@@ -335,8 +339,14 @@ type RedeemMultiSigOutResult struct {
 
 // RedeemMultiSigOutsResult models the data returned from the redeemmultisigouts
 // command.
+//
+// Truncated is set to true when the wallet capped the number of multisig
+// outputs processed in a single call (server-side cap, currently 256). Callers
+// that see Truncated=true should spend the returned redemption transactions
+// and re-call to drain the remaining outputs.
 type RedeemMultiSigOutsResult struct {
-	Results []RedeemMultiSigOutResult `json:"results"`
+	Results   []RedeemMultiSigOutResult `json:"results"`
+	Truncated bool                      `json:"truncated"`
 }
 
 // SendToMultiSigResult models the data returned from the sendtomultisig

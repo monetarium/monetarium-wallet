@@ -55,6 +55,19 @@ const (
 		txscript.ScriptVerifyCheckLockTimeVerify |
 		txscript.ScriptVerifyCheckSequenceVerify |
 		txscript.ScriptVerifyTreasury
+
+	// multisigSKAFeePreSelectInputGuess is the input-count upper bound used
+	// when computing the SKA pre-selection fee budget in
+	// txToMultisigInternal. The post-selection real-fee recompute is the
+	// authoritative balance check, so over-estimating here is harmless
+	// (it just pulls more inputs than strictly needed); under-estimating
+	// produces a spurious InsufficientBalance for fragmented wallets that
+	// would otherwise have enough SKA to cover the real fee.
+	//
+	// 50 covers all but pathologically dust-fragmented SKA wallets at
+	// AtomsPerCoin=1e18: 50 P2SH inputs + 1 output + change is ~8.5 kB,
+	// budgeting ~3.4e19 atoms in fees against a ~4e18/kB relay fee.
+	multisigSKAFeePreSelectInputGuess = 50
 )
 
 // Input provides transaction inputs referencing spendable outputs.
@@ -622,9 +635,12 @@ func (w *Wallet) recordAuthoredTx(ctx context.Context, op errors.Op, a *authorTx
 }
 
 // txToMultisig spends funds to a multisig output, partially signs the
-// transaction, then returns fund
-func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32, amount dcrutil.Amount, pubkeys [][]byte,
-	nRequired int8, minconf int32, coinType cointype.CoinType) (*CreatedTx, stdaddr.Address, []byte, error) {
+// transaction, then returns fund. For VAR the amount parameter is used and
+// amountSKA is ignored; for SKA the amountSKA parameter is used end-to-end as
+// a big.Int so amounts above math.MaxInt64 atoms (SKA's AtomsPerCoin=1e18) are
+// preserved losslessly.
+func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32, amount dcrutil.Amount, amountSKA cointype.SKAAmount,
+	pubkeys [][]byte, nRequired int8, minconf int32, coinType cointype.CoinType) (*CreatedTx, stdaddr.Address, []byte, error) {
 
 	defer w.lockedOutpointMu.Unlock()
 	w.lockedOutpointMu.Lock()
@@ -635,7 +651,7 @@ func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32,
 	err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
 		var err error
 		created, addr, msScript, err = w.txToMultisigInternal(ctx, op, dbtx,
-			account, amount, pubkeys, nRequired, minconf, coinType)
+			account, amount, amountSKA, pubkeys, nRequired, minconf, coinType)
 		return err
 	})
 	if err != nil {
@@ -645,7 +661,7 @@ func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32,
 }
 
 func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx walletdb.ReadWriteTx, account uint32, amount dcrutil.Amount,
-	pubkeys [][]byte, nRequired int8, minconf int32, coinType cointype.CoinType) (*CreatedTx, stdaddr.Address, []byte, error) {
+	amountSKA cointype.SKAAmount, pubkeys [][]byte, nRequired int8, minconf int32, coinType cointype.CoinType) (*CreatedTx, stdaddr.Address, []byte, error) {
 
 	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 
@@ -661,8 +677,11 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 	// Get current block's height and hash.
 	_, topHeight := w.txStore.MainChainTip(dbtx)
 
-	// Add in some extra for fees. TODO In the future, make a better
-	// fee estimator.
+	// VAR pre-selection fee budget. The SKA branch below derives its own
+	// pre-budget from the configured SKA relay fee — the int64 atoms here
+	// are ~12 orders of magnitude smaller than real SKA fees and are not
+	// usable for SKA. Both branches recompute the authoritative fee post-
+	// selection.
 	var feeEstForTx dcrutil.Amount
 	switch w.chainParams.Net {
 	case wire.MainNet:
@@ -674,14 +693,40 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 	default:
 		feeEstForTx = 3e4
 	}
-	amountRequired := amount + feeEstForTx
 
-	// Instead of taking reward addresses by arg, just create them now  and
+	// Instead of taking reward addresses by arg, just create them now and
 	// automatically find all eligible outputs from all current utxos.
 	const minAmount = 0
 	const maxResults = 0
+	var amountRequired dcrutil.Amount
+	amountRequiredSKA := cointype.Zero()
+	if coinType.IsSKA() {
+		// Pre-selection fee budget for SKA: estimate the tx size assuming
+		// up to multisigSKAFeePreSelectInputGuess inputs, one P2SH output,
+		// and a P2PKH change output, then multiply by the configured SKA
+		// relay fee. The post-selection recompute below at the balance-
+		// check is the authoritative fee; this only needs to be a safe
+		// upper bound so findEligibleOutputsAmount returns enough inputs
+		// to cover it.
+		estScriptSizes := make([]int, multisigSKAFeePreSelectInputGuess)
+		for i := range estScriptSizes {
+			estScriptSizes[i] = txsizes.RedeemP2SHSigScriptSize
+		}
+		estTxOuts := []*wire.TxOut{{
+			Value:    0,
+			SKAValue: amountSKA.BigInt(),
+			PkScript: make([]byte, txsizes.P2SHPkScriptSize),
+			CoinType: coinType,
+		}}
+		preBudgetSize := txsizes.EstimateSerializeSizeSKA(estScriptSizes, estTxOuts, txsizes.P2PKHPkScriptSize)
+		relayFeeBig := w.RelayFeeForCoinType(ctx, coinType)
+		skaFeePreBudget := txrules.FeeForSerializeSizeSKA(relayFeeBig, preBudgetSize)
+		amountRequiredSKA = amountSKA.Add(skaFeePreBudget)
+	} else {
+		amountRequired = amount + feeEstForTx
+	}
 	eligible, err := w.findEligibleOutputsAmount(dbtx, account, minconf,
-		amountRequired, topHeight, minAmount, maxResults, coinType)
+		amountRequired, amountRequiredSKA, topHeight, minAmount, maxResults, coinType)
 	if err != nil {
 		return txToMultisigError(errors.E(op, err))
 	}
@@ -742,56 +787,61 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 	// Handle VAR and SKA separately to avoid int64 overflow
 	var feeSize int
 	if coinType.IsSKA() {
-		// SKA path: use big.Int arithmetic
-		skaAmount := cointype.SKAAmountFromInt64(int64(amount))
-
+		// SKA path: use big.Int arithmetic end-to-end. amountSKA is the
+		// caller's target in atoms, preserved losslessly.
 		// Create output with SKAValue (Value=0 for SKA)
 		txOut := &wire.TxOut{
 			Value:    0,
-			SKAValue: skaAmount.BigInt(),
+			SKAValue: amountSKA.BigInt(),
 			PkScript: p2shScript,
 			Version:  vers,
 			CoinType: coinType,
 		}
 		msgtx.AddTxOut(txOut)
 
-		// Estimate fee (fees are always small enough for int64)
-		skaFeeEst := cointype.SKAAmountFromInt64(int64(feeEstForTx))
-		changeSize := 0
-		if totalSKAInput.Cmp(skaAmount.Add(skaFeeEst)) > 0 {
-			changeSize = txsizes.P2PKHPkScriptSize
-		}
-		feeSize = txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, changeSize)
+		// Always estimate fee assuming a change output. SKA relay fees are
+		// ~1e18 atoms/KB so the int64 feeEstForTx guess from the caller is
+		// not usable for SKA (off by ~12 orders of magnitude); compute the
+		// true fee from the relay-fee config for this coin type. Including
+		// changeSize unconditionally over-estimates by ~25 bytes' worth of
+		// fee in the no-change case, which is harmless; under-estimating
+		// would risk relay rejection if the leftover after change-add
+		// crossed the dust threshold.
+		feeSize = txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, txsizes.P2PKHPkScriptSize)
 		relayFeeBig := w.RelayFeeForCoinType(ctx, coinType)
 		skaFeeEstActual := txrules.FeeForSerializeSizeSKA(relayFeeBig, feeSize)
 
 		// Balance check
-		required := skaAmount.Add(skaFeeEstActual)
+		required := amountSKA.Add(skaFeeEstActual)
 		if totalSKAInput.Cmp(required) < 0 {
 			return txToMultisigError(errors.E(op, errors.InsufficientBalance))
 		}
 
-		// Add change if needed
+		// Add change if needed. Drop sub-dust change (forfeit to fees) to
+		// match wallet/txauthor/author.go behavior — a dust change output
+		// would be silently rejected by the network.
 		if totalSKAInput.Cmp(required) > 0 {
-			changeSource := p2PKHChangeSource{
-				persist: w.persistReturnedChild(ctx, dbtx),
-				account: account,
-				wallet:  w,
-				ctx:     ctx,
-			}
-
-			pkScript, vers, err := changeSource.Script()
-			if err != nil {
-				return txToMultisigError(err)
-			}
 			change := totalSKAInput.Sub(required)
-			msgtx.AddTxOut(&wire.TxOut{
-				Value:    0,
-				SKAValue: change.BigInt(),
-				Version:  vers,
-				PkScript: pkScript,
-				CoinType: coinType,
-			})
+			if change.BigInt().Cmp(cointype.MinSKADustAmount) >= 0 {
+				changeSource := p2PKHChangeSource{
+					persist: w.persistReturnedChild(ctx, dbtx),
+					account: account,
+					wallet:  w,
+					ctx:     ctx,
+				}
+
+				pkScript, vers, err := changeSource.Script()
+				if err != nil {
+					return txToMultisigError(err)
+				}
+				msgtx.AddTxOut(&wire.TxOut{
+					Value:    0,
+					SKAValue: change.BigInt(),
+					Version:  vers,
+					PkScript: pkScript,
+					CoinType: coinType,
+				})
+			}
 		}
 	} else {
 		// VAR path: use int64 arithmetic
@@ -1020,6 +1070,12 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 		skaOutput := totalAddedSKA.Sub(skaFee)
 		if skaOutput.IsNegative() || skaOutput.IsZero() {
 			return nil, errors.E(op, errors.InsufficientBalance)
+		}
+		// Reject sub-dust consolidated outputs: there is no change to drop,
+		// the consolidated UTXO would be unspendable on the network.
+		if skaOutput.BigInt().Cmp(cointype.MinSKADustAmount) < 0 {
+			return nil, errors.E(op, errors.InsufficientBalance,
+				"consolidated SKA output below dust threshold after fees")
 		}
 		msgtx.TxOut[0].Value = 0
 		msgtx.TxOut[0].SKAValue = skaOutput.BigInt()
@@ -1490,7 +1546,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		for i := 0; i < req.Count; i++ {
 			if req.extraSplitOutput == nil {
 				credits, err := w.ReserveOutputsForAmount(ctx,
-					req.SourceAccount, fee, req.MinConf, cointype.CoinTypeVAR)
+					req.SourceAccount, fee, cointype.Zero(), req.MinConf, cointype.CoinTypeVAR)
 
 				if errors.Is(err, errors.InsufficientBalance) {
 					lowBalance = true
@@ -1504,7 +1560,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			}
 
 			credits, err := w.ReserveOutputsForAmount(ctx, req.SourceAccount,
-				ticketPrice, req.MinConf, cointype.CoinTypeVAR)
+				ticketPrice, cointype.Zero(), req.MinConf, cointype.CoinTypeVAR)
 			if errors.Is(err, errors.InsufficientBalance) {
 				lowBalance = true
 				credits, _ = w.reserveOutputs(ctx, req.SourceAccount,
@@ -1837,7 +1893,11 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 
 // ReserveOutputsForAmount returns locked spendable outpoints from the given
 // account.  It is the responsibility of the caller to unlock the outpoints.
-func (w *Wallet) ReserveOutputsForAmount(ctx context.Context, account uint32, amount dcrutil.Amount, minconf int32, coinType cointype.CoinType) ([]Input, error) {
+// For VAR coin type the `amount` parameter drives selection and `amountSKA`
+// is ignored; for SKA the `amountSKA` big.Int parameter drives selection and
+// `amount` is ignored. Callers operating on one coin should pass 0 or
+// cointype.Zero() for the unused parameter.
+func (w *Wallet) ReserveOutputsForAmount(ctx context.Context, account uint32, amount dcrutil.Amount, amountSKA cointype.SKAAmount, minconf int32, coinType cointype.CoinType) ([]Input, error) {
 	defer w.lockedOutpointMu.Unlock()
 	w.lockedOutpointMu.Lock()
 
@@ -1849,7 +1909,7 @@ func (w *Wallet) ReserveOutputsForAmount(ctx context.Context, account uint32, am
 		var err error
 		const minAmount = 0
 		const maxResults = 0
-		outputs, err = w.findEligibleOutputsAmount(dbtx, account, minconf, amount, tipHeight,
+		outputs, err = w.findEligibleOutputsAmount(dbtx, account, minconf, amount, amountSKA, tipHeight,
 			minAmount, maxResults, coinType)
 		if err != nil {
 			return err
@@ -1989,6 +2049,13 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 			PkScript: output.PkScript,
 			CoinType: output.CoinType,
 		}
+		if output.CoinType.IsSKA() {
+			// SKA value lives in SKAValue (big.Int); leave Value at 0
+			// so downstream consumers (e.g. compressWalletInternal) treat
+			// this as an SKA input and not a VAR input.
+			txOut.Value = 0
+			txOut.SKAValue = output.SKAAmount.BigInt()
+		}
 		eligible = append(eligible, Input{
 			OutPoint: output.OutPoint,
 			PrevOut:  *txOut,
@@ -2000,13 +2067,31 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 
 // findEligibleOutputsAmount uses wtxmgr to find a number of unspent outputs
 // while doing maturity checks there.
+//
+// For VAR (coinType == CoinTypeVAR) the `amount` / `minAmount` parameters drive
+// selection and `amountSKA` is ignored. For SKA coin types the `amountSKA`
+// parameter drives selection (via big.Int comparisons so values above
+// math.MaxInt64 atoms are handled correctly) and `amount` / `minAmount` are
+// ignored.
+//
+// "No-target" sentinel: passing `amount == 0` (VAR) or `amountSKA.IsZero()`
+// (SKA) signals "consume every eligible output up to maxResults" — the
+// inherited wallet idiom, used by consolidation and sweep flows. There is
+// no supported way to request a transaction with a real zero-atom target;
+// callers that need exactly zero atoms (e.g. a VAR-only output that ships
+// with an SKA-typed sibling) must construct the transaction manually. The
+// public RPC layer rejects zero-amount sends in sendto*/sendtoburn before
+// reaching this function, so this convention is safe in practice.
 func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32, minconf int32,
-	amount dcrutil.Amount, currentHeight int32, minAmount dcrutil.Amount, maxResults int, coinType cointype.CoinType) ([]Input, error) {
+	amount dcrutil.Amount, amountSKA cointype.SKAAmount, currentHeight int32, minAmount dcrutil.Amount,
+	maxResults int, coinType cointype.CoinType) ([]Input, error) {
 
 	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+	isSKA := coinType.IsSKA()
 
 	var eligible []Input
 	var outTotal dcrutil.Amount
+	outTotalSKA := cointype.Zero()
 	seen := make(map[outpoint]struct{})
 	skip := func(output *udb.Credit) bool {
 		if _, ok := seen[outpoint{output.Hash, output.Index}]; ok {
@@ -2026,7 +2111,9 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 		}
 
 		// When a minimum amount is required, skip when it is less.
-		if minAmount != 0 && output.Amount < minAmount {
+		// VAR-only; SKA callers do not use minAmount (its int64 type
+		// cannot represent SKA atoms anyway).
+		if !isSKA && minAmount != 0 && output.Amount < minAmount {
 			return true
 		}
 
@@ -2084,16 +2171,53 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 		return false
 	}
 
+	// targetMet reports whether accumulated outputs cover the caller's target.
+	// amount == 0 (VAR) / amountSKA.IsZero() (SKA) means "no target" — keep
+	// collecting until maxResults (if set) or the UTXO set is exhausted.
+	targetMet := func() bool {
+		if isSKA {
+			return !amountSKA.IsZero() && outTotalSKA.Cmp(amountSKA) >= 0
+		}
+		return amount != 0 && outTotal >= amount
+	}
+
+	// appendInput builds the Input struct from a credit, tracks the running
+	// total for the current coin type, and appends to the eligible slice.
+	appendInput := func(output *udb.Credit) {
+		txOut := &wire.TxOut{
+			Value:    int64(output.Amount),
+			Version:  wire.DefaultPkScriptVersion, // XXX
+			PkScript: output.PkScript,
+			CoinType: output.CoinType,
+		}
+		if isSKA {
+			txOut.Value = 0
+			txOut.SKAValue = output.SKAAmount.BigInt()
+			outTotalSKA = outTotalSKA.Add(output.SKAAmount)
+		} else {
+			outTotal += output.Amount
+		}
+		eligible = append(eligible, Input{
+			OutPoint: output.OutPoint,
+			PrevOut:  *txOut,
+		})
+	}
+
+	hasTarget := (!isSKA && amount != 0) || (isSKA && !amountSKA.IsZero())
+
 	randTries := 0
 	maxTries := 0
-	if (amount != 0 || maxResults != 0) && minconf > 0 {
-		numUnspent := w.txStore.UnspentOutputCount(dbtx, nil) // nil = all coin types
-		log.Debugf("Unspent bucket k/v count: %v", numUnspent)
+	if (hasTarget || maxResults != 0) && minconf > 0 {
+		// Budget the random-pass by the count of UTXOs that RandomUTXO can
+		// actually return (filtered by coin type) — otherwise a wallet with
+		// many VAR UTXOs and few SKA UTXOs would burn iterations looking for
+		// the wrong coin type before falling back to the deterministic pass.
+		numUnspent := w.txStore.UnspentOutputCount(dbtx, &coinType)
+		log.Debugf("Unspent bucket k/v count for cointype %d: %v", coinType, numUnspent)
 		maxTries = numUnspent / 2
 	}
 	for ; randTries < maxTries; randTries++ {
-		// For random selection, default to VAR coin type
-		output, err := w.txStore.RandomUTXO(dbtx, minconf, currentHeight, cointype.CoinTypeVAR)
+		output, err := w.txStore.RandomUTXO(dbtx, minconf, currentHeight, coinType)
 		if err != nil {
 			return nil, err
 		}
@@ -2104,19 +2228,8 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 			continue
 		}
 		seen[outpoint{output.Hash, output.Index}] = struct{}{}
-
-		txOut := &wire.TxOut{
-			Value:    int64(output.Amount),
-			Version:  wire.DefaultPkScriptVersion, // XXX
-			PkScript: output.PkScript,
-			CoinType: output.CoinType,
-		}
-		eligible = append(eligible, Input{
-			OutPoint: output.OutPoint,
-			PrevOut:  *txOut,
-		})
-		outTotal += output.Amount
-		if amount != 0 && outTotal >= amount {
+		appendInput(output)
+		if targetMet() {
 			return eligible, nil
 		}
 		if maxResults != 0 && len(eligible) == maxResults {
@@ -2131,6 +2244,7 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 	eligible = eligible[:0]
 	seen = nil
 	outTotal = 0
+	outTotalSKA = cointype.Zero()
 	unspent, err := w.txStore.UnspentOutputs(dbtx, coinType)
 	if err != nil {
 		return nil, err
@@ -2142,26 +2256,15 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 		if skip(output) {
 			continue
 		}
-
-		txOut := &wire.TxOut{
-			Value:    int64(output.Amount),
-			Version:  wire.DefaultPkScriptVersion, // XXX
-			PkScript: output.PkScript,
-			CoinType: output.CoinType,
-		}
-		eligible = append(eligible, Input{
-			OutPoint: output.OutPoint,
-			PrevOut:  *txOut,
-		})
-		outTotal += output.Amount
-		if amount != 0 && outTotal >= amount {
+		appendInput(output)
+		if targetMet() {
 			return eligible, nil
 		}
 		if maxResults != 0 && len(eligible) == maxResults {
 			return eligible, nil
 		}
 	}
-	if amount != 0 && outTotal < amount {
+	if hasTarget && !targetMet() {
 		return nil, errors.InsufficientBalance
 	}
 

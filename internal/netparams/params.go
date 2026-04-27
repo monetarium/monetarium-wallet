@@ -16,8 +16,8 @@ type Params struct {
 	GRPCServerPort    string
 }
 
-// MainNetParams contains parameters specific running dcrwallet and
-// dcrd on the main network (wire.MainNet).
+// MainNetParams contains parameters specific to running monetarium-wallet and
+// monetarium-node on the main network (wire.MainNet).
 var MainNetParams = Params{
 	Params:            chaincfg.MainNetParams(),
 	JSONRPCClientPort: "9509",
@@ -25,8 +25,8 @@ var MainNetParams = Params{
 	GRPCServerPort:    "9511",
 }
 
-// TestNet3Params contains parameters specific running dcrwallet and
-// dcrd on the test network (version 3) (wire.TestNet3).
+// TestNet3Params contains parameters specific to running monetarium-wallet and
+// monetarium-node on the test network (version 3) (wire.TestNet3).
 var TestNet3Params = Params{
 	Params:            chaincfg.TestNet3Params(),
 	JSONRPCClientPort: "19509",

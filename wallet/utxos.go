@@ -114,8 +114,12 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 }
 
 // SelectInputs selects transaction inputs to redeem unspent outputs stored in
-// the wallet.  It returns an input detail summary.
-func (w *Wallet) SelectInputs(ctx context.Context, targetAmount dcrutil.Amount, policy OutputSelectionPolicy) (inputDetail *txauthor.InputDetail, err error) {
+// the wallet. It returns an input detail summary. For VAR coin-type policies
+// the `targetAmount` parameter drives selection and `targetSKAAmount` is
+// ignored; for SKA the big.Int `targetSKAAmount` drives selection and
+// `targetAmount` is ignored. Callers that don't need SKA precision can pass
+// cointype.Zero().
+func (w *Wallet) SelectInputs(ctx context.Context, targetAmount dcrutil.Amount, targetSKAAmount cointype.SKAAmount, policy OutputSelectionPolicy) (inputDetail *txauthor.InputDetail, err error) {
 	const op errors.Op = "wallet.SelectInputs"
 
 	defer w.lockedOutpointMu.Unlock()
@@ -138,7 +142,7 @@ func (w *Wallet) SelectInputs(ctx context.Context, targetAmount dcrutil.Amount, 
 		sourceImpl := w.txStore.MakeInputSourceWithCoinType(dbtx, policy.Account,
 			policy.RequiredConfirmations, tipHeight, nil, policy.CoinType)
 		var err error
-		inputDetail, err = sourceImpl.SelectInputs(targetAmount)
+		inputDetail, err = sourceImpl.SelectInputs(targetAmount, targetSKAAmount)
 		return err
 	})
 	if err != nil {

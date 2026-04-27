@@ -75,7 +75,7 @@ func TestDualCoinFeeCalculation(t *testing.T) {
 // TestTxAuthorFeeHandling tests that txauthor properly handles fees for all coin types
 func TestTxAuthorFeeHandling(t *testing.T) {
 	// Create mock input source for VAR that provides sufficient funds
-	varInputSource := func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
+	varInputSource := func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
 		// Provide inputs with enough value to cover target + fees
 		mockInput := &wire.TxIn{
 			PreviousOutPoint: wire.OutPoint{Index: 0},
@@ -89,9 +89,8 @@ func TestTxAuthorFeeHandling(t *testing.T) {
 	}
 
 	// Create mock input source for SKA that provides sufficient funds
-	skaInputSource := func(target dcrutil.Amount) (*txauthor.InputDetail, error) {
-		// For SKA, target=0 means collect all available
-		// Provide inputs with enough value to cover outputs + fees
+	skaInputSource := func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
+		// Provide inputs with enough value to cover the big.Int SKA target + fees
 		skaAmount := int64(100000000 + 10000) // Output amount + extra for fees
 		mockInput := &wire.TxIn{
 			PreviousOutPoint: wire.OutPoint{Index: 0},

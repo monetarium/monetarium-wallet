@@ -45,7 +45,13 @@ type InputDetail struct {
 // construct a transaction outputting some target amount.  If the target amount
 // can not be satisified, this can be signaled by returning a total amount less
 // than the target or by returning a more detailed error.
-type InputSource func(target dcrutil.Amount) (detail *InputDetail, err error)
+//
+// The two target arguments are coin-type-specific and mutually exclusive:
+// pass `target` (dcrutil.Amount / int64 atoms) for VAR with `targetSKA` as
+// cointype.Zero(); pass `targetSKA` (big.Int atoms) for SKA with `target` as
+// 0. SKA targets cannot be truncated through int64 since SKA atoms can exceed
+// math.MaxInt64 (AtomsPerCoin = 1e18).
+type InputSource func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (detail *InputDetail, err error)
 
 // AuthoredTx holds the state of a newly-created transaction and the change
 // output (if one was added).
@@ -152,16 +158,21 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmo
 	}
 
 	for {
-		// For SKA, pass target=0 to collect all available UTXOs since we can't
-		// pass big.Int through the int64 parameter. Then check with big.Int.
+		// Pass the coin-type-appropriate target. For VAR the big.Int
+		// target is Zero so the input source only stops on int64 target;
+		// for SKA the int64 target is 0 so the input source only stops on
+		// big.Int target. This replaces the old "target=0 means everything"
+		// hack which caused every SKA tx to co-spend all SKA UTXOs.
 		var inputTarget dcrutil.Amount
+		var inputTargetSKA cointype.SKAAmount
 		if isSKA {
-			inputTarget = 0 // Get all available SKA UTXOs
+			inputTargetSKA = targetSKAAmount.Add(targetFeeSKA)
 		} else {
 			inputTarget = targetAmount + targetFee
+			inputTargetSKA = cointype.Zero()
 		}
 
-		inputDetail, err := fetchInputs(inputTarget)
+		inputDetail, err := fetchInputs(inputTarget, inputTargetSKA)
 		if err != nil {
 			return nil, errors.E(op, err)
 		}
