@@ -869,6 +869,281 @@ func (m *Manager) UpgradeToSLIP0044CoinType(dbtx walletdb.ReadWriteTx) error {
 	return nil
 }
 
+// NeedsReregisteredSLIP0044Migration reports whether the wallet's active
+// SLIP0044 cointype keys were derived under a coin type other than the
+// chain's current chaincfg.Params.SLIP0044CoinType — i.e. whether
+// MigrateToReregisteredSLIP0044 would do real work if invoked with a
+// matching seed.
+//
+// The check inspects the BIP32 child number of the stored cointype xpub
+// (which carries the cointype its key was derived under) and does not
+// require the wallet to be unlocked.  Wallets still in the legacy-cointype
+// state, watching-only wallets, and chains where legacy and SLIP0044
+// cointypes are equal all report false.
+func (m *Manager) NeedsReregisteredSLIP0044Migration(dbtx walletdb.ReadTx) (bool, error) {
+	legacyCoinType, slip0044CoinType := CoinTypes(m.chainParams)
+	if legacyCoinType == slip0044CoinType {
+		return false, nil
+	}
+	if m.watchingOnly {
+		return false, nil
+	}
+
+	ns := dbtx.ReadBucket(waddrmgrBucketKey)
+	mainBucket := ns.NestedReadBucket(mainBucketName)
+
+	if mainBucket.Get(coinTypeLegacyPubKeyName) != nil {
+		// Wallet still uses legacy keys; UpgradeToSLIP0044CoinType is
+		// the upgrade path for that state, not this migration.
+		return false, nil
+	}
+
+	storedSLIP0044PubEnc := mainBucket.Get(coinTypeSLIP0044PubKeyName)
+	if storedSLIP0044PubEnc == nil {
+		return false, errors.E(errors.IO, "missing SLIP0044 cointype pubkey")
+	}
+
+	storedXpubStr, err := m.cryptoKeyPub.Decrypt(storedSLIP0044PubEnc)
+	if err != nil {
+		return false, errors.E(errors.Crypto, errors.Errorf("decrypt stored SLIP0044 xpub: %v", err))
+	}
+	storedXpub, err := hdkeychain.NewKeyFromString(string(storedXpubStr), m.chainParams)
+	zero(storedXpubStr)
+	if err != nil {
+		return false, errors.E(errors.IO, err)
+	}
+	storedCoinType := storedXpub.ChildNum() & ^uint32(hdkeychain.HardenedKeyStart)
+	storedXpub.Zero()
+
+	return storedCoinType != slip0044CoinType, nil
+}
+
+// MigrateToReregisteredSLIP0044 migrates a wallet whose SLIP0044 cointype keys
+// were derived under a previously-used coin type (e.g. 42, inherited from
+// upstream Decred) to a freshly-registered coin type now declared in
+// chaincfg.Params.SLIP0044CoinType (e.g. Monetarium's 9508).
+//
+// Because the seed is no longer stored in the database after database
+// version 4 (noEncryptedSeedVersion), and BIP32 does not allow deriving
+// sibling cointype keys from an existing cointype key, the seed must be
+// supplied by the caller.  The seed is verified by re-deriving the legacy
+// (currently-stored) cointype key and comparing against the on-disk value;
+// callers may treat an Invalid error as a "seed does not match this wallet"
+// signal.
+//
+// This method is a no-op on wallets that have already been migrated, on
+// fresh wallets created at the new SLIP0044 path, and on chains where the
+// legacy cointype equals the SLIP0044 cointype (e.g. testnets that use the
+// universal testnet slot).  In those cases it returns nil without modifying
+// the database.
+//
+// The wallet must be unlocked (so the SLIP0044 cointype xpriv can be
+// encrypted with the manager's private crypto key) and must currently be in
+// SLIP0044 state — wallets still using the legacy bucket (coinTypeLegacy*)
+// must run UpgradeToSLIP0044CoinType first.
+//
+// On success the historical (e.g. 42-path) cointype keys are preserved
+// under coinTypeOldSLIP0044{Pub,Priv}KeyName so funds living at addresses
+// of the old derivation path remain spendable for sweep purposes.  The
+// caller is responsible for refreshing any in-memory address buffers that
+// reference account 0.
+func (m *Manager) MigrateToReregisteredSLIP0044(dbtx walletdb.ReadWriteTx, seed []byte) error {
+	// The DB phase mirrors UpgradeToSLIP0044CoinType: it does not hold
+	// m.mtx, since the walletdb transaction provides isolation and
+	// taking m.mtx here would deadlock with helpers that read it (e.g.
+	// AccountProperties).  m.mtx is acquired only later for the
+	// in-memory cache refresh.
+
+	if m.watchingOnly {
+		return errors.E(errors.WatchingOnly, "cannot migrate watching-only wallet")
+	}
+	if m.locked {
+		return errors.E(errors.Locked, "wallet must be unlocked to migrate SLIP0044 cointype")
+	}
+
+	legacyCoinType, slip0044CoinType := CoinTypes(m.chainParams)
+	if legacyCoinType == slip0044CoinType {
+		// No migration possible (and no harm done) — chain has the same
+		// value in both fields, e.g. a testnet using the universal slot.
+		return nil
+	}
+
+	ns := dbtx.ReadWriteBucket(waddrmgrBucketKey)
+	mainBucket := ns.NestedReadWriteBucket(mainBucketName)
+
+	// Refuse to migrate wallets that have not yet upgraded to the
+	// SLIP0044 cointype.  In Monetarium this state is unreachable in
+	// practice (UpgradeToSLIP0044CoinType auto-runs on wallet creation),
+	// but the defensive check makes the precondition explicit.
+	if mainBucket.Get(coinTypeLegacyPubKeyName) != nil {
+		return errors.E(errors.Invalid,
+			"wallet still uses legacy cointype keys — run UpgradeToSLIP0044CoinType before migrating to a re-registered SLIP0044")
+	}
+
+	storedSLIP0044PubEnc := mainBucket.Get(coinTypeSLIP0044PubKeyName)
+	storedSLIP0044PrivEnc := mainBucket.Get(coinTypeSLIP0044PrivKeyName)
+	if storedSLIP0044PubEnc == nil || storedSLIP0044PrivEnc == nil {
+		return errors.E(errors.IO, "missing SLIP0044 cointype keys for migration")
+	}
+
+	// Decrypt the existing SLIP0044 cointype xpub so we can read its
+	// child number — that tells us which BIP44 cointype the stored keys
+	// were derived under, without requiring the seed for detection.  The
+	// plaintext is reused for the seed-verification comparison further
+	// below; defer-zeroing it here gives a single owning lifetime and
+	// avoids the prior pattern of decrypting the same ciphertext twice.
+	storedXpubStr, err := m.cryptoKeyPub.Decrypt(storedSLIP0044PubEnc)
+	if err != nil {
+		return errors.E(errors.Crypto, errors.Errorf("decrypt stored SLIP0044 xpub: %v", err))
+	}
+	defer zero(storedXpubStr)
+	storedXpub, err := hdkeychain.NewKeyFromString(string(storedXpubStr), m.chainParams)
+	if err != nil {
+		return errors.E(errors.IO, err)
+	}
+	storedCoinType := storedXpub.ChildNum() & ^uint32(hdkeychain.HardenedKeyStart)
+	storedXpub.Zero()
+
+	// Idempotence: if the stored keys already correspond to the current
+	// SLIP0044 cointype, the migration is a no-op.
+	if storedCoinType == slip0044CoinType {
+		return nil
+	}
+	// Sanity: the only other expected value is the chain's legacy
+	// cointype (the previous SLIP0044 value, now demoted).  Anything
+	// else means the wallet was created against a chaincfg we do not
+	// recognise, and we refuse to touch it.
+	if storedCoinType != legacyCoinType {
+		return errors.E(errors.Invalid, errors.Errorf(
+			"stored SLIP0044 keys correspond to coin type %d; expected legacy %d or current %d",
+			storedCoinType, legacyCoinType, slip0044CoinType))
+	}
+
+	// Re-derive both cointype keys from the supplied seed.  HDKeysFromSeed
+	// derives at chaincfg.LegacyCoinType (the now-historical SLIP0044
+	// value, e.g. 42) and chaincfg.SLIP0044CoinType (the new value,
+	// e.g. 9508).
+	legacyCT, slip0044CT, _, acctSLIP0044Priv, err := HDKeysFromSeed(seed, m.chainParams)
+	if err != nil {
+		return err
+	}
+	// Always zero key material we no longer need before returning.
+	defer func() {
+		legacyCT.Zero()
+		slip0044CT.Zero()
+		acctSLIP0044Priv.Zero()
+	}()
+
+	// Verify the seed produces the same xpub the wallet already stores.
+	// The stored value is at coinTypeSLIP0044PubKeyName, which the
+	// storedCoinType check above has established is currently derived
+	// under chaincfg.LegacyCoinType (the previous SLIP0044 value); thus
+	// expectedXpubStr is the legacy-cointype neutered key.  When a future
+	// migration shifts which cointype is stored under that bucket, swap
+	// the *ExtendedKey neutered here — the rest of the comparison is
+	// agnostic to which derivation we expect.
+	expectedXpubStr := legacyCT.Neuter().String()
+	if string(storedXpubStr) != expectedXpubStr {
+		return errors.E(errors.Invalid, "supplied seed does not match this wallet")
+	}
+
+	// Encrypt the newly-derived SLIP0044 cointype keys.
+	newSLIP0044XpubStr := slip0044CT.Neuter().String()
+	newSLIP0044XprivStr := slip0044CT.String()
+	newSLIP0044PubEnc, err := m.cryptoKeyPub.Encrypt([]byte(newSLIP0044XpubStr))
+	if err != nil {
+		return errors.E(errors.Crypto, errors.Errorf("encrypt new SLIP0044 xpub: %v", err))
+	}
+	newSLIP0044PrivEnc, err := m.cryptoKeyPriv.Encrypt([]byte(newSLIP0044XprivStr))
+	if err != nil {
+		return errors.E(errors.Crypto, errors.Errorf("encrypt new SLIP0044 xpriv: %v", err))
+	}
+
+	// Encrypt the new account 0 keys.
+	newAcct0XpubStr := acctSLIP0044Priv.Neuter().String()
+	newAcct0XprivStr := acctSLIP0044Priv.String()
+	newAcct0PubEnc, err := m.cryptoKeyPub.Encrypt([]byte(newAcct0XpubStr))
+	if err != nil {
+		return errors.E(errors.Crypto, errors.Errorf("encrypt new account 0 xpub: %v", err))
+	}
+	newAcct0PrivEnc, err := m.cryptoKeyPriv.Encrypt([]byte(newAcct0XprivStr))
+	if err != nil {
+		return errors.E(errors.Crypto, errors.Errorf("encrypt new account 0 xpriv: %v", err))
+	}
+
+	// Preserve the existing SLIP0044 keys (legacy-path keys) under the
+	// "old" bucket so their UTXOs remain spendable for sweep flows.
+	err = putCoinTypeOldSLIP0044Keys(ns, storedSLIP0044PubEnc, storedSLIP0044PrivEnc)
+	if err != nil {
+		return err
+	}
+
+	// Overwrite the SLIP0044 cointype keys with the newly-derived ones.
+	err = putCoinTypeSLIP0044Keys(ns, newSLIP0044PubEnc, newSLIP0044PrivEnc)
+	if err != nil {
+		return err
+	}
+
+	// Rewrite the account 0 row with the newly-derived account keys.
+	// The account name is preserved.  Last-used / last-returned indexes
+	// are reset because the new derivation path has no historical address
+	// usage on chain.
+	existingAcctName, err := fetchAccountName(ns, 0)
+	if err != nil {
+		return err
+	}
+	newAcct0 := &dbBIP0044Account{
+		dbAccountRow: dbAccountRow{
+			acctType: actBIP0044,
+		},
+		pubKeyEncrypted:           newAcct0PubEnc,
+		privKeyEncrypted:          newAcct0PrivEnc,
+		lastUsedExternalIndex:     ^uint32(0),
+		lastUsedInternalIndex:     ^uint32(0),
+		lastReturnedExternalIndex: ^uint32(0),
+		lastReturnedInternalIndex: ^uint32(0),
+		name:                      existingAcctName,
+	}
+	newAcct0.dbAccountRow.rawData = newAcct0.serializeRow()
+	err = putBIP0044AccountInfo(ns, 0, &dbBIP0044AccountRow{
+		dbAccountRow:              newAcct0.dbAccountRow,
+		pubKeyEncrypted:           newAcct0.pubKeyEncrypted,
+		privKeyEncrypted:          newAcct0.privKeyEncrypted,
+		lastUsedExternalIndex:     newAcct0.lastUsedExternalIndex,
+		lastUsedInternalIndex:     newAcct0.lastUsedInternalIndex,
+		lastReturnedExternalIndex: newAcct0.lastReturnedExternalIndex,
+		lastReturnedInternalIndex: newAcct0.lastReturnedInternalIndex,
+		name:                      newAcct0.name,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Acquire the manager mutex for the remainder of the call so that
+	// the in-memory account-info cache can be refreshed without racing
+	// other readers.
+	defer m.mtx.Unlock()
+	m.mtx.Lock()
+
+	// Update in-memory account info cache so subsequent operations use
+	// the new keys without requiring a wallet restart.
+	if acctInfo, ok := m.acctInfo[0]; ok {
+		acctExtPubKey, err := hdkeychain.NewKeyFromString(newAcct0XpubStr, m.chainParams)
+		if err != nil {
+			return errors.E(errors.IO, err)
+		}
+		acctExtPrivKey, err := hdkeychain.NewKeyFromString(newAcct0XprivStr, m.chainParams)
+		if err != nil {
+			return errors.E(errors.IO, err)
+		}
+		acctInfo.acctKeyEncrypted = newAcct0PrivEnc
+		acctInfo.acctKeyPub = acctExtPubKey
+		acctInfo.acctKeyPriv = acctExtPrivKey
+	}
+
+	return nil
+}
+
 // deriveKeyFromPath returns either a public or private derived extended key
 // based on the private flag for the given an account, branch, and index.
 //

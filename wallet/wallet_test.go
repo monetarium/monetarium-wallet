@@ -101,8 +101,10 @@ func TestVotingXprivFromSeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to create seed: %v", err)
 	}
-	wantXpriv := "dprv3oaf1h1hLxLZNHn6Gn9AaUaMJxhpHAj2KGMMHTi2AnoiHdRhCc" +
-		"iKbwf3dB6zpPEq8ffdT4NZ7gjtrZBQhSWDm2RVXbphmpdPnbq299ddB8a"
+	// xpriv prefix is "mprv" after switching mainnet HDPrivateKeyID to
+	// the Monetarium-registered SLIP-0044 slot (chaincfg PR #2013).
+	wantXpriv := "mprv6QF8Q52ks2fGRbJEDvWtwPuU6DovTufFbetkRb5hkA4jA3rN2w" +
+		"KPuopwvbDZrEVGdHPkHBN2st1baSLdS2WARpZxoP7U7H3PKTNjT9ZMrrW"
 
 	tests := []struct {
 		name, want string

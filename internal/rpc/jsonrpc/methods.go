@@ -7007,6 +7007,47 @@ func (s *Server) getcoinjoinsbyacct(ctx context.Context, icmd any) (any, error) 
 	return acctNameCoinjoinSum, nil
 }
 
+// coinBalanceAmounts holds the seven balance amounts rendered into the
+// getcoinbalance response. Each field is either float64 (VAR) or string
+// (SKA decimal) per the GetCoinBalanceResult schema. Stake-only fields are
+// fixed to "0" for SKA since SKA does not participate in PoS.
+type coinBalanceAmounts struct {
+	ImmatureCoinbaseRewards interface{}
+	ImmatureStakeGeneration interface{}
+	LockedByTickets         interface{}
+	Spendable               interface{}
+	Total                   interface{}
+	Unconfirmed             interface{}
+	VotingAuthority         interface{}
+}
+
+// renderCoinBalanceAmounts formats a CoinBalance for getcoinbalance output.
+// For SKA coins, the SKA big.Int fields are emitted as decimal strings via
+// SKAAmount.ToDecimalString to preserve precision beyond int64. For VAR, the
+// existing atomsToCoins float64 path is used.
+func renderCoinBalanceAmounts(cb wallet.CoinBalance, isSKA bool, atomsPerCoin *big.Int) coinBalanceAmounts {
+	if isSKA {
+		return coinBalanceAmounts{
+			ImmatureCoinbaseRewards: cb.SKAImmatureCoinbaseRewards.ToDecimalString(atomsPerCoin),
+			ImmatureStakeGeneration: "0",
+			LockedByTickets:         "0",
+			Spendable:               cb.SKASpendable.ToDecimalString(atomsPerCoin),
+			Total:                   cb.SKATotal.ToDecimalString(atomsPerCoin),
+			Unconfirmed:             cb.SKAUnconfirmed.ToDecimalString(atomsPerCoin),
+			VotingAuthority:         "0",
+		}
+	}
+	return coinBalanceAmounts{
+		ImmatureCoinbaseRewards: atomsToCoins(int64(cb.ImmatureCoinbaseRewards), atomsPerCoin),
+		ImmatureStakeGeneration: atomsToCoins(int64(cb.ImmatureStakeGeneration), atomsPerCoin),
+		LockedByTickets:         atomsToCoins(int64(cb.LockedByTickets), atomsPerCoin),
+		Spendable:               atomsToCoins(int64(cb.Spendable), atomsPerCoin),
+		Total:                   atomsToCoins(int64(cb.Total), atomsPerCoin),
+		Unconfirmed:             atomsToCoins(int64(cb.Unconfirmed), atomsPerCoin),
+		VotingAuthority:         atomsToCoins(int64(cb.VotingAuthority), atomsPerCoin),
+	}
+}
+
 // getCoinBalance handles a getcoinbalance request by returning the balance
 // for a specific coin type (VAR or SKA) with detailed breakdown.
 func (s *Server) getCoinBalance(ctx context.Context, icmd any) (any, error) {
@@ -7032,6 +7073,7 @@ func (s *Server) getCoinBalance(ctx context.Context, icmd any) (any, error) {
 
 	// Get AtomsPerCoin for the specified coin type
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), coinType)
+	isSKA := coinType.IsSKA()
 
 	accountName := "*"
 	if cmd.Account != nil {
@@ -7053,42 +7095,50 @@ func (s *Server) getCoinBalance(ctx context.Context, icmd any) (any, error) {
 			return nil, err
 		}
 
+		totals := renderCoinBalanceAmounts(totalBalance, isSKA, atomsPerCoin)
 		result := types.GetCoinBalanceResult{
 			CoinType:                     uint8(coinType),
 			BlockHash:                    blockHash.String(),
-			TotalImmatureCoinbaseRewards: atomsToCoins(int64(totalBalance.ImmatureCoinbaseRewards), atomsPerCoin),
-			TotalImmatureStakeGeneration: atomsToCoins(int64(totalBalance.ImmatureStakeGeneration), atomsPerCoin),
-			TotalLockedByTickets:         atomsToCoins(int64(totalBalance.LockedByTickets), atomsPerCoin),
-			TotalSpendable:               atomsToCoins(int64(totalBalance.Spendable), atomsPerCoin),
-			TotalUnconfirmed:             atomsToCoins(int64(totalBalance.Unconfirmed), atomsPerCoin),
-			TotalVotingAuthority:         atomsToCoins(int64(totalBalance.VotingAuthority), atomsPerCoin),
-			CumulativeTotal:              atomsToCoins(int64(totalBalance.Total), atomsPerCoin),
+			TotalImmatureCoinbaseRewards: totals.ImmatureCoinbaseRewards,
+			TotalImmatureStakeGeneration: totals.ImmatureStakeGeneration,
+			TotalLockedByTickets:         totals.LockedByTickets,
+			TotalSpendable:               totals.Spendable,
+			TotalUnconfirmed:             totals.Unconfirmed,
+			TotalVotingAuthority:         totals.VotingAuthority,
+			CumulativeTotal:              totals.Total,
 		}
 
 		// Add per-account breakdown
 		result.Balances = make([]types.GetCoinAccountBalanceResult, 0)
 		for _, balance := range allBalances {
-			if coinBalance, exists := balance.CoinTypeBalances[coinType]; exists && coinBalance.Total > 0 {
-				accountName, err := w.AccountName(ctx, balance.Account)
-				if err != nil {
-					if errors.Is(err, errors.NotExist) {
-						return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
-					}
-					return nil, err
-				}
-
-				result.Balances = append(result.Balances, types.GetCoinAccountBalanceResult{
-					AccountName:             accountName,
-					CoinType:                uint8(coinType),
-					ImmatureCoinbaseRewards: atomsToCoins(int64(coinBalance.ImmatureCoinbaseRewards), atomsPerCoin),
-					ImmatureStakeGeneration: atomsToCoins(int64(coinBalance.ImmatureStakeGeneration), atomsPerCoin),
-					LockedByTickets:         atomsToCoins(int64(coinBalance.LockedByTickets), atomsPerCoin),
-					Spendable:               atomsToCoins(int64(coinBalance.Spendable), atomsPerCoin),
-					Total:                   atomsToCoins(int64(coinBalance.Total), atomsPerCoin),
-					Unconfirmed:             atomsToCoins(int64(coinBalance.Unconfirmed), atomsPerCoin),
-					VotingAuthority:         atomsToCoins(int64(coinBalance.VotingAuthority), atomsPerCoin),
-				})
+			coinBalance, exists := balance.CoinTypeBalances[coinType]
+			if !exists {
+				continue
 			}
+			hasBalance := (isSKA && !coinBalance.SKATotal.IsZero()) || (!isSKA && coinBalance.Total > 0)
+			if !hasBalance {
+				continue
+			}
+			accountName, err := w.AccountName(ctx, balance.Account)
+			if err != nil {
+				if errors.Is(err, errors.NotExist) {
+					return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
+				}
+				return nil, err
+			}
+
+			amounts := renderCoinBalanceAmounts(coinBalance, isSKA, atomsPerCoin)
+			result.Balances = append(result.Balances, types.GetCoinAccountBalanceResult{
+				AccountName:             accountName,
+				CoinType:                uint8(coinType),
+				ImmatureCoinbaseRewards: amounts.ImmatureCoinbaseRewards,
+				ImmatureStakeGeneration: amounts.ImmatureStakeGeneration,
+				LockedByTickets:         amounts.LockedByTickets,
+				Spendable:               amounts.Spendable,
+				Total:                   amounts.Total,
+				Unconfirmed:             amounts.Unconfirmed,
+				VotingAuthority:         amounts.VotingAuthority,
+			})
 		}
 
 		return result, nil
@@ -7107,30 +7157,29 @@ func (s *Server) getCoinBalance(ctx context.Context, icmd any) (any, error) {
 			return nil, err
 		}
 
-		result := types.GetCoinBalanceResult{
+		amounts := renderCoinBalanceAmounts(coinBalance, isSKA, atomsPerCoin)
+		return types.GetCoinBalanceResult{
 			CoinType:                     uint8(coinType),
 			BlockHash:                    blockHash.String(),
-			TotalImmatureCoinbaseRewards: atomsToCoins(int64(coinBalance.ImmatureCoinbaseRewards), atomsPerCoin),
-			TotalImmatureStakeGeneration: atomsToCoins(int64(coinBalance.ImmatureStakeGeneration), atomsPerCoin),
-			TotalLockedByTickets:         atomsToCoins(int64(coinBalance.LockedByTickets), atomsPerCoin),
-			TotalSpendable:               atomsToCoins(int64(coinBalance.Spendable), atomsPerCoin),
-			TotalUnconfirmed:             atomsToCoins(int64(coinBalance.Unconfirmed), atomsPerCoin),
-			TotalVotingAuthority:         atomsToCoins(int64(coinBalance.VotingAuthority), atomsPerCoin),
-			CumulativeTotal:              atomsToCoins(int64(coinBalance.Total), atomsPerCoin),
+			TotalImmatureCoinbaseRewards: amounts.ImmatureCoinbaseRewards,
+			TotalImmatureStakeGeneration: amounts.ImmatureStakeGeneration,
+			TotalLockedByTickets:         amounts.LockedByTickets,
+			TotalSpendable:               amounts.Spendable,
+			TotalUnconfirmed:             amounts.Unconfirmed,
+			TotalVotingAuthority:         amounts.VotingAuthority,
+			CumulativeTotal:              amounts.Total,
 			Balances: []types.GetCoinAccountBalanceResult{{
 				AccountName:             accountName,
 				CoinType:                uint8(coinType),
-				ImmatureCoinbaseRewards: atomsToCoins(int64(coinBalance.ImmatureCoinbaseRewards), atomsPerCoin),
-				ImmatureStakeGeneration: atomsToCoins(int64(coinBalance.ImmatureStakeGeneration), atomsPerCoin),
-				LockedByTickets:         atomsToCoins(int64(coinBalance.LockedByTickets), atomsPerCoin),
-				Spendable:               atomsToCoins(int64(coinBalance.Spendable), atomsPerCoin),
-				Total:                   atomsToCoins(int64(coinBalance.Total), atomsPerCoin),
-				Unconfirmed:             atomsToCoins(int64(coinBalance.Unconfirmed), atomsPerCoin),
-				VotingAuthority:         atomsToCoins(int64(coinBalance.VotingAuthority), atomsPerCoin),
+				ImmatureCoinbaseRewards: amounts.ImmatureCoinbaseRewards,
+				ImmatureStakeGeneration: amounts.ImmatureStakeGeneration,
+				LockedByTickets:         amounts.LockedByTickets,
+				Spendable:               amounts.Spendable,
+				Total:                   amounts.Total,
+				Unconfirmed:             amounts.Unconfirmed,
+				VotingAuthority:         amounts.VotingAuthority,
 			}},
-		}
-
-		return result, nil
+		}, nil
 	}
 }
 
@@ -7710,12 +7759,17 @@ func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k
 	if err != nil || n <= 1 || n > 1<<20 || n&(n-1) != 0 {
 		return nil, fmt.Errorf("invalid scrypt N parameter")
 	}
+	// Bound r and p for the same reason as N: a malicious blob with
+	// (e.g.) r=1<<10 or p=1<<10 would honour scrypt's contract and burn
+	// CPU/memory.  Encryption uses r=8, p=1; a cap of 16 each leaves
+	// generous headroom for legitimate parameter changes while denying
+	// the unauthenticated-cost-amplification path.
 	r, err := strconv.Atoi(parts[4])
-	if err != nil || r < 1 {
+	if err != nil || r < 1 || r > 16 {
 		return nil, fmt.Errorf("invalid scrypt r parameter")
 	}
 	p, err := strconv.Atoi(parts[5])
-	if err != nil || p < 1 {
+	if err != nil || p < 1 || p > 16 {
 		return nil, fmt.Errorf("invalid scrypt p parameter")
 	}
 	nonce, err := hex.DecodeString(parts[6])
@@ -7749,6 +7803,10 @@ func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt private key (wrong passphrase?): %v", err)
 	}
+	// Safe to zero on defer: PrivKeyFromBytes calls ModNScalar.SetByteSlice,
+	// which copies the bytes into the scalar's internal limbs before
+	// returning, so wiping privateKeyBytes does not mutate the returned
+	// key's state.
 	defer zeroBytes(privateKeyBytes)
 
 	return secp256k1.PrivKeyFromBytes(privateKeyBytes), nil

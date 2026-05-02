@@ -142,6 +142,41 @@ func TestEmissionKeyBackupScryptNUpperBound(t *testing.T) {
 	}
 }
 
+// TestEmissionKeyBackupScryptRPUpperBound parallels the N-cap test for the r
+// and p parameters: scrypt's contract honours arbitrarily large r and p, so a
+// malicious blob with (e.g.) p = 1<<10 would burn CPU on every decrypt
+// attempt.  The decryptor must reject out-of-range values before invoking
+// scrypt.
+func TestEmissionKeyBackupScryptRPUpperBound(t *testing.T) {
+	cases := []struct {
+		name     string
+		blob     string
+		mustSay  string
+	}{
+		{
+			name:    "r over 16 rejected",
+			blob:    "aes256gcm:v2:00:32768:17:1:000000000000000000000000:aa",
+			mustSay: "scrypt r",
+		},
+		{
+			name:    "p over 16 rejected",
+			blob:    "aes256gcm:v2:00:32768:8:17:000000000000000000000000:aa",
+			mustSay: "scrypt p",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decryptPrivateKeyWithPassphrase(tc.blob, "anything")
+			if err == nil {
+				t.Fatal("out-of-range scrypt parameter must be rejected before scrypt is called")
+			}
+			if !strings.Contains(err.Error(), tc.mustSay) {
+				t.Fatalf("rejection should mention %q; got %v", tc.mustSay, err)
+			}
+		})
+	}
+}
+
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
