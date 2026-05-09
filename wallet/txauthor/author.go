@@ -122,12 +122,23 @@ func sumSKAOutputValues(outputs []*wire.TxOut) cointype.SKAAmount {
 // script. This function must return a P2PKH script or smaller, otherwise fee
 // estimation will be incorrect.
 //
+// subtractFeeFromAmountIdx selects the recipient output whose value is
+// reduced by the transaction fee (Bitcoin Core's subtractfeefromamount
+// behavior). Pass -1 to disable: inputs must then cover outputs + fee and
+// the fee is paid out of change. When set to a valid output index, inputs
+// only need to cover the requested output total; the recipient at outputs[idx]
+// is *replaced* in the local outputs slice with a clone whose Value/SKAValue
+// is reduced by the converged fee, so the caller's original *wire.TxOut is
+// left untouched (safe to retry with the same slice). An error is returned
+// if the post-subtraction amount falls at or below the dust threshold.
+//
 // If successful, the transaction, total input value spent, and all previous
 // output scripts are returned.  If the input source was unable to provide
 // enough input value to pay for every output any necessary fees, an
 // InputSourceError is returned.
 func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmount,
-	fetchInputs InputSource, fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
+	fetchInputs InputSource, fetchChange ChangeSource, maxTxSize int,
+	subtractFeeFromAmountIdx int) (*AuthoredTx, error) {
 
 	coinType := cointype.CoinTypeVAR
 	if len(outputs) > 0 {
@@ -145,8 +156,15 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmo
 			}
 		}
 	}
+	if subtractFeeFromAmountIdx >= 0 {
+		if subtractFeeFromAmountIdx >= len(outputs) {
+			return nil, errors.E(errors.Invalid, errors.Errorf(
+				"subtractFeeFromAmountIdx %d out of range for %d outputs",
+				subtractFeeFromAmountIdx, len(outputs)))
+		}
+	}
 	return newUnsignedTransaction(coinType, outputs, relayFeePerKb,
-		fetchInputs, fetchChange, maxTxSize)
+		fetchInputs, fetchChange, maxTxSize, subtractFeeFromAmountIdx)
 }
 
 // NewUnsignedSweepTransaction creates an unsigned transaction with no
@@ -165,20 +183,30 @@ func NewUnsignedSweepTransaction(coinType cointype.CoinType,
 	relayFeePerKb cointype.SKAAmount, fetchInputs InputSource,
 	fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
 	return newUnsignedTransaction(coinType, nil, relayFeePerKb,
-		fetchInputs, fetchChange, maxTxSize)
+		fetchInputs, fetchChange, maxTxSize, -1)
 }
 
 // newUnsignedTransaction is the shared implementation for
 // NewUnsignedTransaction and NewUnsignedSweepTransaction. coinType is taken
 // as an explicit parameter so empty-outputs sweeps still take the SKA paths
 // for fee/dust/change construction.
+//
+// subtractFeeFromAmountIdx == -1 disables the subtractfeefromamount behavior;
+// any other value names the output index whose Value/SKAValue will be reduced
+// by the final fee. The recipient is replaced with a freshly allocated clone
+// before the unsigned tx is constructed, so the caller's outputs slice
+// retains its original *wire.TxOut values. The caller is responsible for
+// ensuring the index is in range (NewUnsignedTransaction validates this;
+// sweeps always pass -1).
 func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 	relayFeePerKb cointype.SKAAmount, fetchInputs InputSource,
-	fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
+	fetchChange ChangeSource, maxTxSize int,
+	subtractFeeFromAmountIdx int) (*AuthoredTx, error) {
 
 	const op errors.Op = "txauthor.NewUnsignedTransaction"
 
 	isSKA := coinType.IsSKA()
+	subtractFee := subtractFeeFromAmountIdx >= 0
 
 	// For SKA, use big.Int amounts; for VAR, use int64
 	targetAmount := sumOutputValues(outputs)
@@ -229,6 +257,13 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 	// increasing-but-still-insufficient inputs across iterations) cannot
 	// spin forever. In practice the loop converges in <=3 iterations; 32 is
 	// generous safety margin without masking real input-source bugs.
+	//
+	// With subtractFee=true the loop always exits in the first iteration:
+	// either the dust/cover-fee check below succeeds (then we fall through
+	// to construct the tx) or it returns an error. The `continue` paths at
+	// the bottom of the loop body only fire in the !subtractFee branches —
+	// adding a `continue` inside the subtractFee block would re-enter the
+	// recipient-clone step and double-subtract the fee.
 	const maxFeeGrowIterations = 32
 	for iter := 0; ; iter++ {
 		if iter >= maxFeeGrowIterations {
@@ -241,12 +276,27 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 		// for SKA the int64 target is 0 so the input source only stops on
 		// big.Int target. This replaces the old "target=0 means everything"
 		// hack which caused every SKA tx to co-spend all SKA UTXOs.
+		//
+		// In subtractfeefromamount mode the fee is paid by reducing the
+		// recipient output, so inputs only need to cover the requested
+		// output total — adding the fee here would cause the wallet to
+		// over-select UTXOs (and could spuriously fail on InsufficientBalance
+		// when the user has UTXOs covering the requested amount but not the
+		// fee on top).
 		var inputTarget dcrutil.Amount
 		var inputTargetSKA cointype.SKAAmount
 		if isSKA {
-			inputTargetSKA = targetSKAAmount.Add(targetFeeSKA)
+			if subtractFee {
+				inputTargetSKA = targetSKAAmount
+			} else {
+				inputTargetSKA = targetSKAAmount.Add(targetFeeSKA)
+			}
 		} else {
-			inputTarget = targetAmount + targetFee
+			if subtractFee {
+				inputTarget = targetAmount
+			} else {
+				inputTarget = targetAmount + targetFee
+			}
 			inputTargetSKA = cointype.Zero()
 		}
 
@@ -255,15 +305,25 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 			return nil, errors.E(op, err)
 		}
 
-		// Check if we have sufficient balance
+		// Check if we have sufficient balance. In subtractfee mode the fee
+		// is absorbed by the recipient output, so inputs ≥ targetAmount is
+		// sufficient; the dust check on the post-subtraction recipient
+		// amount happens after the fee stabilizes below.
 		if isSKA {
 			// For SKA, compare using big.Int (SKAAmount)
-			targetWithFee := targetSKAAmount.Add(targetFeeSKA)
-			if inputDetail.SKAAmount.Cmp(targetWithFee) < 0 {
+			required := targetSKAAmount
+			if !subtractFee {
+				required = targetSKAAmount.Add(targetFeeSKA)
+			}
+			if inputDetail.SKAAmount.Cmp(required) < 0 {
 				return nil, errors.E(op, errors.InsufficientBalance)
 			}
 		} else {
-			if inputDetail.Amount < targetAmount+targetFee {
+			required := targetAmount
+			if !subtractFee {
+				required = targetAmount + targetFee
+			}
+			if inputDetail.Amount < required {
 				return nil, errors.E(op, errors.InsufficientBalance)
 			}
 		}
@@ -285,6 +345,15 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 			TxIn:    inputDetail.Inputs,
 			TxOut:   outputs,
 		}
+		// For SKA in subtractFee mode, the size estimate uses the
+		// pre-subtraction recipient SKAValue. wire.TxOut for SKA is
+		// length-prefixed by len(SKAValue.Bytes()), so when the converged
+		// fee shrinks the recipient across a byte boundary the actually
+		// signed tx is up to one byte smaller than the estimate. Net effect:
+		// the user pays a fractionally higher effective fee rate — never
+		// underpays. Do not "fix" this by recomputing the size after the
+		// recipient clone; the conservatism is intentional and preserves
+		// inputs ≥ outputs + fee under all SKA byte-length transitions.
 		maxRequiredFeeSKA := txrules.FeeForSerializeSizeSKA(relayFeePerKb, maxSignedSize)
 		if wire.IsSKAEmissionTransaction(tempTxWithInputs) {
 			maxRequiredFeeSKA = cointype.Zero() // SKA emission transactions have zero fees
@@ -302,8 +371,56 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 			maxRequiredFee = dcrutil.Amount(maxRequiredFeeInt64)
 		}
 
-		// Check remaining amount covers fees
-		if isSKA {
+		// Check remaining amount covers fees. In subtractfee mode the fee
+		// is paid by reducing the recipient output (not by inputs covering
+		// it on top), so we instead require that the recipient amount is
+		// strictly larger than the fee plus the dust threshold; otherwise
+		// the recipient would receive zero or a dust output.
+		if subtractFee {
+			if isSKA {
+				recipientSKA := cointype.NewSKAAmount(outputs[subtractFeeFromAmountIdx].SKAValue)
+				postFee := recipientSKA.Sub(maxRequiredFeeSKA)
+				// Two strictly-disjoint branches: a non-positive postFee
+				// means the recipient cannot pay the fee at all; a positive
+				// postFee below the SKA dust threshold means it would
+				// produce an unspendable output.
+				if postFee.IsNegative() || postFee.IsZero() {
+					return nil, errors.E(op, errors.Invalid, errors.Errorf(
+						"subtractfeefromamount: recipient amount %s is less than fee %s",
+						recipientSKA.BigInt().String(), maxRequiredFeeSKA.BigInt().String()))
+				}
+				if postFee.BigInt().Cmp(cointype.MinSKADustAmount) < 0 {
+					return nil, errors.E(op, errors.Invalid, errors.Errorf(
+						"subtractfeefromamount: recipient amount %s minus fee %s is below SKA dust threshold %s",
+						recipientSKA.BigInt().String(), maxRequiredFeeSKA.BigInt().String(),
+						cointype.MinSKADustAmount.String()))
+				}
+			} else {
+				// Two strictly-disjoint branches: postFee <= 0 (recipient
+				// cannot cover fee) is checked first, then dust. The dust
+				// check below only sees a strictly positive postFee.
+				recipient := dcrutil.Amount(outputs[subtractFeeFromAmountIdx].Value)
+				postFee := recipient - maxRequiredFee
+				if postFee <= 0 {
+					return nil, errors.E(op, errors.Invalid, errors.Errorf(
+						"subtractfeefromamount: recipient amount %v does not cover fee %v",
+						recipient, maxRequiredFee))
+				}
+				dustFeeRateInt64, derr := relayFeePerKb.Int64()
+				if derr != nil {
+					return nil, errors.E(op, errors.Invalid,
+						"fee overflow: configured VAR relay fee rate exceeds int64 in dust check")
+				}
+				// Use the recipient script's actual size for an accurate dust
+				// check on the post-subtraction output.
+				recipientScriptSize := len(outputs[subtractFeeFromAmountIdx].PkScript)
+				if txrules.IsDustAmount(postFee, recipientScriptSize, dcrutil.Amount(dustFeeRateInt64)) {
+					return nil, errors.E(op, errors.Invalid, errors.Errorf(
+						"subtractfeefromamount: recipient amount %v minus fee %v is dust",
+						recipient, maxRequiredFee))
+				}
+			}
+		} else if isSKA {
 			remainingSKA := inputDetail.SKAAmount.Sub(targetSKAAmount)
 			if remainingSKA.Cmp(maxRequiredFeeSKA) < 0 {
 				targetFeeSKA = maxRequiredFeeSKA
@@ -321,6 +438,35 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 			return nil, errors.E(errors.Invalid, "signed tx size exceeds allowed maximum")
 		}
 
+		// In subtractfeefromamount mode, replace the recipient output with
+		// a clone whose Value/SKAValue is reduced by the converged fee.
+		// Cloning (rather than mutating outputs[idx] in place) keeps the
+		// caller's *wire.TxOut intact, AND we copy the outputs slice so the
+		// caller's slice header/elements are not mutated either — callers
+		// that retry on error or reuse the slice see no silent corruption.
+		// The dust check above guarantees the post-subtraction value is a
+		// valid spendable output.
+		if subtractFee {
+			orig := outputs[subtractFeeFromAmountIdx]
+			clone := &wire.TxOut{
+				Value:    orig.Value,
+				SKAValue: orig.SKAValue,
+				CoinType: orig.CoinType,
+				Version:  orig.Version,
+				PkScript: orig.PkScript,
+			}
+			if isSKA {
+				clone.SKAValue = cointype.NewSKAAmount(orig.SKAValue).
+					Sub(maxRequiredFeeSKA).BigInt()
+			} else {
+				clone.Value = orig.Value - int64(maxRequiredFee)
+			}
+			localOutputs := make([]*wire.TxOut, len(outputs))
+			copy(localOutputs, outputs)
+			localOutputs[subtractFeeFromAmountIdx] = clone
+			outputs = localOutputs
+		}
+
 		unsignedTransaction := &wire.MsgTx{
 			SerType:  wire.TxSerializeFull,
 			Version:  generatedTxVersion,
@@ -331,15 +477,27 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 		}
 		changeIndex := -1
 
-		// Calculate change amount based on coin type
+		// Calculate change amount based on coin type. In subtractfee mode
+		// the fee was already absorbed by reducing the recipient output, so
+		// change = inputs − requested target (no separate fee subtraction).
+		// By conservation:
+		//   inputs = (target − fee) + change + fee  ⇒  change = inputs − target.
 		var changeAmount dcrutil.Amount
 		var changeSKAAmount cointype.SKAAmount
 		if isSKA {
 			// SKA: use SKAAmount (big.Int) for full precision
-			changeSKAAmount = inputDetail.SKAAmount.Sub(targetSKAAmount).Sub(maxRequiredFeeSKA)
+			if subtractFee {
+				changeSKAAmount = inputDetail.SKAAmount.Sub(targetSKAAmount)
+			} else {
+				changeSKAAmount = inputDetail.SKAAmount.Sub(targetSKAAmount).Sub(maxRequiredFeeSKA)
+			}
 		} else {
 			// VAR: use dcrutil.Amount (int64)
-			changeAmount = inputDetail.Amount - targetAmount - maxRequiredFee
+			if subtractFee {
+				changeAmount = inputDetail.Amount - targetAmount
+			} else {
+				changeAmount = inputDetail.Amount - targetAmount - maxRequiredFee
+			}
 		}
 
 		// Check if change output should be added

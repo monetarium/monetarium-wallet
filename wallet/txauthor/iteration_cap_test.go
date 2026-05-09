@@ -68,7 +68,7 @@ func TestNewUnsignedTransactionFeeGrowLoopBounded(t *testing.T) {
 	changeSource := AuthorTestChangeSource{}
 
 	_, err := txauthor.NewUnsignedTransaction(outputs, relayFee, source, changeSource,
-		chaincfg.MainNetParams().MaxTxSize)
+		chaincfg.MainNetParams().MaxTxSize, -1)
 	if err == nil {
 		t.Fatalf("non-monotonic input source must terminate with an error; got nil after %d iterations", iter)
 	}

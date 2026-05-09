@@ -1085,11 +1085,12 @@ func NewSendManyCmdWithCoinType(fromAccount string, amounts map[string]string, m
 
 // SendToAddressCmd defines the sendtoaddress JSON-RPC command.
 type SendToAddressCmd struct {
-	Address   string  `json:"address"`
-	Amount    string  `json:"amount"` // Coin amount as string (preserves precision for SKA)
-	Comment   *string `json:"comment,omitempty"`
-	CommentTo *string `json:"commentto,omitempty"`
-	CoinType  *uint8  `json:"cointype,omitempty"` // Optional: specify coin type (0=VAR, 1-255=SKA)
+	Address               string  `json:"address"`
+	Amount                string  `json:"amount"` // Coin amount as string (preserves precision for SKA)
+	Comment               *string `json:"comment,omitempty"`
+	CommentTo             *string `json:"commentto,omitempty"`
+	CoinType              *uint8  `json:"cointype,omitempty"`              // Optional: specify coin type (0=VAR, 1-255=SKA)
+	SubtractFeeFromAmount *bool   `json:"subtractfeefromamount,omitempty"` // Optional: when true, fee is taken from the recipient amount instead of change (Bitcoin Core parity)
 }
 
 // NewSendToAddressCmd returns a new instance which can be used to issue a
@@ -1114,6 +1115,20 @@ func NewSendToAddressCmdWithCoinType(address, amount string, comment, commentTo 
 		Comment:   comment,
 		CommentTo: commentTo,
 		CoinType:  coinType,
+	}
+}
+
+// NewSendToAddressCmdWithSubtractFee returns a new SendToAddressCmd with both
+// coin type and the subtractfeefromamount flag specified. Either pointer may
+// be nil to fall back to the default (VAR / false).
+func NewSendToAddressCmdWithSubtractFee(address, amount string, comment, commentTo *string, coinType *uint8, subtractFeeFromAmount *bool) *SendToAddressCmd {
+	return &SendToAddressCmd{
+		Address:               address,
+		Amount:                amount,
+		Comment:               comment,
+		CommentTo:             commentTo,
+		CoinType:              coinType,
+		SubtractFeeFromAmount: subtractFeeFromAmount,
 	}
 }
 

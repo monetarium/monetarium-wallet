@@ -199,7 +199,7 @@ func TestNewUnsignedTransaction(t *testing.T) {
 
 	for i, test := range tests {
 		inputSource := makeInputSource(test.UnspentOutputs)
-		tx, err := txauthor.NewUnsignedTransaction(test.Outputs, test.RelayFee, inputSource, changeSource, chaincfg.MainNetParams().MaxTxSize)
+		tx, err := txauthor.NewUnsignedTransaction(test.Outputs, test.RelayFee, inputSource, changeSource, chaincfg.MainNetParams().MaxTxSize, -1)
 		if err != nil {
 			insufficientBalance := errors.Is(err, errors.InsufficientBalance)
 			if insufficientBalance != test.InputSourceError {

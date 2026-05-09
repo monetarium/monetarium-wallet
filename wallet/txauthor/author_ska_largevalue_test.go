@@ -86,7 +86,7 @@ func TestSKAValueGreaterThanInt64MaxRoundTrip(t *testing.T) {
 	changeSource := AuthorTestChangeSource{}
 
 	atx, err := txauthor.NewUnsignedTransaction(
-		[]*wire.TxOut{skaOutput}, relayFee, inputSource, changeSource, 100000)
+		[]*wire.TxOut{skaOutput}, relayFee, inputSource, changeSource, 100000, -1)
 	if err != nil {
 		t.Fatalf("NewUnsignedTransaction: %v", err)
 	}

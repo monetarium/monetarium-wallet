@@ -165,6 +165,25 @@ func TestSendToAddressCmdWithCoinType(t *testing.T) {
 			},
 			wantJSON: `{"address":"SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc","amount":"2.0"}`,
 		},
+		{
+			name: "SendToAddress with subtractfeefromamount=true and SKA coin type",
+			cmd: &SendToAddressCmd{
+				Address:               "SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc",
+				Amount:                "1.5",
+				CoinType:              uint8Ptr(1),
+				SubtractFeeFromAmount: subFeeBoolPtr(true),
+			},
+			wantJSON: `{"address":"SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc","amount":"1.5","cointype":1,"subtractfeefromamount":true}`,
+		},
+		{
+			name: "SendToAddress with subtractfeefromamount=false explicit",
+			cmd: &SendToAddressCmd{
+				Address:               "SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc",
+				Amount:                "0.5",
+				SubtractFeeFromAmount: subFeeBoolPtr(false),
+			},
+			wantJSON: `{"address":"SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc","amount":"0.5","subtractfeefromamount":false}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -395,4 +414,8 @@ func intPtr(i int) *int {
 
 func uint8Ptr(u uint8) *uint8 {
 	return &u
+}
+
+func subFeeBoolPtr(b bool) *bool {
+	return &b
 }

@@ -2280,12 +2280,13 @@ func (w *Wallet) PurchaseTickets(ctx context.Context, n NetworkBackend,
 	vspFee := txrules.StakePoolTicketFee(sdiff, relayFee, height,
 		feePercent, w.chainParams, dcp0010Active, dcp0012Active)
 	a := &authorTx{
-		outputs:            make([]*wire.TxOut, 0, 2),
-		account:            req.SourceAccount,
-		changeAccount:      req.SourceAccount, // safe-ish; this is not mixed.
-		minconf:            req.MinConf,
-		randomizeChangeIdx: true,
-		txFee:              cointype.SKAAmountFromInt64(int64(relayFee)), // VAR-only, convert to SKAAmount
+		outputs:                  make([]*wire.TxOut, 0, 2),
+		account:                  req.SourceAccount,
+		changeAccount:            req.SourceAccount, // safe-ish; this is not mixed.
+		minconf:                  req.MinConf,
+		randomizeChangeIdx:       true,
+		txFee:                    cointype.SKAAmountFromInt64(int64(relayFee)), // VAR-only, convert to SKAAmount
+		subtractFeeFromAmountIdx: -1,
 	}
 	addr, err := w.NewInternalAddress(ctx, req.SourceAccount)
 	if err != nil {
@@ -5729,8 +5730,13 @@ func (w *Wallet) TotalReceivedSKAForAddr(ctx context.Context, addr stdaddr.Addre
 }
 
 // SendOutputs creates and sends payment transactions. It returns the
-// transaction hash upon success
-func (w *Wallet) SendOutputs(ctx context.Context, outputs []*wire.TxOut, account, changeAccount uint32, minconf int32) (*chainhash.Hash, error) {
+// transaction hash upon success.
+//
+// When subtractFeeFromAmountIdx >= 0, the tx fee is taken out of the
+// recipient output at that index (Bitcoin Core's subtractfeefromamount
+// behavior). Pass -1 to leave the recipient amount untouched and pay the
+// fee out of change (the historical default).
+func (w *Wallet) SendOutputs(ctx context.Context, outputs []*wire.TxOut, account, changeAccount uint32, minconf int32, subtractFeeFromAmountIdx int) (*chainhash.Hash, error) {
 	const op errors.Op = "wallet.SendOutputs"
 
 	// Determine the coin type from outputs for coin-type-aware fee calculation
@@ -5748,14 +5754,15 @@ func (w *Wallet) SendOutputs(ctx context.Context, outputs []*wire.TxOut, account
 	}
 
 	a := &authorTx{
-		outputs:            outputs,
-		account:            account,
-		changeAccount:      changeAccount,
-		minconf:            minconf,
-		randomizeChangeIdx: true,
-		txFee:              txFeeRate, // SKAAmount for big.Int precision
-		dontSignTx:         false,
-		isTreasury:         false,
+		outputs:                  outputs,
+		account:                  account,
+		changeAccount:            changeAccount,
+		minconf:                  minconf,
+		randomizeChangeIdx:       true,
+		txFee:                    txFeeRate, // SKAAmount for big.Int precision
+		dontSignTx:               false,
+		isTreasury:               false,
+		subtractFeeFromAmountIdx: subtractFeeFromAmountIdx,
 	}
 	err := w.authorTx(ctx, op, a)
 	if err != nil {
@@ -5785,14 +5792,15 @@ func (w *Wallet) SendOutputsToTreasury(ctx context.Context, outputs []*wire.TxOu
 	}
 
 	a := &authorTx{
-		outputs:            outputs,
-		account:            account,
-		changeAccount:      changeAccount,
-		minconf:            minconf,
-		randomizeChangeIdx: false,
-		txFee:              cointype.SKAAmountFromInt64(int64(relayFee)), // VAR-only (treasury), convert to SKAAmount
-		dontSignTx:         false,
-		isTreasury:         true,
+		outputs:                  outputs,
+		account:                  account,
+		changeAccount:            changeAccount,
+		minconf:                  minconf,
+		randomizeChangeIdx:       false,
+		txFee:                    cointype.SKAAmountFromInt64(int64(relayFee)), // VAR-only (treasury), convert to SKAAmount
+		dontSignTx:               false,
+		isTreasury:               true,
+		subtractFeeFromAmountIdx: -1,
 	}
 	err := w.authorTx(ctx, op, a)
 	if err != nil {

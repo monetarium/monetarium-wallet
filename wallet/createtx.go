@@ -216,7 +216,7 @@ func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
 
 		var err error
 		authoredTx, err = txauthor.NewUnsignedTransaction(outputs, actualRelayFee,
-			inputSource, changeSource, w.chainParams.MaxTxSize)
+			inputSource, changeSource, w.chainParams.MaxTxSize, -1)
 		if err != nil {
 			return err
 		}
@@ -564,6 +564,11 @@ type authorTx struct {
 	dontSignTx         bool
 	isTreasury         bool
 
+	// subtractFeeFromAmountIdx selects an output whose value is reduced by
+	// the converged tx fee (Bitcoin Core's subtractfeefromamount semantics).
+	// -1 disables the behavior; otherwise it indexes outputs.
+	subtractFeeFromAmountIdx int
+
 	atx                 *txauthor.AuthoredTx
 	changeSourceUpdates []func(walletdb.ReadWriteTx) error
 	watch               []wire.OutPoint
@@ -639,7 +644,7 @@ func (w *Wallet) authorTx(ctx context.Context, op errors.Op, a *authorTx) error 
 		var err error
 		atx, err = txauthor.NewUnsignedTransaction(a.outputs, actualTxFee,
 			inputSource.SelectInputs, changeSource,
-			w.chainParams.MaxTxSize)
+			w.chainParams.MaxTxSize, a.subtractFeeFromAmountIdx)
 		if err != nil {
 			return err
 		}
@@ -1514,7 +1519,7 @@ func (w *Wallet) mixedSplit(ctx context.Context, req *PurchaseTicketsRequest, ne
 		var err error
 		atx, err = txauthor.NewUnsignedTransaction(mixOut, relayFee,
 			inputSource.SelectInputs, changeSource,
-			w.chainParams.MaxTxSize)
+			w.chainParams.MaxTxSize, -1)
 		if err != nil {
 			return err
 		}
@@ -1603,14 +1608,15 @@ func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsReques
 
 	const op errors.Op = "individualSplit"
 	a := &authorTx{
-		outputs:            splitOuts,
-		account:            req.SourceAccount,
-		changeAccount:      req.ChangeAccount,
-		minconf:            req.MinConf,
-		randomizeChangeIdx: false,
-		txFee:              w.RelayFeeForCoinType(ctx, ticketCoinType),
-		dontSignTx:         req.DontSignTx,
-		isTreasury:         false,
+		outputs:                  splitOuts,
+		account:                  req.SourceAccount,
+		changeAccount:            req.ChangeAccount,
+		minconf:                  req.MinConf,
+		randomizeChangeIdx:       false,
+		txFee:                    w.RelayFeeForCoinType(ctx, ticketCoinType),
+		dontSignTx:               req.DontSignTx,
+		isTreasury:               false,
+		subtractFeeFromAmountIdx: -1,
 	}
 	err = w.authorTx(ctx, op, a)
 	if err != nil {

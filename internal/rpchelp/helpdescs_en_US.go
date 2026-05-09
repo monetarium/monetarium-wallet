@@ -885,12 +885,13 @@ var helpDescsEnUS = map[string]string{
 	"sendtoaddress--synopsis": "Authors, signs, and sends a transaction that outputs some amount to a payment address.\n" +
 		"Unlike sendfrom, outputs are always chosen from the default account.\n" +
 		"A change output is automatically included to send extra output value back to the original account.",
-	"sendtoaddress-address":   "Address to pay",
-	"sendtoaddress-amount":    "Amount to send to the payment address valued in Monetarium",
-	"sendtoaddress-comment":   "Unused",
-	"sendtoaddress-commentto": "Unused",
-	"sendtoaddress-cointype":  "Optional coin type to send (0=VAR, 1-255=SKA)",
-	"sendtoaddress--result0":  "The transaction hash of the sent transaction",
+	"sendtoaddress-address":               "Address to pay",
+	"sendtoaddress-amount":                "Amount to send to the payment address valued in Monetarium",
+	"sendtoaddress-comment":               "Unused",
+	"sendtoaddress-commentto":             "Unused",
+	"sendtoaddress-cointype":              "Optional coin type to send (0=VAR, 1-255=SKA)",
+	"sendtoaddress-subtractfeefromamount": "Optional. When true, the transaction fee is deducted from the recipient amount instead of the sender's change. The recipient receives less than the requested amount and the sender spends exactly the requested amount in inputs. Errors if the requested amount does not cover the fee plus the dust threshold.",
+	"sendtoaddress--result0":              "The transaction hash of the sent transaction",
 
 	// SendToMultisigCmd help.
 	"sendtomultisig--synopsis": "Authors, signs, and sends a transaction that outputs some amount to a multisig address.\n" +

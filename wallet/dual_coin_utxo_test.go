@@ -90,7 +90,7 @@ func TestTxAuthorFeeHandling(t *testing.T) {
 		{Value: 100000000, CoinType: cointype.CoinTypeVAR},
 	}
 
-	varTx, err := txauthor.NewUnsignedTransaction(varOutputs, relayFeePerKb, varInputSource, changeSource, 100000)
+	varTx, err := txauthor.NewUnsignedTransaction(varOutputs, relayFeePerKb, varInputSource, changeSource, 100000, -1)
 	if err != nil {
 		t.Fatalf("Failed to create VAR transaction: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestTxAuthorFeeHandling(t *testing.T) {
 		{Value: 0, SKAValue: big.NewInt(100000000), CoinType: cointype.CoinType(1)},
 	}
 
-	skaTx, err := txauthor.NewUnsignedTransaction(skaOutputs, relayFeePerKb, skaInputSource, changeSource, 100000)
+	skaTx, err := txauthor.NewUnsignedTransaction(skaOutputs, relayFeePerKb, skaInputSource, changeSource, 100000, -1)
 	if err != nil {
 		t.Fatalf("Failed to create SKA transaction: %v", err)
 	}

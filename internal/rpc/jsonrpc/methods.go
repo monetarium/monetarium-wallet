@@ -4934,7 +4934,11 @@ func makeOutputsWithCoinTypeBig(pairs map[string]*big.Int, chainParams *chaincfg
 
 // sendPairsWithCoinTypeBig creates and sends payment transactions with coin type support using big.Int amounts.
 // This is essential for SKA transactions where amounts can exceed int64.
-func (s *Server) sendPairsWithCoinTypeBig(ctx context.Context, w *wallet.Wallet, amounts map[string]*big.Int, account uint32, minconf int32, coinType cointype.CoinType) (string, error) {
+//
+// subtractFeeFromAmountIdx selects an output by index whose value should be
+// reduced by the tx fee (Bitcoin Core's subtractfeefromamount). Pass -1 to
+// disable. Multi-recipient callers (sendmany) currently always pass -1.
+func (s *Server) sendPairsWithCoinTypeBig(ctx context.Context, w *wallet.Wallet, amounts map[string]*big.Int, account uint32, minconf int32, coinType cointype.CoinType, subtractFeeFromAmountIdx int) (string, error) {
 	changeAccount := account
 	if s.cfg.MixingEnabled && s.cfg.MixAccount != "" && s.cfg.MixChangeAccount != "" {
 		mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
@@ -4955,7 +4959,7 @@ func (s *Server) sendPairsWithCoinTypeBig(ctx context.Context, w *wallet.Wallet,
 	}
 
 	// Use existing SendOutputs method (coin type is embedded in outputs)
-	txSha, err := w.SendOutputs(ctx, outputs, account, changeAccount, minconf)
+	txSha, err := w.SendOutputs(ctx, outputs, account, changeAccount, minconf, subtractFeeFromAmountIdx)
 	if err != nil {
 		if errors.Is(err, errors.Locked) {
 			return "", errWalletUnlockNeeded
@@ -5881,7 +5885,7 @@ func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 
 	relayFee := w.RelayFeeForCoinType(ctx, coinType)
 	atx, err := txauthor.NewUnsignedTransaction(outputs, relayFee,
-		inputSource, changeSource, params.MaxTxSize)
+		inputSource, changeSource, params.MaxTxSize, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -6040,7 +6044,8 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 	pairsBig := map[string]*big.Int{
 		cmd.ToAddress: amtBig,
 	}
-	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType)
+	// sendfrom does not currently expose subtractfeefromamount; pass -1.
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType, -1)
 }
 
 // sendMany handles a sendmany RPC request by creating a new transaction
@@ -6096,7 +6101,8 @@ func (s *Server) sendMany(ctx context.Context, icmd any) (any, error) {
 		}
 		pairsBig[k] = amtBig
 	}
-	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType)
+	// sendmany does not currently expose subtractfeefromamount; pass -1.
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType, -1)
 }
 
 // sendToAddress handles a sendtoaddress RPC request by creating a new
@@ -6146,8 +6152,21 @@ func (s *Server) sendToAddress(ctx context.Context, icmd any) (any, error) {
 	pairsBig := map[string]*big.Int{
 		cmd.Address: amtBig,
 	}
+
+	// Resolve subtractfeefromamount: when true, the single recipient output
+	// absorbs the fee. nil/false → -1 (default behavior).
+	//
+	// Invariant: sendtoaddress emits exactly one recipient output before
+	// any change output is appended by the wallet, so index 0 is always
+	// the recipient. If sendtoaddress ever grows multi-recipient support,
+	// this hardcoded 0 must be revisited.
+	subtractFeeIdx := -1
+	if cmd.SubtractFeeFromAmount != nil && *cmd.SubtractFeeFromAmount {
+		subtractFeeIdx = 0
+	}
+
 	// sendtoaddress always spends from the default account, this matches bitcoind
-	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, udb.DefaultAccountNum, 1, coinType)
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, udb.DefaultAccountNum, 1, coinType, subtractFeeIdx)
 }
 
 // sendToMultiSig handles a sendtomultisig RPC request by creating a new
@@ -6425,7 +6444,7 @@ func (s *Server) sendToBurn(ctx context.Context, icmd any) (any, error) {
 			}
 		}
 
-		txHash, err := w.SendOutputs(ctx, outputs, account, changeAccount, minConf)
+		txHash, err := w.SendOutputs(ctx, outputs, account, changeAccount, minConf, -1)
 		if err != nil {
 			if errors.Is(err, errors.Locked) {
 				return nil, errWalletUnlockNeeded

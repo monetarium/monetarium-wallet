@@ -183,6 +183,24 @@ method.
 
 ## Unreleased — JSON-RPC API surface
 
+### `sendtoaddress` — optional `subtractfeefromamount` parameter (additive)
+
+`sendtoaddress` now accepts an optional 6th positional parameter
+`subtractfeefromamount` (boolean, default `false`). When `true`, the
+recipient output absorbs the transaction fee instead of the change output:
+the recipient receives `amount − fee` and the change is `inputs − amount`
+(rather than `inputs − amount − fee`). This matches Bitcoin Core's
+`subtractfeefromamount` semantics on `sendtoaddress`.
+
+Both VAR and SKA coin types are supported. The fee absorption is rejected
+(no transaction broadcast, RPC returns an error) if the post-subtraction
+recipient amount is at or below the dust threshold for the recipient's
+script — VAR uses the standard dust check against the configured relay
+fee; SKA uses `MinSKADustAmount` (30 atoms).
+
+Existing callers do not need to change — omitting the parameter or
+passing `false` preserves the previous behavior.
+
 ### `signrawtransaction` — optional `skaValueIn` field on `RawTxInput` (additive)
 
 Each `RawTxInput` entry in the `inputs` argument now accepts an optional
@@ -404,3 +422,41 @@ for VAR atoms and `SKAValue` for SKA atoms; an output that carries both is
 a wire-protocol violation. The validator already enforces this on
 acceptance; this is a redundant local check so a future validator
 regression cannot silently corrupt the UTXO bookkeeping.
+
+## Unreleased — Wallet Go API
+
+### `Wallet.SendOutputs` — new `subtractFeeFromAmountIdx int` parameter (BREAKING)
+
+`Wallet.SendOutputs` and `txauthor.NewUnsignedTransaction` both gained a
+new required `subtractFeeFromAmountIdx int` parameter at the end of their
+signatures. External Go consumers that call these functions directly will
+need to update their call sites — pass `-1` to preserve the previous
+behavior (inputs cover outputs + fee, fee paid out of change), or pass a
+valid output index to enable Bitcoin Core's `subtractfeefromamount`
+semantics on that recipient (see the `sendtoaddress` JSON-RPC entry above
+for the user-facing behavior).
+
+In-tree callers (`createtx.go`, `methods.go`, the txauthor and wallet
+test suites) have been updated; only out-of-tree Go importers are
+affected.
+
+No backwards-compatibility shim is provided: this network is being
+restarted from genesis as a controlled rollout, so external Go API
+stability for the pre-release wallet module is not a release-gate
+constraint.
+
+### `txauthor.NewUnsignedTransaction` no longer mutates the caller's `outputs` slice
+
+When `subtractFeeFromAmountIdx >= 0`, the function previously decremented
+`outputs[idx].Value` (or reassigned `outputs[idx].SKAValue`) directly on
+the caller's `*wire.TxOut`. It now allocates a fresh `*wire.TxOut` with
+the post-fee value and substitutes it into a *local* copy of the outputs
+slice; the caller's slice header, slice elements, and the underlying
+`*wire.TxOut` objects are all left untouched.
+
+Callers that build a single `outputs` slice and pass it to multiple
+`NewUnsignedTransaction` invocations (for retry-on-error or for batched
+sends) will no longer see the recipient amount silently shrink across
+calls. Callers that observed the old in-place mutation as their source of
+truth for the post-fee recipient amount should read it from the returned
+`AuthoredTx.Tx.TxOut[idx]` instead.

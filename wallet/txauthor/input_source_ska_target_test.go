@@ -75,7 +75,7 @@ func TestSKAInputSourceStopsAtTarget(t *testing.T) {
 	relayFee := cointype.SKAAmountFromInt64(1)
 
 	authored, err := txauthor.NewUnsignedTransaction(outputs, relayFee,
-		fetchInputs, testChangeSource{}, 100_000)
+		fetchInputs, testChangeSource{}, 100_000, -1)
 	if err != nil {
 		t.Fatalf("NewUnsignedTransaction: %v", err)
 	}

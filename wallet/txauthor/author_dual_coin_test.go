@@ -90,7 +90,7 @@ func TestVARTransactionCreation(t *testing.T) {
 	changeSource := AuthorTestChangeSource{}
 
 	// Create transaction
-	authoredTx, err := txauthor.NewUnsignedTransaction(varOutputs, relayFee, inputSource, changeSource, 100000)
+	authoredTx, err := txauthor.NewUnsignedTransaction(varOutputs, relayFee, inputSource, changeSource, 100000, -1)
 	if err != nil {
 		t.Fatalf("Failed to create VAR transaction: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestSKATransactionCreation(t *testing.T) {
 			changeSource := AuthorTestChangeSource{}
 
 			// Create transaction
-			authoredTx, err := txauthor.NewUnsignedTransaction(skaOutputs, relayFee, inputSource, changeSource, 100000)
+			authoredTx, err := txauthor.NewUnsignedTransaction(skaOutputs, relayFee, inputSource, changeSource, 100000, -1)
 			if err != nil {
 				t.Fatalf("Failed to create SKA transaction: %v", err)
 			}
@@ -177,7 +177,7 @@ func TestMixedCoinRejection(t *testing.T) {
 	relayFee := cointype.SKAAmountFromInt64(1e3)
 
 	// This should work in txauthor (validation happens at higher level)
-	_, err := txauthor.NewUnsignedTransaction(mixedOutputs, relayFee, inputSource, changeSource, 100000)
+	_, err := txauthor.NewUnsignedTransaction(mixedOutputs, relayFee, inputSource, changeSource, 100000, -1)
 
 	// Note: Mixed coin validation happens in wallet.NewUnsignedTransaction, not in txauthor
 	// This test verifies that txauthor itself can handle mixed outputs (validation is elsewhere)
@@ -209,7 +209,7 @@ func TestDualCoinChangeOutput(t *testing.T) {
 			inputSource := makeInputSourceWithCoinType(unspents)
 			changeSource := AuthorTestChangeSource{}
 
-			authoredTx, err := txauthor.NewUnsignedTransaction(outputs, relayFee, inputSource, changeSource, 100000)
+			authoredTx, err := txauthor.NewUnsignedTransaction(outputs, relayFee, inputSource, changeSource, 100000, -1)
 			if err != nil {
 				t.Fatalf("Failed to create transaction: %v", err)
 			}
@@ -254,7 +254,7 @@ func TestEmptyOutputsHandling(t *testing.T) {
 	changeSource := AuthorTestChangeSource{}
 	relayFee := cointype.SKAAmountFromInt64(1e3)
 
-	_, err := txauthor.NewUnsignedTransaction(emptyOutputs, relayFee, inputSource, changeSource, 100000)
+	_, err := txauthor.NewUnsignedTransaction(emptyOutputs, relayFee, inputSource, changeSource, 100000, -1)
 	// Note: Empty outputs might be allowed at txauthor level - validation happens elsewhere
 	// This test just verifies the behavior is consistent
 	if err != nil {
