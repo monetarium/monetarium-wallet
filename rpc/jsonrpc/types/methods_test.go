@@ -1197,19 +1197,19 @@ func TestWalletSvrCmds(t *testing.T) {
 		{
 			name: "sweepaccount - optionals provided",
 			newCmd: func() (any, error) {
-				return dcrjson.NewCmd(Method("sweepaccount"), "default", "DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu", 6, 0.05)
+				return dcrjson.NewCmd(Method("sweepaccount"), "default", "DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu", 6, "0.05")
 			},
 			staticCmd: func() any {
 				return NewSweepAccountCmd("default", "DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu",
 					func(i uint32) *uint32 { return &i }(6),
-					func(i float64) *float64 { return &i }(0.05))
+					func(s string) *string { return &s }("0.05"))
 			},
-			marshalled: `{"jsonrpc":"1.0","method":"sweepaccount","params":["default","DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu",6,0.05],"id":1}`,
+			marshalled: `{"jsonrpc":"1.0","method":"sweepaccount","params":["default","DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu",6,"0.05"],"id":1}`,
 			unmarshalled: &SweepAccountCmd{
 				SourceAccount:         "default",
 				DestinationAddress:    "DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu",
 				RequiredConfirmations: func(i uint32) *uint32 { return &i }(6),
-				FeePerKb:              func(i float64) *float64 { return &i }(0.05),
+				FeePerKb:              func(s string) *string { return &s }("0.05"),
 			},
 		},
 		{

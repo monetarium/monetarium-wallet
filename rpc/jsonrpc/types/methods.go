@@ -1379,16 +1379,20 @@ func NewSignRawTransactionsCmd(hexEncodedTxs []string,
 }
 
 // SweepAccountCmd defines the sweep account JSON-RPC command.
+//
+// FeePerKb is a decimal coin string (e.g. "0.0001" for VAR, "8" for SKA) so it
+// can carry SKA's 1e18-atom precision; float64 cannot, and earlier numeric
+// schemas were rejected by the wallet's precision guard for SKA coin types.
 type SweepAccountCmd struct {
 	SourceAccount         string
 	DestinationAddress    string
 	RequiredConfirmations *uint32
-	FeePerKb              *float64
+	FeePerKb              *string
 	CoinType              *uint8 `json:"cointype,omitempty"` // Optional: 0=VAR (default), 1-255=SKA
 }
 
 // NewSweepAccountCmd returns a new instance which can be used to issue a JSON-RPC SweepAccountCmd command.
-func NewSweepAccountCmd(sourceAccount string, destinationAddress string, requiredConfs *uint32, feePerKb *float64) *SweepAccountCmd {
+func NewSweepAccountCmd(sourceAccount string, destinationAddress string, requiredConfs *uint32, feePerKb *string) *SweepAccountCmd {
 	return &SweepAccountCmd{
 		SourceAccount:         sourceAccount,
 		DestinationAddress:    destinationAddress,

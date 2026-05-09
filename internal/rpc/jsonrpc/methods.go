@@ -7050,7 +7050,7 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 	feePerKbOverride := cointype.Zero()
 	if cmd.FeePerKb != nil {
 		atomsPerCoin := getAtomsPerCoin(w.ChainParams(), sweepCoinType)
-		atomsBig, err := coinsToAtomsBig(*cmd.FeePerKb, atomsPerCoin)
+		atomsBig, err := coinsToAtomsBig(strings.TrimSpace(*cmd.FeePerKb), atomsPerCoin)
 		if err != nil {
 			return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
 		}

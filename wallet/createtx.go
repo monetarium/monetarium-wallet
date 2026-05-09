@@ -215,8 +215,20 @@ func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
 		}
 
 		var err error
-		authoredTx, err = txauthor.NewUnsignedTransaction(outputs, actualRelayFee,
-			inputSource, changeSource, w.chainParams.MaxTxSize, -1)
+		// Sweep semantics: outputs is empty and the caller wants "drain
+		// every UTXO of txCoinType to changeSource". txauthor.NewUnsignedTransaction
+		// infers coin type from outputs[0], so with no outputs it defaults
+		// to VAR — for SKA sweeps that mis-infers and the int64 balance check
+		// fires "insufficient balance" because SKA UTXOs report Amount=0
+		// (atom value lives in the big.Int SKAAmount). NewUnsignedSweepTransaction
+		// takes coin type explicitly so the SKA paths are taken.
+		if algo == OutputSelectionAlgorithmAll && len(outputs) == 0 {
+			authoredTx, err = txauthor.NewUnsignedSweepTransaction(txCoinType, actualRelayFee,
+				inputSource, changeSource, w.chainParams.MaxTxSize)
+		} else {
+			authoredTx, err = txauthor.NewUnsignedTransaction(outputs, actualRelayFee,
+				inputSource, changeSource, w.chainParams.MaxTxSize, -1)
+		}
 		if err != nil {
 			return err
 		}

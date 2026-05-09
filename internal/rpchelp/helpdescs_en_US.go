@@ -1036,7 +1036,7 @@ var helpDescsEnUS = map[string]string{
 	"sweepaccount-sourceaccount":         "The account to be swept.",
 	"sweepaccount-destinationaddress":    "The destination address to pay to.",
 	"sweepaccount-requiredconfirmations": "The minimum utxo confirmation requirement (optional).",
-	"sweepaccount-feeperkb":              "The minimum relay fee policy (optional).",
+	"sweepaccount-feeperkb":              "The minimum relay fee policy as a decimal coin string in the selected coin type (e.g. \"0.0001\" for VAR, \"8\" for SKA). Optional.",
 	"sweepaccount-cointype":              "Optional: Coin type to sweep (0=VAR, 1-255=SKA). Default is VAR (0). UTXOs of other coin types are ignored.",
 
 	// SweepAccountResult help.
