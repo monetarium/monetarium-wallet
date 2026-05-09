@@ -162,12 +162,21 @@ func NewCreateNewAccountCmd(account string) *CreateNewAccountCmd {
 // to sign at a specific point in the emission window. Nonce defaults to 1
 // (first emission) and should only be overridden when re-authorizing a coin
 // type that has already been emitted once.
+//
+// ForceWindow and ForceNonce are independent override flags that bypass the
+// corresponding safety guard. ForceWindow allows signing at a height outside
+// the configured emission window; ForceNonce allows signing with a nonce
+// other than 1. Each flag must be set explicitly: a single global "force"
+// affordance is intentionally absent so that an operator who wants to bypass
+// only one guard cannot accidentally bypass both.
 type CreateAuthorizedEmissionCmd struct {
 	CoinType        uint8   `json:"cointype"`            // SKA coin type (1-255)
 	EmissionKeyName string  `json:"emissionkeyname"`     // Name of imported emission private key
 	Passphrase      string  `json:"passphrase"`          // Wallet passphrase for key access
 	Height          *int64  `json:"height,omitempty"`    // Optional: explicit block height to sign (defaults to wallet tip)
 	Nonce           *uint64 `json:"nonce,omitempty"`     // Optional: emission nonce (defaults to 1)
+	ForceWindow     *bool   `json:"forcewindow,omitempty" jsonrpcdefault:"false"` // Optional: bypass the out-of-window-height safety error (default false)
+	ForceNonce      *bool   `json:"forcenonce,omitempty" jsonrpcdefault:"false"`  // Optional: bypass the non-default-nonce safety error (default false)
 	// NOTE: Emission addresses, amounts, and windows are defined by governance
 	// and retrieved from chain parameters - users cannot specify arbitrary values
 }
@@ -185,11 +194,16 @@ func NewCreateAuthorizedEmissionCmd(coinType uint8, emissionKeyName, passphrase 
 // GenerateEmissionKeyCmd defines the generateemissionkey JSON-RPC command for
 // generating new private keys for SKA emission authorization (primary flow).
 //
-// Passphrase is used to encrypt the returned backup blob and is unrelated to the
-// wallet-unlock passphrase (the wallet must be separately unlocked via
-// walletpassphrase before this call).
+// WalletPassphrase is the wallet's master passphrase. It is used to unlock the
+// wallet for the duration of this single call so the emission key can be stored
+// in the wallet DB; the wallet is re-locked on return if it was locked
+// beforehand. The ambient walletpassphrase unlock window is NOT used.
+//
+// Passphrase is used to encrypt the returned backup blob (only when
+// ReturnEncryptedBackup=true) and is unrelated to WalletPassphrase.
 type GenerateEmissionKeyCmd struct {
 	KeyName               string `json:"keyname"`                         // Unique identifier for this emission key
+	WalletPassphrase      string `json:"walletpassphrase"`                // Wallet master passphrase; required (per-call unlock)
 	Passphrase            string `json:"passphrase"`                      // Passphrase used to encrypt the returned backup blob (if requested)
 	CoinType              *uint8 `json:"cointype,omitempty"`              // Optional SKA coin type (1-255) - for user organization only
 	ReturnEncryptedBackup *bool  `json:"returnencryptedbackup,omitempty"` // If true, include the encrypted private-key backup in the response; default false (canonical backup is the wallet DB)
@@ -197,56 +211,66 @@ type GenerateEmissionKeyCmd struct {
 
 // NewGenerateEmissionKeyCmd returns a new instance which can be used to issue a
 // generateemissionkey JSON-RPC command.
-func NewGenerateEmissionKeyCmd(keyName, passphrase string) *GenerateEmissionKeyCmd {
+func NewGenerateEmissionKeyCmd(keyName, walletPassphrase, passphrase string) *GenerateEmissionKeyCmd {
 	return &GenerateEmissionKeyCmd{
-		KeyName:    keyName,
-		Passphrase: passphrase,
-		CoinType:   nil,
+		KeyName:          keyName,
+		WalletPassphrase: walletPassphrase,
+		Passphrase:       passphrase,
+		CoinType:         nil,
 	}
 }
 
 // NewGenerateEmissionKeyCmdWithCoinType returns a new instance with cointype parameter.
-func NewGenerateEmissionKeyCmdWithCoinType(coinType uint8, keyName, passphrase string) *GenerateEmissionKeyCmd {
+func NewGenerateEmissionKeyCmdWithCoinType(coinType uint8, keyName, walletPassphrase, passphrase string) *GenerateEmissionKeyCmd {
 	return &GenerateEmissionKeyCmd{
-		KeyName:    keyName,
-		Passphrase: passphrase,
-		CoinType:   &coinType,
+		KeyName:          keyName,
+		WalletPassphrase: walletPassphrase,
+		Passphrase:       passphrase,
+		CoinType:         &coinType,
 	}
 }
 
 // ImportEmissionKeyCmd defines the importemissionkey JSON-RPC command for
 // importing private keys used for SKA emission authorization (emergency/recovery only).
 //
+// WalletPassphrase is the wallet's master passphrase. It is used to unlock the
+// wallet for the duration of this single call so the imported key can be stored
+// in the wallet DB; the wallet is re-locked on return if it was locked
+// beforehand. The ambient walletpassphrase unlock window is NOT used.
+//
 // Passphrase is the backup-blob passphrase used when the key was exported via
-// generateemissionkey; it is unrelated to the wallet-unlock passphrase (the
-// wallet must be separately unlocked via walletpassphrase before this call).
-// Only v2 ("aes256gcm:v2:...") blobs are accepted; legacy v1 blobs are
+// generateemissionkey (only consumed when PrivateKey is an encrypted blob); it
+// is unrelated to WalletPassphrase. Only v3 ("aes256gcm:v3:...") blobs are
+// accepted; legacy v1 (no KDF) and v2 (no AAD on KDF params) blobs are
 // cryptographically weak and rejected.
 type ImportEmissionKeyCmd struct {
-	KeyName    string `json:"keyname"`            // Unique identifier for this key
-	PrivateKey string `json:"privatekey"`         // Hex-encoded secp256k1 private key or v2 encrypted backup blob
-	Passphrase string `json:"passphrase"`         // Backup-blob passphrase (only used when PrivateKey is an encrypted blob)
-	CoinType   *uint8 `json:"cointype,omitempty"` // Optional SKA coin type (1-255) - for user organization only
+	KeyName          string `json:"keyname"`            // Unique identifier for this key
+	PrivateKey       string `json:"privatekey"`         // Hex-encoded secp256k1 private key or v3 encrypted backup blob
+	WalletPassphrase string `json:"walletpassphrase"`   // Wallet master passphrase; required (per-call unlock)
+	Passphrase       string `json:"passphrase"`         // Backup-blob passphrase (only used when PrivateKey is an encrypted blob)
+	CoinType         *uint8 `json:"cointype,omitempty"` // Optional SKA coin type (1-255) - for user organization only
 }
 
 // NewImportEmissionKeyCmd returns a new instance which can be used to issue an
 // importemissionkey JSON-RPC command.
-func NewImportEmissionKeyCmd(coinType uint8, keyName, privateKey, passphrase string) *ImportEmissionKeyCmd {
+func NewImportEmissionKeyCmd(coinType uint8, keyName, privateKey, walletPassphrase, passphrase string) *ImportEmissionKeyCmd {
 	return &ImportEmissionKeyCmd{
-		KeyName:    keyName,
-		PrivateKey: privateKey,
-		Passphrase: passphrase,
-		CoinType:   &coinType,
+		KeyName:          keyName,
+		PrivateKey:       privateKey,
+		WalletPassphrase: walletPassphrase,
+		Passphrase:       passphrase,
+		CoinType:         &coinType,
 	}
 }
 
 // NewImportEmissionKeyCmdNoCoinType returns a new instance without cointype parameter.
-func NewImportEmissionKeyCmdNoCoinType(keyName, privateKey, passphrase string) *ImportEmissionKeyCmd {
+func NewImportEmissionKeyCmdNoCoinType(keyName, privateKey, walletPassphrase, passphrase string) *ImportEmissionKeyCmd {
 	return &ImportEmissionKeyCmd{
-		KeyName:    keyName,
-		PrivateKey: privateKey,
-		Passphrase: passphrase,
-		CoinType:   nil,
+		KeyName:          keyName,
+		PrivateKey:       privateKey,
+		WalletPassphrase: walletPassphrase,
+		Passphrase:       passphrase,
+		CoinType:         nil,
 	}
 }
 
@@ -1284,12 +1308,21 @@ func NewSignMessageCmd(address, message string) *SignMessageCmd {
 
 // RawTxInput models the data needed for raw transaction input that is used in
 // the SignRawTransactionCmd struct.  Contains Decred additions.
+//
+// SKAValueIn is a decimal-coin string (e.g. "1.234567890123456789") asserting
+// the SKA atom value of the prevout being spent. It is required for SKA inputs
+// when the wallet does not own the prevout — without it the wire-format tx
+// either carries SKAValueIn through deserialize/sign/serialize (the wallet's
+// own unsigned-tx hex case), or arrives with SKAValueIn=nil from a third-party
+// tool, in which case the wallet must populate it from a wallet UTXO lookup or
+// this caller-supplied value before signing. VAR inputs ignore this field.
 type RawTxInput struct {
-	Txid         string `json:"txid"`
-	Vout         uint32 `json:"vout"`
-	Tree         int8   `json:"tree"`
-	ScriptPubKey string `json:"scriptPubKey"`
-	RedeemScript string `json:"redeemScript"`
+	Txid         string  `json:"txid"`
+	Vout         uint32  `json:"vout"`
+	Tree         int8    `json:"tree"`
+	ScriptPubKey string  `json:"scriptPubKey"`
+	RedeemScript string  `json:"redeemScript"`
+	SKAValueIn   *string `json:"skaValueIn,omitempty"`
 }
 
 // SignRawTransactionCmd defines the signrawtransaction JSON-RPC command.
@@ -1336,6 +1369,7 @@ type SweepAccountCmd struct {
 	DestinationAddress    string
 	RequiredConfirmations *uint32
 	FeePerKb              *float64
+	CoinType              *uint8 `json:"cointype,omitempty"` // Optional: 0=VAR (default), 1-255=SKA
 }
 
 // NewSweepAccountCmd returns a new instance which can be used to issue a JSON-RPC SweepAccountCmd command.
@@ -1424,9 +1458,6 @@ type DiscoverUsageCmd struct {
 	GapLimit         *uint32 `json:"gaplimit"`
 }
 
-// ValidatePreDCP0005CFCmd defines the validatepredcp0005cf JSON-RPC command.
-type ValidatePreDCP0005CFCmd struct{}
-
 // ImportCfiltersV2Cmd defines the importcfiltersv2 JSON-RPC command.
 type ImportCFiltersV2Cmd struct {
 	StartHeight int32    `json:"startheight"`
@@ -1480,13 +1511,15 @@ type SpendOutputsCmd struct {
 	Account           string
 	PreviousOutpoints []string
 	Outputs           []AddressAmountPair
+	CoinType          *uint8 `json:"cointype,omitempty"` // Optional: specify coin type (0=VAR, 1-255=SKA)
 }
 
 // AddressAmountPair represents a JSON object defining an address and an
-// amount.
+// amount. Amount is a decimal coin string for both VAR and SKA — preserving
+// SKA big.Int precision and avoiding float64 round-trip loss for VAR.
 type AddressAmountPair struct {
-	Address string  `json:"address"`
-	Amount  float64 `json:"amount"`
+	Address string `json:"address"`
+	Amount  string `json:"amount"`
 }
 
 func init() {
@@ -1585,7 +1618,6 @@ func init() {
 		{"treasurypolicy", (*TreasuryPolicyCmd)(nil)},
 		{"tspendpolicy", (*TSpendPolicyCmd)(nil)},
 		{"unlockaccount", (*UnlockAccountCmd)(nil)},
-		{"validatepredcp0005cf", (*ValidatePreDCP0005CFCmd)(nil)},
 		{"walletinfo", (*WalletInfoCmd)(nil)},
 		{"walletislocked", (*WalletIsLockedCmd)(nil)},
 		{"walletlock", (*WalletLockCmd)(nil)},
@@ -1632,11 +1664,32 @@ func init() {
 	}
 }
 
+// CreateRawTransactionCmd extends the dcrd createrawtransaction command with
+// an optional CoinType. Amounts is now a single map[string]string for both
+// VAR and SKA — decimal coin strings preserve SKA big.Int precision and avoid
+// float64 round-trip loss for VAR amounts above ~9e7 VAR.
+//
+// The legacy float64 Amount on each TransactionInput is lossy for VAR values
+// above ~9e7 VAR (single-precision-equivalent at int64 atom scale) and
+// fundamentally too small for SKA (1e18 atoms/coin vs ~15 significant decimal
+// digits in float64). InputAmounts is an optional parallel slice of
+// decimal-coin strings indexed by input position; when an entry is non-empty
+// the parser uses it instead of the float64 Amount field, preserving full
+// precision. An entry of "" falls back to the float64 Amount for backwards
+// compatibility with existing callers.
+type CreateRawTransactionCmd struct {
+	Inputs       []dcrdtypes.TransactionInput
+	Amounts      map[string]string `jsonrpcusage:"{\"address\":\"amount\",...}"` // Decimal coin strings (VAR or SKA per CoinType)
+	LockTime     *int64
+	Expiry       *int64
+	CoinType     *uint8    `json:"cointype,omitempty"`
+	InputAmounts *[]string `json:"inputamounts,omitempty"` // Optional decimal-coin override per input (index-aligned with Inputs)
+}
+
 // newtype definitions of dcrd commands we implement.
 type (
-	AuthenticateCmd         dcrdtypes.AuthenticateCmd
-	CreateRawTransactionCmd dcrdtypes.CreateRawTransactionCmd
-	DebugLevelCmd           dcrdtypes.DebugLevelCmd
+	AuthenticateCmd dcrdtypes.AuthenticateCmd
+	DebugLevelCmd   dcrdtypes.DebugLevelCmd
 	GetBestBlockCmd         dcrdtypes.GetBestBlockCmd
 	GetBestBlockHashCmd     dcrdtypes.GetBestBlockHashCmd
 	GetBlockCountCmd        dcrdtypes.GetBlockCountCmd

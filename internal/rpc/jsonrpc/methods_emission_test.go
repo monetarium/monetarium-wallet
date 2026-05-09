@@ -402,9 +402,10 @@ func validateCreateAuthorizedEmissionCmd(cmd *types.CreateAuthorizedEmissionCmd)
 }
 
 // isValidEncryptedKeyFormat checks only the prefix/shape of an emission-key
-// backup blob. Both v1 (aes256gcm:<iv>:<ct>, 3 parts — insecure, rejected at
-// import) and v2 (aes256gcm:v2:<salt>:<N>:<r>:<p>:<nonce>:<ct>, 8 parts —
-// canonical) are shape-valid here; actual cryptographic rejection of v1
+// backup blob. v1 (aes256gcm:<iv>:<ct>, 3 parts — insecure), v2
+// (aes256gcm:v2:<salt>:<N>:<r>:<p>:<nonce>:<ct>, 8 parts — no AAD on KDF
+// params, rejected at import), and v3 (same shape with AAD-bound KDF params,
+// canonical) are all shape-valid here; cryptographic rejection of v1 and v2
 // happens inside decryptPrivateKeyWithPassphrase.
 func isValidEncryptedKeyFormat(encryptedKey string) bool {
 	if !strings.HasPrefix(encryptedKey, "aes256gcm:") {
@@ -415,7 +416,7 @@ func isValidEncryptedKeyFormat(encryptedKey string) bool {
 	if len(parts) == 3 {
 		return parts[1] != "" && parts[2] != ""
 	}
-	if len(parts) == 8 && parts[1] == "v2" {
+	if len(parts) == 8 && (parts[1] == "v2" || parts[1] == "v3") {
 		for _, p := range parts[2:] {
 			if p == "" {
 				return false

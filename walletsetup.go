@@ -285,7 +285,12 @@ func createSimulationWallet(ctx context.Context, cfg *config) error {
 	// Write the seed to disk, so that we can restore it later
 	// if need be, for testing purposes.
 	seedStr := walletseed.EncodeMnemonic(seed)
-	err = os.WriteFile(filepath.Join(netDir, "seed"), []byte(seedStr), 0644)
+	seedPath := filepath.Join(netDir, "seed")
+	fmt.Fprintf(os.Stderr,
+		"WARNING: writing simulation wallet seed mnemonic in plaintext to %s. "+
+			"This file grants full control of the wallet — do not use --createtemp "+
+			"outside of throwaway test environments.\n", seedPath)
+	err = os.WriteFile(seedPath, []byte(seedStr), 0600)
 	if err != nil {
 		return err
 	}

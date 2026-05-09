@@ -26,6 +26,8 @@ internal/rpc/*/dcrwallet
 
 # Binaries
 monetarium-wallet
+/movefunds
+/sweepaccount
 
 # Internal
 go.work

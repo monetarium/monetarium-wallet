@@ -6,6 +6,7 @@
 package txrules
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/monetarium/monetarium-node/chaincfg"
@@ -44,6 +45,10 @@ const DefaultRelayFeePerKb dcrutil.Amount = 0.0001 * 1e8
 // IsDustAmount determines whether a transaction output value and script length would
 // cause the output to be considered dust.  Transactions with dust outputs are
 // not standard and are rejected by mempools with default policies.
+//
+// VAR-only: this function operates on int64 amounts and is unsuitable for SKA
+// outputs (whose atom values can exceed math.MaxInt64). For SKA, use
+// CheckOutput, which enforces cointype.MinSKADustAmount via SKAValue.
 func IsDustAmount(amount dcrutil.Amount, scriptSize int, relayFeePerKb dcrutil.Amount) bool {
 	// Calculate the total (estimated) cost to the network.  This is
 	// calculated using the serialize size of the output plus the serial
@@ -62,6 +67,9 @@ func IsDustAmount(amount dcrutil.Amount, scriptSize int, relayFeePerKb dcrutil.A
 // IsDustOutput determines whether a transaction output is considered dust.
 // Transactions with dust outputs are not standard and are rejected by mempools
 // with default policies.
+//
+// VAR-only: this function reads output.Value (int64) and ignores SKAValue.
+// For SKA outputs, use CheckOutput, which enforces cointype.MinSKADustAmount.
 func IsDustOutput(output *wire.TxOut, relayFeePerKb dcrutil.Amount) bool {
 	// Unspendable outputs which solely carry data are not checked for dust.
 	if stdscript.IsNullDataScript(output.Version, output.PkScript) {
@@ -88,6 +96,13 @@ func CheckOutput(output *wire.TxOut, relayFeePerKb cointype.SKAAmount) error {
 		if output.SKAValue == nil || output.SKAValue.Sign() < 0 {
 			return errors.E(errors.Invalid, "SKA transaction output amount is nil or negative")
 		}
+		// OP_RETURN data outputs (incl. SKA burn scripts from
+		// chaincfg.CreateSKABurnScript) are provably unspendable; the
+		// dust-as-network-burden rationale doesn't apply. Mirrors the VAR
+		// IsDustOutput exemption above.
+		if stdscript.IsNullDataScript(output.Version, output.PkScript) {
+			return nil
+		}
 		// Minimum 30 atoms for SKA outputs (matches mempool dust threshold)
 		if output.SKAValue.Cmp(cointype.MinSKADustAmount) < 0 {
 			return errors.E(errors.Policy, "SKA transaction output amount below minimum (30 atoms)")
@@ -95,8 +110,15 @@ func CheckOutput(output *wire.TxOut, relayFeePerKb cointype.SKAAmount) error {
 		return nil
 	}
 
-	// VAR output validation - convert fee to int64 (VAR fees always fit in int64)
-	relayFeeInt64, _ := relayFeePerKb.Int64()
+	// VAR output validation - convert fee to int64. VAR fees always fit in
+	// int64; an overflow here means the caller passed an SKA-shaped fee
+	// rate by mistake, which would silently disable dust rejection if
+	// allowed to fall through.
+	relayFeeInt64, err := relayFeePerKb.Int64()
+	if err != nil {
+		return errors.E(errors.Invalid, fmt.Sprintf(
+			"VAR fee overflow: %s exceeds int64 (%v)", relayFeePerKb.String(), err))
+	}
 	if output.Value < 0 {
 		return errors.E(errors.Invalid, "transaction output amount is negative")
 	}
@@ -111,6 +133,9 @@ func CheckOutput(output *wire.TxOut, relayFeePerKb cointype.SKAAmount) error {
 
 // FeeForSerializeSize calculates the required fee for a transaction of some
 // arbitrary size given a mempool's relay fee policy.
+//
+// VAR-only: this function uses int64 math and clamps at cointype.MaxVARAmount.
+// For SKA, use FeeForSerializeSizeSKA, which preserves big.Int precision.
 func FeeForSerializeSize(relayFeePerKb dcrutil.Amount, txSerializeSize int) dcrutil.Amount {
 	fee := relayFeePerKb * dcrutil.Amount(txSerializeSize) / 1000
 
@@ -136,9 +161,11 @@ func FeeForSerializeSizeSKA(relayFeePerKb cointype.SKAAmount, txSerializeSize in
 	// Divide by 1000
 	fee.Div(fee, cointype.KilobyteInt)
 
-	// Ensure minimum fee
+	// Floor: when truncation drives the computed fee to zero, return one
+	// fee-rate-per-kB. Use a defensive copy so the returned SKAAmount does
+	// not alias relayFeePerKb's inner *big.Int.
 	if fee.Sign() == 0 && relayFeePerKb.BigInt().Sign() > 0 {
-		return relayFeePerKb
+		return cointype.NewSKAAmount(new(big.Int).Set(relayFeePerKb.BigInt()))
 	}
 
 	return cointype.NewSKAAmount(fee)
@@ -149,15 +176,6 @@ func sumOutputValues(outputs []*wire.TxOut) (totalOutput dcrutil.Amount) {
 		totalOutput += dcrutil.Amount(txOut.Value)
 	}
 	return totalOutput
-}
-
-// FeeForSerializeSizeDualCoin calculates the required fee for a transaction.
-// All coin types (VAR and SKA) pay fees in their own coin type.
-// The fee calculation is the same for all coin types.
-func FeeForSerializeSizeDualCoin(relayFeePerKb dcrutil.Amount, txSerializeSize int, coinType cointype.CoinType) dcrutil.Amount {
-	// All coin types use the same fee calculation
-	// The fee is paid in the same coin type as the transaction
-	return FeeForSerializeSize(relayFeePerKb, txSerializeSize)
 }
 
 // GetCoinTypeFromOutputs determines the coin type of transaction outputs.
@@ -172,41 +190,53 @@ func GetCoinTypeFromOutputs(outputs []*wire.TxOut) cointype.CoinType {
 	return outputs[0].CoinType
 }
 
-// IsDustAmountDualCoin determines dust for the dual-coin system.
-// All coin types use the same dust calculation.
-func IsDustAmountDualCoin(amount dcrutil.Amount, scriptSize int, relayFeePerKb dcrutil.Amount, coinType cointype.CoinType) bool {
-	return IsDustAmount(amount, scriptSize, relayFeePerKb)
-}
-
-// IsDustOutputDualCoin determines whether a transaction output is considered dust
-// in the dual-coin system.
-func IsDustOutputDualCoin(output *wire.TxOut, relayFeePerKb dcrutil.Amount) bool {
-	// Unspendable outputs which solely carry data are not checked for dust.
-	if stdscript.IsNullDataScript(output.Version, output.PkScript) {
-		return false
+// ValidateCoinTypeUniformity returns an error if outputs do not all share the
+// same coin type. Consensus rejects mixed-coin transactions, but wallet-layer
+// aggregators that read txStore-resident MsgTx must verify the invariant
+// locally as defense-in-depth before summing Value/SKAValue — a malformed tx
+// reaching the wallet via SPV rescan or addtransaction RPC would otherwise
+// silently mis-report balance.
+func ValidateCoinTypeUniformity(outputs []*wire.TxOut) error {
+	if len(outputs) <= 1 {
+		return nil
 	}
-
-	// All other unspendable outputs are considered dust.
-	if txscript.IsUnspendable(output.Value, output.PkScript) {
-		return true
+	first := outputs[0].CoinType
+	for i, txOut := range outputs[1:] {
+		if txOut.CoinType != first {
+			return errors.E(errors.Invalid,
+				fmt.Sprintf("output 0 coin type %d does not match output %d coin type %d",
+					first, i+1, txOut.CoinType))
+		}
 	}
-
-	return IsDustAmountDualCoin(dcrutil.Amount(output.Value), len(output.PkScript),
-		relayFeePerKb, output.CoinType)
+	return nil
 }
 
 // PaysHighFees checks whether the signed transaction pays insanely high fees.
 // Transactons are defined to have a high fee if they have pay a fee rate that
 // is 1000 time higher than the default fee.
-func PaysHighFees(totalInput dcrutil.Amount, tx *wire.MsgTx) bool {
+//
+// VAR-only: this function reads output.Value (int64) and ignores SKAValue.
+// Passing a transaction with any SKA output is a programmer error and returns
+// an errors.Bug error — callers must dispatch on coin type at the call site
+// and route SKA transactions to PaysHighFeesSKA. Returning an error (rather
+// than silently returning false) ensures any future caller that forgets the
+// dispatch surfaces the bug immediately instead of bypassing the high-fee gate.
+func PaysHighFees(totalInput dcrutil.Amount, tx *wire.MsgTx) (bool, error) {
+	for _, txOut := range tx.TxOut {
+		if txOut.CoinType.IsSKA() {
+			return false, errors.E(errors.Bug,
+				"txrules.PaysHighFees called with SKA outputs; use PaysHighFeesSKA")
+		}
+	}
+
 	fee := totalInput - sumOutputValues(tx.TxOut)
 	if fee <= 0 {
 		// Impossible to determine
-		return false
+		return false, nil
 	}
 
 	maxFee := FeeForSerializeSize(1000*DefaultRelayFeePerKb, tx.SerializeSize())
-	return fee > maxFee
+	return fee > maxFee, nil
 }
 
 // TxPaysHighFees checks whether the signed transaction pays insanely high fees.
@@ -214,7 +244,16 @@ func PaysHighFees(totalInput dcrutil.Amount, tx *wire.MsgTx) bool {
 // is 1000 time higher than the default fee.  Total transaction input value is
 // determined by summing the ValueIn fields of each input, and an error is returned
 // if any input values were the null value.
+//
+// VAR-only: returns an Invalid error if any output is SKA — callers must use
+// the SKA-aware path instead.
 func TxPaysHighFees(tx *wire.MsgTx) (bool, error) {
+	for _, txOut := range tx.TxOut {
+		if txOut.CoinType.IsSKA() {
+			return false, errors.E(errors.Bug,
+				"TxPaysHighFees is VAR-only; use PaysHighFeesSKA for SKA transactions")
+		}
+	}
 	var input dcrutil.Amount
 	for i, in := range tx.TxIn {
 		if in.ValueIn < 0 {
@@ -224,15 +263,35 @@ func TxPaysHighFees(tx *wire.MsgTx) (bool, error) {
 		}
 		input += dcrutil.Amount(in.ValueIn)
 	}
-	return PaysHighFees(input, tx), nil
+	return PaysHighFees(input, tx)
 }
 
 // PaysHighFeesSKA checks whether an SKA transaction pays excessively high fees.
 // SKA transactions are defined to have a high fee if they pay a fee rate that
 // is MaxFeeMultiplier (default 2500) times higher than the per-coin MinRelayTxFee.
-func PaysHighFeesSKA(totalInput *big.Int, tx *wire.MsgTx, chainParams *chaincfg.Params) bool {
-	if totalInput == nil || totalInput.Sign() <= 0 {
-		return false
+//
+// Absolute floor: regardless of tx size, the maximum allowed fee never falls
+// below MinRelayTxFee × MaxFeeMultiplier (the "minMaxFee" computed below). For
+// SKA1 mainnet with MinRelayTxFee=4e18 and MaxFeeMultiplier=2500 that floor is
+// 1e22 atoms (10000 SKA). The function therefore does not flag txs paying less
+// than that absolute amount, even when their fee-rate per-kB is many multiples
+// of MinRelayTxFee. This matches dcrwallet's VAR PaysHighFees behavior at the
+// small-tx end and is intentional — the gate is a sanity check on grossly
+// overpaying transactions, not a fee-rate ceiling.
+//
+// Returns errors.Bug if the per-coin MinRelayTxFee is missing or non-positive
+// — silently bypassing the high-fee gate on a misconfigured chain would let
+// the wallet author SKA transactions paying any fee. Mirrors the explicit
+// error contract on the VAR PaysHighFees path.
+func PaysHighFeesSKA(totalInput *big.Int, tx *wire.MsgTx, chainParams *chaincfg.Params) (bool, error) {
+	if totalInput == nil {
+		return false, errors.E(errors.Bug, "PaysHighFeesSKA: nil totalInput")
+	}
+	if totalInput.Sign() < 0 {
+		return false, errors.E(errors.Bug, "PaysHighFeesSKA: negative totalInput")
+	}
+	if totalInput.Sign() == 0 {
+		return false, nil
 	}
 
 	// Determine coin type from outputs
@@ -240,8 +299,9 @@ func PaysHighFeesSKA(totalInput *big.Int, tx *wire.MsgTx, chainParams *chaincfg.
 
 	// Look up per-coin config
 	config, ok := chainParams.SKACoins[coinType]
-	if !ok || config.MinRelayTxFee == nil || config.MinRelayTxFee.Sign() <= 0 {
-		return false
+	if !ok || config == nil || config.MinRelayTxFee == nil || config.MinRelayTxFee.Sign() <= 0 {
+		return false, errors.E(errors.Bug, errors.Errorf(
+			"PaysHighFeesSKA: missing or non-positive MinRelayTxFee for coin type %d", coinType))
 	}
 
 	// Sum SKA output values
@@ -255,14 +315,10 @@ func PaysHighFeesSKA(totalInput *big.Int, tx *wire.MsgTx, chainParams *chaincfg.
 	// Calculate fee = inputs - outputs
 	fee := new(big.Int).Sub(totalInput, outputSum)
 	if fee.Sign() <= 0 {
-		return false
+		return false, nil
 	}
 
-	// Get multiplier from config (default 2500)
-	multiplier := config.MaxFeeMultiplier
-	if multiplier <= 0 {
-		multiplier = 2500
-	}
+	multiplier := config.EffectiveMaxFeeMultiplier()
 
 	// Calculate max fee using big.Int: minRelayFee * multiplier * txSize / 1000
 	txSize := int64(tx.SerializeSize())
@@ -276,7 +332,7 @@ func PaysHighFeesSKA(totalInput *big.Int, tx *wire.MsgTx, chainParams *chaincfg.
 		maxFee = minMaxFee
 	}
 
-	return fee.Cmp(maxFee) > 0
+	return fee.Cmp(maxFee) > 0, nil
 }
 
 // TxPaysHighFeesSKA checks whether an SKA transaction pays excessively high fees.
@@ -300,5 +356,5 @@ func TxPaysHighFeesSKA(tx *wire.MsgTx, chainParams *chaincfg.Params) (bool, erro
 		}
 		totalInput.Add(totalInput, in.SKAValueIn)
 	}
-	return PaysHighFeesSKA(totalInput, tx, chainParams), nil
+	return PaysHighFeesSKA(totalInput, tx, chainParams)
 }

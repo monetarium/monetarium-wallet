@@ -38,7 +38,7 @@ func TestConsolidateCmdStructure(t *testing.T) {
 			wantErr:  false,
 		},
 		{
-			name:     "Consolidate with SKA-1 coin type",
+			name:     "Consolidate with SKA1 coin type",
 			inputs:   100,
 			account:  nil,
 			address:  stringPtr("SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc"),
@@ -46,7 +46,7 @@ func TestConsolidateCmdStructure(t *testing.T) {
 			wantErr:  false,
 		},
 		{
-			name:     "Consolidate with SKA-2 coin type",
+			name:     "Consolidate with SKA2 coin type",
 			inputs:   75,
 			account:  stringPtr("staker"),
 			address:  nil,
@@ -129,25 +129,25 @@ func TestConsolidateCoinTypeValues(t *testing.T) {
 			desc:     "VAR coin type",
 		},
 		{
-			name:     "SKA-1",
+			name:     "SKA1",
 			coinType: 1,
 			valid:    true,
 			desc:     "First SKA coin type",
 		},
 		{
-			name:     "SKA-2",
+			name:     "SKA2",
 			coinType: 2,
 			valid:    true,
 			desc:     "Second SKA coin type",
 		},
 		{
-			name:     "SKA-100",
+			name:     "SKA100",
 			coinType: 100,
 			valid:    true,
 			desc:     "Mid-range SKA coin type",
 		},
 		{
-			name:     "SKA-255",
+			name:     "SKA255",
 			coinType: 255,
 			valid:    true,
 			desc:     "Maximum SKA coin type",
@@ -199,7 +199,7 @@ func TestConsolidateWithAccount(t *testing.T) {
 			}
 
 			// Test with coin type as well
-			coinType := uint8(1) // SKA-1
+			coinType := uint8(1) // SKA1
 			cmdWithCoinType := types.NewConsolidateCmdWithCoinType(50, &acct, nil, &coinType)
 
 			if cmdWithCoinType.Account == nil {
@@ -241,7 +241,7 @@ func TestConsolidateWithAddress(t *testing.T) {
 			}
 
 			// Test with coin type as well
-			coinType := uint8(1) // SKA-1
+			coinType := uint8(1) // SKA1
 			cmdWithCoinType := types.NewConsolidateCmdWithCoinType(100, nil, &addr, &coinType)
 
 			if cmdWithCoinType.Address == nil {
@@ -293,7 +293,7 @@ func TestConsolidateAllParameters(t *testing.T) {
 	inputs := 100
 	account := "staker"
 	address := "SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc"
-	coinType := uint8(1) // SKA-1
+	coinType := uint8(1) // SKA1
 
 	cmd := types.NewConsolidateCmdWithCoinType(inputs, &account, &address, &coinType)
 

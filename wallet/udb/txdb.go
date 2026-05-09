@@ -59,6 +59,15 @@ import (
 //      incremented by constants. Comments need to be filled in. Only
 //      about 1/2 of functions are properly commented.
 
+// Compile-time assertion that cointype.CoinTypeMax fits in uint8.
+// existsRawUnspent's fallback walks [1, CoinTypeMax]; a silent widening past
+// 255 would balloon that scan and break the coin-type bucket layout, which
+// assumes a single-byte coin-type discriminator. If CoinTypeMax is ever
+// raised above 255 (or the underlying type is widened past uint8), this
+// declaration fails to compile because the constant cannot be represented
+// as uint8.
+const _ = uint8(cointype.CoinTypeMax)
+
 const (
 	// accountExistsMask is the bitmask for the accountExists bool in
 	// the encoded scriptType for credits.
@@ -160,6 +169,14 @@ var (
 	// bucketSKAUnminedCreditAmounts stores big.Int amounts for unmined SKA credits.
 	bucketSKAUnminedCreditAmounts = []byte("skam")
 
+	// bucketSKAStakeInvalidatedCreditAmounts mirrors bucketStakeInvalidatedCredits
+	// for SKA: when stakeInvalidate moves an SKA credit to the invalidated archive,
+	// its big.Int amount is moved here keyed by the same 72-byte credit key.
+	// stakeValidate later restores it to bucketSKACreditAmounts. Without this side
+	// archive a stake-invalidate / stake-validate round-trip would silently zero
+	// out the SKA credit's value.
+	bucketSKAStakeInvalidatedCreditAmounts = []byte("skai")
+
 	// bucketSSFeeMarkers stores SSFee marker types for transactions to avoid
 	// deserializing transactions just to check output[0] for the marker.
 	// Key: tx record key (68 bytes)
@@ -217,6 +234,11 @@ var (
 // outputs spent by mempool transactions, which must be considered when
 // returning the actual balance for a given number of block confirmations.  The
 // value is the amount serialized as a uint64.
+//
+// Note: this aggregate is VAR-only (int64 atoms). SKA balances are tracked
+// per coin type via bucketUnspentForCoinType / bucketUnminedCreditsForCoinType,
+// with big.Int amounts held in bucketSKACreditAmounts and
+// bucketSKAUnminedCreditAmounts. Do not add SKA output values to mined balance.
 func fetchMinedBalance(ns walletdb.ReadBucket) (dcrutil.Amount, error) {
 	v := ns.Get(rootMinedBalance)
 	if len(v) != 8 {
@@ -988,17 +1010,23 @@ func putSKACreditAmount(ns walletdb.ReadWriteBucket, k []byte, amount cointype.S
 }
 
 // fetchSKACreditAmount retrieves the big.Int amount for an SKA credit.
-// Returns nil if no big.Int amount was stored (falls back to int64).
-func fetchSKACreditAmount(ns walletdb.ReadBucket, k []byte) cointype.SKAAmount {
+// Returns Zero if no big.Int amount was stored (falls back to int64). Surfaces
+// an error when the persisted blob has an invalid sign byte so callers do not
+// silently consume a corrupted value.
+func fetchSKACreditAmount(ns walletdb.ReadBucket, k []byte) (cointype.SKAAmount, error) {
 	bucket := ns.NestedReadBucket(bucketSKACreditAmounts)
 	if bucket == nil {
-		return cointype.Zero()
+		return cointype.Zero(), nil
 	}
 	v := bucket.Get(k)
 	if v == nil {
-		return cointype.Zero()
+		return cointype.Zero(), nil
 	}
-	return cointype.SKAAmountFromSignedBytes(v)
+	amt, err := cointype.SKAAmountFromSignedBytes(v)
+	if err != nil {
+		return cointype.Zero(), errors.E(errors.IO, err)
+	}
+	return amt, nil
 }
 
 // putSKAUnminedCreditAmount stores the big.Int amount for an unmined SKA credit.
@@ -1015,16 +1043,23 @@ func putSKAUnminedCreditAmount(ns walletdb.ReadWriteBucket, k []byte, amount coi
 }
 
 // fetchSKAUnminedCreditAmount retrieves the big.Int amount for an unmined SKA credit.
-func fetchSKAUnminedCreditAmount(ns walletdb.ReadBucket, k []byte) cointype.SKAAmount {
+// Returns Zero when the bucket or key is absent. Surfaces an error when the
+// persisted blob has an invalid sign byte so callers do not silently consume a
+// corrupted value.
+func fetchSKAUnminedCreditAmount(ns walletdb.ReadBucket, k []byte) (cointype.SKAAmount, error) {
 	bucket := ns.NestedReadBucket(bucketSKAUnminedCreditAmounts)
 	if bucket == nil {
-		return cointype.Zero()
+		return cointype.Zero(), nil
 	}
 	v := bucket.Get(k)
 	if v == nil {
-		return cointype.Zero()
+		return cointype.Zero(), nil
 	}
-	return cointype.SKAAmountFromSignedBytes(v)
+	amt, err := cointype.SKAAmountFromSignedBytes(v)
+	if err != nil {
+		return cointype.Zero(), errors.E(errors.IO, err)
+	}
+	return amt, nil
 }
 
 // deleteSKACreditAmount removes the big.Int amount for an SKA credit.
@@ -1039,6 +1074,49 @@ func deleteSKACreditAmount(ns walletdb.ReadWriteBucket, k []byte) error {
 // deleteSKAUnminedCreditAmount removes the big.Int amount for an unmined SKA credit.
 func deleteSKAUnminedCreditAmount(ns walletdb.ReadWriteBucket, k []byte) error {
 	bucket := ns.NestedReadWriteBucket(bucketSKAUnminedCreditAmounts)
+	if bucket == nil {
+		return nil
+	}
+	return bucket.Delete(k)
+}
+
+// putSKAStakeInvalidatedCreditAmount stores the big.Int amount for an SKA
+// credit that has been moved to bucketStakeInvalidatedCredits. The mined-credit
+// key (72 bytes) is reused so stakeValidate can restore the amount in lockstep
+// with the credit body.
+func putSKAStakeInvalidatedCreditAmount(ns walletdb.ReadWriteBucket, k []byte, amount cointype.SKAAmount) error {
+	bucket := ns.NestedReadWriteBucket(bucketSKAStakeInvalidatedCreditAmounts)
+	if bucket == nil {
+		return errors.E(errors.IO, "missing SKA stake-invalidated credit amounts bucket")
+	}
+	return bucket.Put(k, amount.SignedBytes())
+}
+
+// fetchSKAStakeInvalidatedCreditAmount retrieves the big.Int amount for an
+// SKA credit currently in the stake-invalidated archive. Returns Zero when
+// the bucket or key is absent. Surfaces an error when the persisted blob has
+// an invalid sign byte so callers do not silently consume a corrupted value.
+func fetchSKAStakeInvalidatedCreditAmount(ns walletdb.ReadBucket, k []byte) (cointype.SKAAmount, error) {
+	bucket := ns.NestedReadBucket(bucketSKAStakeInvalidatedCreditAmounts)
+	if bucket == nil {
+		return cointype.Zero(), nil
+	}
+	v := bucket.Get(k)
+	if v == nil {
+		return cointype.Zero(), nil
+	}
+	amt, err := cointype.SKAAmountFromSignedBytes(v)
+	if err != nil {
+		return cointype.Zero(), errors.E(errors.IO, err)
+	}
+	return amt, nil
+}
+
+// deleteSKAStakeInvalidatedCreditAmount removes the big.Int amount for an SKA
+// credit being restored from (or permanently dropped from) the stake-invalidated
+// archive. Idempotent on missing keys.
+func deleteSKAStakeInvalidatedCreditAmount(ns walletdb.ReadWriteBucket, k []byte) error {
+	bucket := ns.NestedReadWriteBucket(bucketSKAStakeInvalidatedCreditAmounts)
 	if bucket == nil {
 		return nil
 	}
@@ -1113,10 +1191,14 @@ func fetchRawCreditCoinType(v []byte) cointype.CoinType {
 
 	coinType := cointype.CoinType(v[coinTypeBytePosition]) // Read CoinType from end of record
 
-	// Validate coin type range - corrupted data could have invalid values
+	// Validate coin type range — corrupted data could have invalid values.
+	// Log loudly so operators see the corruption rather than silently
+	// reporting an SKA balance as VAR.
 	if coinType > cointype.CoinTypeMax {
-		// Log warning but return VAR as safe fallback for corrupted data
-		// TODO: Consider adding proper logging infrastructure
+		log.Warnf("credit record has out-of-range CoinType byte %d at "+
+			"position %d; coercing to VAR (likely DB corruption or a "+
+			"record written by an incompatible binary)",
+			coinType, coinTypeBytePosition)
 		return cointype.CoinTypeVAR
 	}
 
@@ -1209,12 +1291,20 @@ func existsInvalidatedCredit(ns walletdb.ReadBucket, txHash *chainhash.Hash, ind
 	return
 }
 
+// deleteRawCredit removes a mined credit and cascades to the SKA side bucket.
+// Callers that need to preserve the SKA amount across the deletion (e.g. the
+// stake-invalidate archive path or the mined→unmined rollback migration) MUST
+// capture the amount via fetchSKACreditAmount and write it to its destination
+// bucket BEFORE calling deleteRawCredit.
 func deleteRawCredit(ns walletdb.ReadWriteBucket, k []byte) error {
 	err := ns.NestedReadWriteBucket(bucketCredits).Delete(k)
 	if err != nil {
 		return errors.E(errors.IO, err)
 	}
-	return nil
+	// Cascade: drop any orphan SKA side-bucket entry for this credit key.
+	// Idempotent on missing keys (deleteSKACreditAmount returns nil when
+	// the bucket is absent).
+	return deleteSKACreditAmount(ns, k)
 }
 
 // creditIterator allows for in-order iteration of all credit records for a
@@ -1271,7 +1361,11 @@ func (it *creditIterator) readElem() error {
 
 	// For SKA credits, fetch the big.Int amount from the SKA bucket
 	if it.elem.CoinType.IsSKA() && it.ns != nil {
-		it.elem.SKAAmount = fetchSKACreditAmount(it.ns, it.ck)
+		amt, err := fetchSKACreditAmount(it.ns, it.ck)
+		if err != nil {
+			return err
+		}
+		it.elem.SKAAmount = amt
 	} else {
 		it.elem.SKAAmount = cointype.Zero()
 	}
@@ -1401,31 +1495,53 @@ func existsRawUnspent(ns walletdb.ReadBucket, k []byte, chainParams *chaincfg.Pa
 		return nil
 	}
 
-	// Check VAR bucket first (most common coin type)
-	varBucket := ns.NestedReadBucket(bucketUnspentForCoinType(cointype.CoinTypeVAR))
-	if varBucket != nil {
-		v := varBucket.Get(k)
-		if len(v) >= 36 {
-			credKey = make([]byte, 72)
-			copy(credKey, k[:32])
-			copy(credKey[32:68], v)
-			copy(credKey[68:72], k[32:36])
-			return credKey
+	// lookup checks one u:N bucket; returns the constructed credit key when
+	// the unspent record exists, nil otherwise.
+	lookup := func(ct cointype.CoinType) []byte {
+		bucket := ns.NestedReadBucket(bucketUnspentForCoinType(ct))
+		if bucket == nil {
+			return nil
 		}
+		v := bucket.Get(k)
+		if len(v) < 36 {
+			return nil
+		}
+		out := make([]byte, 72)
+		copy(out, k[:32])
+		copy(out[32:68], v)
+		copy(out[68:72], k[32:36])
+		return out
 	}
 
-	// Check active SKA coin type buckets only (much more efficient than checking all 255)
+	// Check VAR bucket first (most common coin type).
+	if ck := lookup(cointype.CoinTypeVAR); ck != nil {
+		return ck
+	}
+
+	// Check active SKA coin type buckets next — typically the only SKA
+	// types holding UTXOs.
+	checked := map[cointype.CoinType]bool{cointype.CoinTypeVAR: true}
 	for _, ct := range getActiveSKACoinTypesFromParams(chainParams) {
-		bucket := ns.NestedReadBucket(bucketUnspentForCoinType(ct))
-		if bucket != nil {
-			v := bucket.Get(k)
-			if len(v) >= 36 {
-				credKey = make([]byte, 72)
-				copy(credKey, k[:32])
-				copy(credKey[32:68], v)
-				copy(credKey[68:72], k[32:36])
-				return credKey
-			}
+		if ck := lookup(ct); ck != nil {
+			return ck
+		}
+		checked[ct] = true
+	}
+
+	// Fallback: a coin type may have been active when its UTXOs were
+	// recorded but is now inactive in chain params. Walk every remaining
+	// u:N bucket so we still find those UTXOs and avoid double-spend
+	// errors. Most of these buckets won't exist, so the lookup is cheap.
+	// Iterate over [1, CoinTypeMax] inclusive; the compile-time assertion
+	// in coinTypeMaxAssertion below forces this loop and CoinTypeMax to
+	// stay in sync if the type is ever widened.
+	for i := 1; i <= int(cointype.CoinTypeMax); i++ {
+		ct := cointype.CoinType(i)
+		if checked[ct] {
+			continue
+		}
+		if ck := lookup(ct); ck != nil {
+			return ck
 		}
 	}
 
@@ -1607,7 +1723,11 @@ func (it *debitIterator) readElem() error {
 		it.elem.CoinType = fetchRawCreditCoinType(creditVal)
 		// For SKA debits, fetch the big.Int amount from the SKA bucket
 		if it.elem.CoinType.IsSKA() {
-			it.elem.SKAAmount = fetchSKACreditAmount(it.ns, creditKey)
+			amt, err := fetchSKACreditAmount(it.ns, creditKey)
+			if err != nil {
+				return err
+			}
+			it.elem.SKAAmount = amt
 		} else {
 			it.elem.SKAAmount = cointype.Zero()
 		}
@@ -1920,7 +2040,19 @@ func existsRawUnminedCredit(ns walletdb.ReadBucket, k []byte, chainParams *chain
 	return nil
 }
 
+// deleteRawUnminedCredit removes an unmined credit from its per-coin-type
+// bucket and cascades to the SKA unmined side bucket. Callers that need to
+// migrate the SKA amount elsewhere (e.g. mineMinedTx) MUST capture it BEFORE
+// calling.
 func deleteRawUnminedCredit(ns walletdb.ReadWriteBucket, k []byte, chainParams *chaincfg.Params) error {
+	// Cascade: clear any side-bucket entry up front. Idempotent on missing
+	// keys; safe to call regardless of whether the per-coin-type bucket
+	// scan below finds the credit (an orphan SKA amount with no
+	// per-coin-type credit gets garbage-collected here).
+	if err := deleteSKAUnminedCreditAmount(ns, k); err != nil {
+		return err
+	}
+
 	// Try to delete from all coin type buckets where it might exist
 	// Start with VAR (most common)
 	varBucket := ns.NestedReadWriteBucket(bucketUnminedCreditsForCoinType(cointype.CoinTypeVAR))
@@ -2011,7 +2143,11 @@ func (it *unminedCreditIterator) readElem() error {
 
 	// For SKA credits, fetch the big.Int amount from the SKA bucket
 	if it.elem.CoinType.IsSKA() && it.ns != nil {
-		it.elem.SKAAmount = fetchSKAUnminedCreditAmount(it.ns, it.ck)
+		amt, err := fetchSKAUnminedCreditAmount(it.ns, it.ck)
+		if err != nil {
+			return err
+		}
+		it.elem.SKAAmount = amt
 	} else {
 		it.elem.SKAAmount = cointype.Zero()
 	}
@@ -2256,6 +2392,19 @@ func valueMultisigOut(sh [ripemd160.Size]byte, m uint8, n uint8,
 	v[136] = uint8(len(skaBytes))
 	copy(v[137:], skaBytes)
 
+	// Enforce the v2 lower-bound invariant in code: any record produced
+	// here MUST be at least multisigOutV1Len+2 bytes. A 135-byte v2 record
+	// would alias the v1 length and be silently misread as a pre-dual-coin
+	// VAR record, corrupting persisted multisig data. The current allocation
+	// guarantees this (skaBytes is nil-or-bytes, never <0), but a future
+	// regression to the tail layout could break the invariant; this guard
+	// makes that failure mode loud rather than silent.
+	if len(v) < multisigOutV1Len+2 {
+		return nil, errors.E(errors.Invalid, errors.Errorf(
+			"valueMultisigOut produced %d-byte record below v2 minimum %d "+
+				"(programmer bug)", len(v), multisigOutV1Len+2))
+	}
+
 	return v, nil
 }
 
@@ -2369,6 +2518,19 @@ func fetchMultisigOutMined(v []byte) (chainhash.Hash, uint32) {
 
 func fetchMultisigOutAmount(v []byte) dcrutil.Amount {
 	return dcrutil.Amount(byteOrder.Uint64(v[59:67]))
+}
+
+// fetchMultisigOutCoinType returns the CoinType byte from a v2+ multisig
+// output value. v1 records (exactly multisigOutV1Len bytes) lack the dual-coin
+// tail; for those we report VAR. Callers must have already accepted the
+// record (i.e. fetchMultisigOut would not have returned an IO error for
+// reserved length 136). See the schema rationale block above
+// multisigOutV1Len.
+func fetchMultisigOutCoinType(v []byte) cointype.CoinType {
+	if len(v) >= multisigOutV1Len+2 {
+		return cointype.CoinType(v[multisigOutV1Len])
+	}
+	return cointype.CoinTypeVAR
 }
 
 func setMultisigOutSpent(v []byte, spendHash chainhash.Hash, spendIndex uint32) {

@@ -6,6 +6,7 @@ package wallet
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"sort"
 
@@ -191,8 +192,12 @@ func (t *sidechainRootedTree) pruneChain(chain []*BlockNode) []*sidechainRootedT
 // This method will always return at least one valid block node, or panic if
 // called on an invalid tree.
 func (t *sidechainRootedTree) best() ([]*BlockNode, *big.Int) {
+	// Invariant: this method is only reachable from AddBlockNode after a
+	// successful tree attachment. Calling it on an invalidated tree is a
+	// caller bug; the panic text below dumps the root hash for diagnostics.
 	if t.root.invalid {
-		panic("no best chain for invalid sidechain tree")
+		panic(fmt.Sprintf("sidechains: best() called on invalid tree, root=%v",
+			t.root.Hash))
 	}
 
 	// Return memoized best chain if unchanged.
@@ -291,7 +296,12 @@ func (f *SidechainForest) AddBlockNode(n *BlockNode) bool {
 		})
 		for _, n := range nodes {
 			if nodeTree.duplicateNode(n) || !nodeTree.maybeAttachNode(n) {
-				panic("sidechain forest internal consistency error")
+				// Invariant: an orphan tree being merged into nodeTree must
+				// always attach successfully because we just confirmed it
+				// chains off nodeTree's root. A failure here indicates the
+				// orphan/forest bookkeeping is corrupt.
+				panic(fmt.Sprintf("sidechains: orphan reattach failed for node %v",
+					n.Hash))
 			}
 		}
 		f.trees[i] = f.trees[len(f.trees)-1]

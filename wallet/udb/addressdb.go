@@ -257,19 +257,18 @@ var (
 	coinTypeLegacyPubKeyName    = []byte("ctpub")
 	coinTypeSLIP0044PrivKeyName = []byte("ctpriv-slip0044")
 	coinTypeSLIP0044PubKeyName  = []byte("ctpub-slip0044")
-	// coinTypeOldSLIP0044{Priv,Pub}KeyName preserve the cointype keys
-	// previously stored under coinTypeSLIP0044{Priv,Pub}KeyName after a
-	// re-registered-SLIP0044 migration runs. They keep the historical
-	// derivation path (originally the chain's first SLIP0044 value, e.g.
-	// 42 inherited from upstream) accessible so funds can be swept from
-	// the old-path addresses to the newly-derived path.
-	coinTypeOldSLIP0044PrivKeyName = []byte("ctpriv-slip0044-old")
-	coinTypeOldSLIP0044PubKeyName  = []byte("ctpub-slip0044-old")
-	watchingOnlyName               = []byte("watchonly")
-	slip0044Account0RowName        = []byte("slip0044acct0")
+	watchingOnlyName            = []byte("watchonly")
+	slip0044Account0RowName     = []byte("slip0044acct0")
 
 	// Emission key storage names
 	emissionKeysBucketName = []byte("emissionkeys")
+
+	// emissionAuthLogBucketName tracks createauthorizedemission calls so the
+	// wallet can detect (and refuse) a duplicate (CoinType, Nonce) pair that
+	// would otherwise produce two distinct signed full-supply emission
+	// transactions for the same logical authorization. Records are keyed by
+	// CoinType:1||Nonce:8 (big-endian) and store TxHash:32||TimestampUnix:8.
+	emissionAuthLogBucketName = []byte("emissionauthlog")
 
 	// Used addresses (used bucket).  This was removed by database version 2.
 	usedAddrBucketName = []byte("usedaddrs")
@@ -439,49 +438,6 @@ func putCoinTypeSLIP0044Keys(ns walletdb.ReadWriteBucket, coinTypePubKeyEnc []by
 
 	if coinTypePrivKeyEnc != nil {
 		err := bucket.Put(coinTypeSLIP0044PrivKeyName, coinTypePrivKeyEnc)
-		if err != nil {
-			return errors.E(errors.IO, err)
-		}
-	}
-
-	return nil
-}
-
-// fetchCoinTypeOldSLIP0044Keys returns the encrypted cointype keys preserved
-// from a prior SLIP0044 derivation path after a re-registered-SLIP0044
-// migration.  Returns nil for both values (and no error) when no migration
-// has been performed.
-func fetchCoinTypeOldSLIP0044Keys(ns walletdb.ReadBucket) ([]byte, []byte, error) {
-	bucket := ns.NestedReadBucket(mainBucketName)
-
-	pub := bucket.Get(coinTypeOldSLIP0044PubKeyName)
-	priv := bucket.Get(coinTypeOldSLIP0044PrivKeyName)
-	if pub == nil && priv == nil {
-		return nil, nil, nil
-	}
-	if pub == nil || priv == nil {
-		return nil, nil, errors.E(errors.IO, "old SLIP0044 cointype keys partially present")
-	}
-	return pub, priv, nil
-}
-
-// putCoinTypeOldSLIP0044Keys stores the encrypted cointype keys that were
-// previously the active SLIP0044 keys, retained so existing UTXOs at the old
-// derivation path can still be spent (e.g. to sweep funds to the new path).
-// Either parameter can be nil in which case no value is written for the
-// parameter.
-func putCoinTypeOldSLIP0044Keys(ns walletdb.ReadWriteBucket, coinTypePubKeyEnc []byte, coinTypePrivKeyEnc []byte) error {
-	bucket := ns.NestedReadWriteBucket(mainBucketName)
-
-	if coinTypePubKeyEnc != nil {
-		err := bucket.Put(coinTypeOldSLIP0044PubKeyName, coinTypePubKeyEnc)
-		if err != nil {
-			return errors.E(errors.IO, err)
-		}
-	}
-
-	if coinTypePrivKeyEnc != nil {
-		err := bucket.Put(coinTypeOldSLIP0044PrivKeyName, coinTypePrivKeyEnc)
 		if err != nil {
 			return errors.E(errors.IO, err)
 		}

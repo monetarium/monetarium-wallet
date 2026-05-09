@@ -8,8 +8,9 @@ package jsonrpc
 import (
 	"fmt"
 
-	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-node/dcrjson"
+	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/wallet"
 	"github.com/jrick/wsrpc/v2"
 )
 
@@ -21,6 +22,18 @@ func convertError(err error) *dcrjson.RPCError {
 		return &dcrjson.RPCError{
 			Code:    dcrjson.RPCErrorCode(err.Code),
 			Message: err.Message,
+		}
+	}
+
+	// Surface the foreign-input sentinel from validateAuthoredCoinTypes with
+	// an actionable message so RPC clients route to signrawtransaction
+	// instead of the generic Invalid bubble-up.
+	if errors.Is(err, wallet.ErrExternalInputInAuthoredTx) {
+		return &dcrjson.RPCError{
+			Code: dcrjson.ErrRPCInvalidParameter,
+			Message: "the input previousoutpoint is not in this wallet's " +
+				"UTXO set; use signrawtransaction with explicit inputs to " +
+				"sign foreign-funded transactions",
 		}
 	}
 

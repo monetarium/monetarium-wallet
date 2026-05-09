@@ -305,6 +305,16 @@ func (w *Wallet) MixOutput(ctx context.Context, output *wire.OutPoint, changeAcc
 			return err
 		}
 		out := txDetails.MsgTx.TxOut[output.Index]
+		// Mixing is VAR-only by design: the CoinShuffle++ split denominations
+		// and the int64 `amount` plumbed through the rest of this function
+		// cannot represent SKA values without silent truncation via
+		// GetValue(). MixAccount filters to VAR before calling MixOutput, but
+		// MixOutput is exported — reject SKA prevouts here so an out-of-tree
+		// caller cannot trigger silent precision loss.
+		if out.CoinType.IsSKA() {
+			return errors.E(errors.Invalid,
+				"MixOutput: mixing only supports VAR outputs; got SKA cointype")
+		}
 		prevScript = out.PkScript
 		prevScriptVersion = out.Version
 		amount = dcrutil.Amount(txDetails.MsgTx.TxOut[output.Index].GetValue())
@@ -414,6 +424,7 @@ SplitPoints:
 			Value:    int64(changeValue),
 			PkScript: changeScript,
 			Version:  version,
+			CoinType: cointype.CoinTypeVAR, // mixing is VAR-only
 		}
 	}
 

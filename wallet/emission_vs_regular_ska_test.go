@@ -105,7 +105,7 @@ func TestEmissionVsRegularSKATransactions(t *testing.T) {
 				},
 			},
 			TxOut: []*wire.TxOut{
-				{Value: 1000000000, CoinType: cointype.CoinType(1)}, // 10 SKA-1
+				{Value: 1000000000, CoinType: cointype.CoinType(1)}, // 10 SKA1
 			},
 		}
 

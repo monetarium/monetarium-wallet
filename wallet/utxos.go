@@ -102,6 +102,15 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 				ContainingBlock: BlockIdentity(output.Block),
 				ReceiveTime:     output.Received,
 			}
+			// For SKA UTXOs the int64 Value field is meaningless (atoms
+			// can exceed int64); the authoritative atom count lives in
+			// SKAValue. Mirror the pattern used by OutputInfo above so
+			// callers that read result.Output.SKAValue see the real value
+			// instead of nil. SKAAmount.BigInt() returns a fresh copy.
+			if output.CoinType.IsSKA() {
+				result.Output.Value = 0
+				result.Output.SKAValue = output.SKAAmount.BigInt()
+			}
 			outputResults = append(outputResults, result)
 		}
 
@@ -157,6 +166,8 @@ type OutputInfo struct {
 	Received     time.Time
 	Amount       dcrutil.Amount
 	FromCoinbase bool
+	CoinType     cointype.CoinType
+	SKAAmount    cointype.SKAAmount
 }
 
 // OutputInfo queries the wallet for additional transaction output info
@@ -175,13 +186,28 @@ func (w *Wallet) OutputInfo(ctx context.Context, out *wire.OutPoint) (OutputInfo
 			return errors.Errorf("transaction has no output %d", out.Index)
 		}
 
+		txOut := txDetails.TxRecord.MsgTx.TxOut[out.Index]
 		info.Received = txDetails.Received
-		info.Amount = dcrutil.Amount(txDetails.TxRecord.MsgTx.TxOut[out.Index].GetValue())
+		info.CoinType = txOut.CoinType
+		// Keep the int64 Amount field VAR-only. For SKA outputs the
+		// authoritative atom count is in SKAAmount; leaving Amount at 0
+		// avoids handing callers a silently-truncated int64.
+		if txOut.CoinType.IsSKA() {
+			if txOut.SKAValue != nil {
+				info.SKAAmount = cointype.NewSKAAmount(txOut.SKAValue)
+			}
+		} else {
+			info.Amount = dcrutil.Amount(txOut.Value)
+		}
 		info.FromCoinbase = compat.IsEitherCoinBaseTx(&txDetails.TxRecord.MsgTx)
 		return nil
 	})
 	if err != nil {
-		return info, errors.E(op, err)
+		// Return a zero-valued OutputInfo on error so a caller that
+		// dispatches on info.CoinType without checking err first cannot
+		// confuse a missing SKA output (CoinType==0 zero-default) for a
+		// real VAR output.
+		return OutputInfo{}, errors.E(op, err)
 	}
 	return info, nil
 }

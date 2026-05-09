@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	httppprof "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -105,18 +105,44 @@ func run(ctx context.Context) error {
 	}
 
 	// Run the pprof profiler if enabled.
+	//
+	// pprof exposes unauthenticated heap / goroutine / profile dumps that
+	// can include in-memory passphrases and decrypted key material. Refuse
+	// to bind to anything other than a loopback address so an operator
+	// can't accidentally expose it.  The handlers are registered on a
+	// private ServeMux instead of http.DefaultServeMux so a future feature
+	// that exposes the default mux can't accidentally surface pprof.
 	if len(cfg.Profile) > 0 {
 		if done(ctx) {
 			return ctx.Err()
 		}
 
-		profileRedirect := http.RedirectHandler("/debug/pprof", http.StatusSeeOther)
-		http.Handle("/", profileRedirect)
+		mux := http.NewServeMux()
+		mux.Handle("/", http.RedirectHandler("/debug/pprof", http.StatusSeeOther))
+		mux.HandleFunc("/debug/pprof/", httppprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+
 		for _, listenAddr := range cfg.Profile {
 			listenAddr := listenAddr // copy for closure
+			host, _, splitErr := net.SplitHostPort(listenAddr)
+			if splitErr != nil {
+				return fmt.Errorf("invalid profile listen address %q: %w",
+					listenAddr, splitErr)
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || !ip.IsLoopback() {
+				return fmt.Errorf(
+					"profile listen address %q is not a loopback address; "+
+						"pprof exposes unauthenticated debug data including "+
+						"in-memory key material and must only bind to localhost",
+					listenAddr)
+			}
 			go func() {
 				log.Infof("Starting profile server on %s", listenAddr)
-				err := http.ListenAndServe(listenAddr, nil)
+				err := http.ListenAndServe(listenAddr, mux)
 				if err != nil {
 					fatalf("Unable to run profiler: %v", err)
 				}

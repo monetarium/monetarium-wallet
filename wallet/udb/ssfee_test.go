@@ -233,7 +233,7 @@ func TestIsSSFeeMinerTx(t *testing.T) {
 // TestAugmentedSSFeeCreation tests that the helper can create both null-input
 // and augmented SSFee transactions correctly.
 func TestAugmentedSSFeeCreation(t *testing.T) {
-	coinType := cointype.CoinType(1) // SKA-1
+	coinType := cointype.CoinType(1) // SKA1
 
 	t.Run("Null input SSFee", func(t *testing.T) {
 		tx := createMockSSFeeTx(coinType, 1, 1000, "SF")

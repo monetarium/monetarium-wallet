@@ -6,6 +6,7 @@ package wallet
 
 import (
 	"context"
+	"math/big"
 
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-wallet/errors"
@@ -96,26 +97,45 @@ func (w *Wallet) PrepareRedeemMultiSigOutTxOutput(ctx context.Context, msgTx *wi
 	if ct.IsSKA() {
 		feeSize := txsizes.EstimateSerializeSizeSKA(scriptSizes, []*wire.TxOut{txOut}, 0)
 		relayFee := w.RelayFeeForCoinType(ctx, ct)
+		if relayFee.IsZero() {
+			return errors.E(op, errors.Invalid, errors.Errorf(
+				"no relay fee configured for coin type %d; cannot redeem multisig output", ct))
+		}
 		feeEst := txrules.FeeForSerializeSizeSKA(relayFee, feeSize)
 		if p2shOutput.SKAOutputAmount.Cmp(feeEst) <= 0 {
 			return errors.E(op, errors.Errorf("estimated SKA fee %v is at or above output value %v",
 				feeEst, p2shOutput.SKAOutputAmount))
 		}
 		toReceive := p2shOutput.SKAOutputAmount.Sub(feeEst)
+		if toReceive.BigInt().Cmp(cointype.MinSKADustAmount) < 0 {
+			return errors.E(op, errors.Policy, errors.Errorf(
+				"SKA redemption output %v below dust threshold %v atoms",
+				toReceive, cointype.MinSKADustAmount))
+		}
 		txOut.Value = 0
-		txOut.SKAValue = toReceive.BigInt()
+		// Defense in depth: SKAAmount.BigInt() already returns a fresh
+		// *big.Int per its current contract, so this copy is redundant
+		// today. Kept so the wire TxOut stays safe if BigInt()'s
+		// contract is ever weakened to alias the inner pointer.
+		txOut.SKAValue = new(big.Int).Set(toReceive.BigInt())
 		msgTx.AddTxOut(txOut)
 		return nil
 	}
 
 	// VAR path.
+	relayFee := w.RelayFee()
 	feeSize := txsizes.EstimateSerializeSize(scriptSizes, []*wire.TxOut{txOut}, 0)
-	feeEst := txrules.FeeForSerializeSize(w.RelayFee(), feeSize)
+	feeEst := txrules.FeeForSerializeSize(relayFee, feeSize)
 	if feeEst >= p2shOutput.OutputAmount {
 		return errors.E(op, errors.Errorf("estimated fee %v is above output value %v",
 			feeEst, p2shOutput.OutputAmount))
 	}
 	toReceive := p2shOutput.OutputAmount - feeEst
+	if txrules.IsDustAmount(toReceive, len(*pkScript), relayFee) {
+		return errors.E(op, errors.Policy, errors.Errorf(
+			"VAR redemption output %v is dust at relay fee %v",
+			toReceive, relayFee))
+	}
 	txOut.Value = int64(toReceive)
 	msgTx.AddTxOut(txOut)
 	return nil

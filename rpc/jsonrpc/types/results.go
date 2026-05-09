@@ -6,37 +6,51 @@
 package types
 
 // FundRawTransactionResult models the data from the fundrawtransaction command.
+//
+// Fee is a decimal coin string for both VAR and SKA, formatted against the
+// transaction's coin type's atomsPerCoin. The string form preserves SKA
+// big.Int precision and unifies the wire shape across coin types.
 type FundRawTransactionResult struct {
-	Hex string  `json:"hex"`
-	Fee float64 `json:"fee"`
+	Hex string `json:"hex"`
+	Fee string `json:"fee"`
 }
 
 // GetAccountBalanceResult models the account data from the getbalance command.
-// Amount fields use interface{} to support both VAR (float64) and SKA (string with full precision).
-// VAR amounts are returned as float64, SKA amounts as decimal strings like "899999999999999.000000000400001".
+//
+// Wire contract:
+//   - All amount fields are decimal coin strings for both VAR and SKA, formatted
+//     against the coin type's atomsPerCoin. Examples: "1.23456789" for VAR,
+//     "899999999999999.000000000400001" for SKA. The string form preserves full
+//     SKA big.Int precision (atomsPerCoin is typically 1e18 for SKA).
+//
+// This is a breaking change from the prior interface{} (float64-or-string)
+// shape: VAR clients that parsed amounts as JSON numbers must now parse them as
+// JSON strings.
 type GetAccountBalanceResult struct {
-	AccountName             string      `json:"accountname"`
-	ImmatureCoinbaseRewards interface{} `json:"immaturecoinbaserewards"`
-	ImmatureStakeGeneration interface{} `json:"immaturestakegeneration"`
-	LockedByTickets         interface{} `json:"lockedbytickets"`
-	Spendable               interface{} `json:"spendable"`
-	Total                   interface{} `json:"total"`
-	Unconfirmed             interface{} `json:"unconfirmed"`
-	VotingAuthority         interface{} `json:"votingauthority"`
+	AccountName             string `json:"accountname"`
+	ImmatureCoinbaseRewards string `json:"immaturecoinbaserewards"`
+	ImmatureStakeGeneration string `json:"immaturestakegeneration"`
+	LockedByTickets         string `json:"lockedbytickets"`
+	Spendable               string `json:"spendable"`
+	Total                   string `json:"total"`
+	Unconfirmed             string `json:"unconfirmed"`
+	VotingAuthority         string `json:"votingauthority"`
 }
 
 // GetBalanceResult models the data from the getbalance command.
-// Total fields use interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// Wire contract: total fields are decimal coin strings (see GetAccountBalanceResult
+// for the full shape). Breaking change from the prior interface{} typing.
 type GetBalanceResult struct {
 	Balances                     []GetAccountBalanceResult `json:"balances"`
 	BlockHash                    string                    `json:"blockhash"`
-	TotalImmatureCoinbaseRewards interface{}               `json:"totalimmaturecoinbaserewards,omitempty"`
-	TotalImmatureStakeGeneration interface{}               `json:"totalimmaturestakegeneration,omitempty"`
-	TotalLockedByTickets         interface{}               `json:"totallockedbytickets,omitempty"`
-	TotalSpendable               interface{}               `json:"totalspendable,omitempty"`
-	CumulativeTotal              interface{}               `json:"cumulativetotal,omitempty"`
-	TotalUnconfirmed             interface{}               `json:"totalunconfirmed,omitempty"`
-	TotalVotingAuthority         interface{}               `json:"totalvotingauthority,omitempty"`
+	TotalImmatureCoinbaseRewards string                    `json:"totalimmaturecoinbaserewards,omitempty"`
+	TotalImmatureStakeGeneration string                    `json:"totalimmaturestakegeneration,omitempty"`
+	TotalLockedByTickets         string                    `json:"totallockedbytickets,omitempty"`
+	TotalSpendable               string                    `json:"totalspendable,omitempty"`
+	CumulativeTotal              string                    `json:"cumulativetotal,omitempty"`
+	TotalUnconfirmed             string                    `json:"totalunconfirmed,omitempty"`
+	TotalVotingAuthority         string                    `json:"totalvotingauthority,omitempty"`
 }
 
 // GetMultisigOutInfoResult models the data returned from the getmultisigoutinfo
@@ -53,7 +67,9 @@ type GetMultisigOutInfoResult struct {
 	Spent        bool     `json:"spent"`
 	SpentBy      string   `json:"spentby"`
 	SpentByIndex uint32   `json:"spentbyindex"`
-	Amount       float64  `json:"amount"`
+	// Amount is the output value as a decimal string (VAR or SKA, see CoinType).
+	Amount   string `json:"amount"`
+	CoinType uint8  `json:"cointype"`
 }
 
 // CreateMultiSigResult models the data returned from the createmultisig
@@ -154,22 +170,26 @@ type GetTicketsResult struct {
 // This models the "short" version of the ListTransactionsResult type, which
 // excludes fields common to the transaction.  These common fields are instead
 // part of the GetTransactionResult.
-// Amount and Fee use interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// Amount and Fee are decimal coin strings for both VAR and SKA. Breaking change
+// from the prior interface{} typing — see GetAccountBalanceResult.
 type GetTransactionDetailsResult struct {
-	Account           string      `json:"account"`
-	Address           string      `json:"address,omitempty"`
-	Amount            interface{} `json:"amount"`
-	Category          string      `json:"category"`
-	InvolvesWatchOnly bool        `json:"involveswatchonly,omitempty"`
-	Fee               interface{} `json:"fee,omitempty"`
-	Vout              uint32      `json:"vout"`
+	Account           string `json:"account"`
+	Address           string `json:"address,omitempty"`
+	Amount            string `json:"amount"`
+	Category          string `json:"category"`
+	InvolvesWatchOnly bool   `json:"involveswatchonly,omitempty"`
+	Fee               string `json:"fee,omitempty"`
+	Vout              uint32 `json:"vout"`
 }
 
 // GetTransactionResult models the data from the gettransaction command.
-// Amount and Fee use interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// Amount and Fee are decimal coin strings for both VAR and SKA. Breaking change
+// from the prior interface{} typing — see GetAccountBalanceResult.
 type GetTransactionResult struct {
-	Amount          interface{}                   `json:"amount"`
-	Fee             interface{}                   `json:"fee,omitempty"`
+	Amount          string                        `json:"amount"`
+	Fee             string                        `json:"fee,omitempty"`
 	Confirmations   int64                         `json:"confirmations"`
 	BlockHash       string                        `json:"blockhash"`
 	BlockIndex      int64                         `json:"blockindex"`
@@ -236,8 +256,9 @@ type InfoResult struct {
 	KeypoolOldest   int64   `json:"keypoololdest"`
 	KeypoolSize     int32   `json:"keypoolsize"`
 	UnlockedUntil   int64   `json:"unlocked_until"`
-	PaytxFee        float64 `json:"paytxfee"`
-	RelayFee        float64 `json:"relayfee"`
+	PaytxFee        string  `json:"paytxfee"`
+	RelayFee        string  `json:"relayfee"`
+	CoinType        uint32  `json:"cointype,omitempty"`
 	Errors          string  `json:"errors"`
 }
 
@@ -263,17 +284,19 @@ const (
 )
 
 // ListTransactionsResult models the data from the listtransactions command.
-// Amount and Fee use interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// Amount and Fee are decimal coin strings for both VAR and SKA. Breaking change
+// from the prior interface{} typing — see GetAccountBalanceResult.
 type ListTransactionsResult struct {
 	Account           string                  `json:"account"`
 	Address           string                  `json:"address,omitempty"`
-	Amount            interface{}             `json:"amount"`
+	Amount            string                  `json:"amount"`
 	BlockHash         string                  `json:"blockhash,omitempty"`
 	BlockIndex        *int64                  `json:"blockindex,omitempty"`
 	BlockTime         int64                   `json:"blocktime,omitempty"`
 	Category          string                  `json:"category"`
 	Confirmations     int64                   `json:"confirmations"`
-	Fee               interface{}             `json:"fee,omitempty"`
+	Fee               string                  `json:"fee,omitempty"`
 	Generated         bool                    `json:"generated,omitempty"`
 	InvolvesWatchOnly bool                    `json:"involveswatchonly,omitempty"`
 	Time              int64                   `json:"time"`
@@ -289,17 +312,21 @@ type ListTransactionsResult struct {
 // ListReceivedByAccountResult models the data from the listreceivedbyaccount
 // command.
 type ListReceivedByAccountResult struct {
-	Account       string  `json:"account"`
-	Amount        float64 `json:"amount"`
-	Confirmations uint64  `json:"confirmations"`
+	Account string `json:"account"`
+	// Amount is the total received as a decimal string (VAR or SKA atoms,
+	// per the configured network).
+	Amount        string `json:"amount"`
+	Confirmations uint64 `json:"confirmations"`
 }
 
 // ListReceivedByAddressResult models the data from the listreceivedbyaddress
 // command.
 type ListReceivedByAddressResult struct {
-	Account           string   `json:"account"`
-	Address           string   `json:"address"`
-	Amount            float64  `json:"amount"`
+	Account string `json:"account"`
+	Address string `json:"address"`
+	// Amount is the total received as a decimal string (VAR or SKA atoms,
+	// per the configured network).
+	Amount            string   `json:"amount"`
 	Confirmations     uint64   `json:"confirmations"`
 	TxIDs             []string `json:"txids,omitempty"`
 	InvolvesWatchonly bool     `json:"involvesWatchonly,omitempty"`
@@ -312,21 +339,30 @@ type ListSinceBlockResult struct {
 }
 
 // ListUnspentResult models a successful response from the listunspent request.
-// Contains Decred additions.
-// Amount uses interface{}: float64 for VAR, string for SKA (full precision).
+//
+// Wire contract:
+//   - CoinType is 0 for VAR, 1-255 for SKA. Always present.
+//   - Amount is a decimal coin string for both VAR and SKA, formatted against
+//     the coin type's atomsPerCoin. Examples: "0.001" for VAR, "1.5" for SKA.
+//     The string form preserves full SKA big.Int precision (atomsPerCoin is
+//     typically 1e18 for SKA).
+//
+// This is a breaking change from the prior "Amount float64 + SkaAmount string"
+// shape: VAR clients that parsed Amount as a JSON number must now parse it as
+// a JSON string.
 type ListUnspentResult struct {
-	TxID          string      `json:"txid"`
-	Vout          uint32      `json:"vout"`
-	Tree          int8        `json:"tree"`
-	TxType        int         `json:"txtype"`
-	Address       string      `json:"address"`
-	Account       string      `json:"account"`
-	ScriptPubKey  string      `json:"scriptPubKey"`
-	RedeemScript  string      `json:"redeemScript,omitempty"`
-	Amount        interface{} `json:"amount"` // float64 for VAR, string for SKA (full precision)
-	Confirmations int64       `json:"confirmations"`
-	Spendable     bool        `json:"spendable"`
-	CoinType      uint8       `json:"cointype"` // Dual-coin support: coin type (0=VAR, 1-255=SKA)
+	TxID          string `json:"txid"`
+	Vout          uint32 `json:"vout"`
+	Tree          int8   `json:"tree"`
+	TxType        int    `json:"txtype"`
+	Address       string `json:"address"`
+	Account       string `json:"account"`
+	ScriptPubKey  string `json:"scriptPubKey"`
+	RedeemScript  string `json:"redeemScript,omitempty"`
+	Amount        string `json:"amount"` // Decimal coins as string (VAR or SKA, see CoinType)
+	Confirmations int64  `json:"confirmations"`
+	Spendable     bool   `json:"spendable"`
+	CoinType      uint8  `json:"cointype"` // Dual-coin support: coin type (0=VAR, 1-255=SKA)
 }
 
 // RedeemMultiSigOutResult models the data returned from the redeemmultisigout
@@ -391,17 +427,23 @@ type SignRawTransactionsResult struct {
 
 // SweepAccountResult models the data returned from the sweepaccount
 // command.
+//
+// Amount fields are full-precision base-10 decimal coin strings computed
+// directly from *big.Int atoms.  This avoids the float64 round-trip
+// rounding that SKA amounts (1e18 atoms/coin) cannot survive and that
+// drifts large VAR balances past ~9e7 VAR.
 type SweepAccountResult struct {
-	UnsignedTransaction       string  `json:"unsignedtransaction"`
-	TotalPreviousOutputAmount float64 `json:"totalpreviousoutputamount"`
-	TotalOutputAmount         float64 `json:"totaloutputamount"`
-	EstimatedSignedSize       uint32  `json:"estimatedsignedsize"`
+	UnsignedTransaction       string `json:"unsignedtransaction"`
+	TotalPreviousOutputAmount string `json:"totalpreviousoutputamount"`
+	TotalOutputAmount         string `json:"totaloutputamount"`
+	EstimatedSignedSize       uint32 `json:"estimatedsignedsize"`
 }
 
 // TicketInfoResult models the data returned from the ticketinfo command.
 type TicketInfoResult struct {
-	Hash          string       `json:"hash"`
-	Cost          float64      `json:"cost"`
+	Hash string `json:"hash"`
+	// Cost is the ticket purchase price as a decimal string (VAR atoms).
+	Cost          string       `json:"cost"`
 	VotingAddress string       `json:"votingaddress"`
 	Status        string       `json:"status"`
 	BlockHash     string       `json:"blockhash,omitempty"`
@@ -456,7 +498,7 @@ type WalletInfoResult struct {
 	SPV              bool    `json:"spv"`
 	Unlocked         bool    `json:"unlocked"`
 	CoinType         uint32  `json:"cointype,omitempty"`
-	TxFee            float64 `json:"txfee"`
+	TxFee            string  `json:"txfee"`
 	VoteBits         uint16  `json:"votebits"`
 	VoteBitsExtended string  `json:"votebitsextended"`
 	VoteVersion      uint32  `json:"voteversion"`
@@ -476,32 +518,36 @@ type AccountUnlockedResult struct {
 
 // GetCoinBalanceResult models the data returned from the getcoinbalance command.
 // This provides detailed balance information for a specific coin type.
-// Total fields use interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// All amount fields are decimal coin strings for both VAR and SKA. Breaking
+// change from the prior interface{} typing — see GetAccountBalanceResult.
 type GetCoinBalanceResult struct {
 	CoinType                     uint8                         `json:"cointype"`                     // The coin type (0=VAR, 1-255=SKA)
 	BlockHash                    string                        `json:"blockhash"`                    // Current block hash
-	TotalImmatureCoinbaseRewards interface{}                   `json:"totalimmaturecoinbaserewards"` // Total immature coinbase rewards
-	TotalImmatureStakeGeneration interface{}                   `json:"totalimmaturestakegeneration"` // Total immature stake generation
-	TotalLockedByTickets         interface{}                   `json:"totallockedbytickets"`         // Total locked by tickets
-	TotalSpendable               interface{}                   `json:"totalspendable"`               // Total spendable balance
-	TotalUnconfirmed             interface{}                   `json:"totalunconfirmed"`             // Total unconfirmed balance
-	TotalVotingAuthority         interface{}                   `json:"totalvotingauthority"`         // Total voting authority
-	CumulativeTotal              interface{}                   `json:"cumulativetotal"`              // Cumulative total balance
+	TotalImmatureCoinbaseRewards string                        `json:"totalimmaturecoinbaserewards"` // Total immature coinbase rewards
+	TotalImmatureStakeGeneration string                        `json:"totalimmaturestakegeneration"` // Total immature stake generation
+	TotalLockedByTickets         string                        `json:"totallockedbytickets"`         // Total locked by tickets
+	TotalSpendable               string                        `json:"totalspendable"`               // Total spendable balance
+	TotalUnconfirmed             string                        `json:"totalunconfirmed"`             // Total unconfirmed balance
+	TotalVotingAuthority         string                        `json:"totalvotingauthority"`         // Total voting authority
+	CumulativeTotal              string                        `json:"cumulativetotal"`              // Cumulative total balance
 	Balances                     []GetCoinAccountBalanceResult `json:"balances"`                     // Per-account breakdown
 }
 
 // GetCoinAccountBalanceResult models per-account balance data within GetCoinBalanceResult.
-// Amount fields use interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// All amount fields are decimal coin strings for both VAR and SKA. Breaking
+// change from the prior interface{} typing — see GetAccountBalanceResult.
 type GetCoinAccountBalanceResult struct {
-	AccountName             string      `json:"accountname"`             // Account name
-	CoinType                uint8       `json:"cointype"`                // The coin type (0=VAR, 1-255=SKA)
-	ImmatureCoinbaseRewards interface{} `json:"immaturecoinbaserewards"` // Immature coinbase rewards
-	ImmatureStakeGeneration interface{} `json:"immaturestakegeneration"` // Immature stake generation
-	LockedByTickets         interface{} `json:"lockedbytickets"`         // Locked by tickets
-	Spendable               interface{} `json:"spendable"`               // Spendable balance
-	Total                   interface{} `json:"total"`                   // Total balance
-	Unconfirmed             interface{} `json:"unconfirmed"`             // Unconfirmed balance
-	VotingAuthority         interface{} `json:"votingauthority"`         // Voting authority
+	AccountName             string `json:"accountname"`             // Account name
+	CoinType                uint8  `json:"cointype"`                // The coin type (0=VAR, 1-255=SKA)
+	ImmatureCoinbaseRewards string `json:"immaturecoinbaserewards"` // Immature coinbase rewards
+	ImmatureStakeGeneration string `json:"immaturestakegeneration"` // Immature stake generation
+	LockedByTickets         string `json:"lockedbytickets"`         // Locked by tickets
+	Spendable               string `json:"spendable"`               // Spendable balance
+	Total                   string `json:"total"`                   // Total balance
+	Unconfirmed             string `json:"unconfirmed"`             // Unconfirmed balance
+	VotingAuthority         string `json:"votingauthority"`         // Voting authority
 }
 
 // ListCoinTypesResult models the data returned from the listcointypes command.
@@ -511,9 +557,11 @@ type ListCoinTypesResult struct {
 }
 
 // CoinTypeInfo provides information about a specific coin type.
-// Balance uses interface{} to support both VAR (float64) and SKA (string with full precision).
+//
+// Balance is a decimal coin string for both VAR and SKA. Breaking change from
+// the prior interface{} typing — see GetAccountBalanceResult.
 type CoinTypeInfo struct {
-	CoinType uint8       `json:"cointype"` // The coin type number (0=VAR, 1-255=SKA)
-	Name     string      `json:"name"`     // Human-readable name (e.g., "VAR", "SKA-1", "SKA-2")
-	Balance  interface{} `json:"balance"`  // Total spendable balance for this coin type
+	CoinType uint8  `json:"cointype"` // The coin type number (0=VAR, 1-255=SKA)
+	Name     string `json:"name"`     // Human-readable name (e.g., "VAR", "SKA1", "SKA2")
+	Balance  string `json:"balance"`  // Total spendable balance for this coin type
 }

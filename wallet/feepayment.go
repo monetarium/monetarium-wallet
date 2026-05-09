@@ -150,8 +150,8 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 		// the wallet.  This should not happen and may require manual
 		// intervention.
 		//
-		// XXX should check ticketinfo and see if fee is not paid. if
-		// possible, update it with a new fee.
+		// TODO: check ticketinfo and, if the fee is not paid, update it
+		// with a new fee instead of giving up.
 		fp.err = fmt.Errorf("fee transaction not found in wallet: %w", err)
 		return fp
 	}
@@ -167,8 +167,8 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 			return fp
 		}
 
-		fp.state = Unprocessed // XXX fee created, but perhaps not submitted with vsp.
-		fp.fee = -1            // XXX fee amount (not needed anymore?)
+		fp.state = Unprocessed
+		fp.fee = 0
 	}
 	return fp
 }
@@ -277,7 +277,7 @@ func (fp *vspFeePayment) receiveFeeAddress() error {
 			feeAmount, fp.policy.MaxFee)
 	}
 
-	// XXX validate server timestamp?
+	// TODO: validate server timestamp.
 
 	fp.mu.Lock()
 	fp.fee = feeAmount
@@ -324,7 +324,6 @@ func (fp *vspFeePayment) makeFeeTx(tx *wire.MsgTx) error {
 		tx = wire.NewMsgTx()
 	}
 
-	// XXX fp.fee == -1?
 	if fee == 0 {
 		err := fp.receiveFeeAddress()
 		if err != nil {
@@ -367,7 +366,7 @@ func (c *VSPClient) status(ctx context.Context, ticket *VSPTicket) (*types.Ticke
 		return nil, err
 	}
 
-	// XXX validate server timestamp?
+	// TODO: validate server timestamp.
 
 	return resp, nil
 }
@@ -388,7 +387,7 @@ func (c *VSPClient) setVoteChoices(ctx context.Context, ticket *VSPTicket,
 		return err
 	}
 
-	// XXX validate server timestamp?
+	// TODO: validate server timestamp.
 
 	return nil
 }
@@ -398,8 +397,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 	w := fp.client.wallet
 
 	// stop processing if ticket is expired or spent
-	// XXX if ticket is no longer saved by wallet (because the tx expired,
-	// or was double spent, etc) remove the fee payment.
+	// TODO: if the ticket is no longer saved by the wallet (tx expired,
+	// double-spent, etc) remove the fee payment.
 	if fp.removedExpiredOrSpent() {
 		// nothing scheduled
 		return errStopped
@@ -479,8 +478,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 	return fp.confirmPayment()
 
 	/*
-		// XXX? for each input, c.Wallet.UnlockOutpoint(&outpoint.Hash, outpoint.Index)
-		// xxx, or let the published tx replace the unpublished one, and unlock
+		// TODO: for each input, c.Wallet.UnlockOutpoint(&outpoint.Hash, outpoint.Index)
+		// — or let the published tx replace the unpublished one, and unlock
 		// outpoints as it is processed.
 
 	*/
@@ -609,7 +608,8 @@ func (fp *vspFeePayment) confirmPayment() (err error) {
 		fp.schedule("reconcile payment", fp.reconcilePayment)
 		return nil
 	default:
-		// XXX put in unknown state
+		// TODO: transition fp into a dedicated unknown/error state instead
+		// of just logging.
 		fp.client.log.Warnf("VSP responded with unknown FeeTxStatus %q for %v",
 			status.FeeTxStatus, fp.ticket)
 	}

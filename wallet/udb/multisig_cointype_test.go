@@ -58,6 +58,27 @@ func TestMultisigOutV2RoundTripVAR(t *testing.T) {
 	}
 }
 
+// TestValueMultisigOutMinimumV2Length pins the schema-evolution invariant: a
+// v2 record with SKAAmount=Zero (skaBytes=nil, length=0) must be exactly
+// multisigOutV1Len+2 = 137 bytes — never 135. A 135-byte v2 record would
+// alias the v1 length and be silently misread by fetchMultisigOut as a
+// pre-dual-coin VAR record, corrupting persisted multisig data. This test
+// catches any future tail-encoding regression that breaks that invariant.
+func TestValueMultisigOutMinimumV2Length(t *testing.T) {
+	var sh [ripemd160.Size]byte
+	var bh, sb, th chainhash.Hash
+
+	v, err := valueMultisigOut(sh, 1, 1, false, wire.TxTreeRegular,
+		bh, 0, 0, sb, 0, th, cointype.CoinTypeVAR, cointype.Zero())
+	if err != nil {
+		t.Fatalf("valueMultisigOut: %v", err)
+	}
+	if got, want := len(v), multisigOutV1Len+2; got != want {
+		t.Fatalf("valueMultisigOut(SKAAmount=Zero) length: got %d want %d",
+			got, want)
+	}
+}
+
 // TestMultisigOutV2RoundTripSKALargeAmount is the CoinType+SKAAmount case. It
 // uses an SKA atom count just above math.MaxInt64 to prove the serialization
 // preserves big.Int precision that the legacy int64 Amount field could not.

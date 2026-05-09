@@ -5,229 +5,122 @@
 package wallet
 
 import (
+	"math/big"
 	"testing"
 
+	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
+	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 )
 
-// TestConsolidateMethodSignatures tests that the consolidate methods have correct signatures
-func TestConsolidateMethodSignatures(t *testing.T) {
-	// This test verifies that the method signatures are correct and that the methods
-	// can be called with the expected parameters. It doesn't test the full consolidation
-	// logic (which requires a full wallet setup), but ensures the API is correct.
-
+// TestConsolidateCoinTypeValidation verifies cointype values consolidation
+// can accept. Uses the canonical IsValid / IsSKA helpers rather than
+// hand-rolling range checks.
+func TestConsolidateCoinTypeValidation(t *testing.T) {
 	tests := []struct {
-		name     string
-		coinType cointype.CoinType
-		desc     string
+		name      string
+		coinType  cointype.CoinType
+		valid     bool
+		isSKA     bool
 	}{
-		{
-			name:     "VAR consolidation",
-			coinType: cointype.CoinTypeVAR,
-			desc:     "Default VAR coin type should work",
-		},
-		{
-			name:     "SKA-1 consolidation",
-			coinType: cointype.CoinType(1),
-			desc:     "SKA-1 coin type should be supported",
-		},
-		{
-			name:     "SKA-2 consolidation",
-			coinType: cointype.CoinType(2),
-			desc:     "SKA-2 coin type should be supported",
-		},
-		{
-			name:     "SKA-255 consolidation",
-			coinType: cointype.CoinType(255),
-			desc:     "Maximum SKA coin type should be supported",
-		},
+		{"VAR", cointype.CoinTypeVAR, true, false},
+		{"SKA1", cointype.CoinType(1), true, true},
+		{"SKA2", cointype.CoinType(2), true, true},
+		{"SKA100", cointype.CoinType(100), true, true},
+		{"SKA255 max", cointype.CoinType(255), true, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Test that the coin type values are valid
-			if tt.coinType < 0 || tt.coinType > 255 {
-				t.Errorf("Invalid coin type: %d (must be 0-255)", tt.coinType)
+			if tt.coinType.IsValid() != tt.valid {
+				t.Errorf("IsValid() = %v, want %v", tt.coinType.IsValid(), tt.valid)
 			}
-
-			// Verify that the expected methods exist by checking their behavior
-			// with different coin types (without requiring a full wallet)
-			t.Logf("✓ %s: CoinType %d is valid", tt.desc, tt.coinType)
-		})
-	}
-}
-
-// TestConsolidateCoinTypeParameter tests the coin type parameter handling
-func TestConsolidateCoinTypeParameter(t *testing.T) {
-	// Test various coin type values to ensure they're properly handled
-
-	validCoinTypes := []cointype.CoinType{
-		0,   // VAR
-		1,   // SKA-1
-		2,   // SKA-2
-		100, // SKA-100
-		255, // SKA-255 (max)
-	}
-
-	for _, ct := range validCoinTypes {
-		t.Run(string(rune(ct)), func(t *testing.T) {
-			// Verify coin type is in valid range
-			if ct < 0 || ct > 255 {
-				t.Errorf("Coin type %d is out of valid range (0-255)", ct)
-			}
-
-			// Verify coin type classification
-			if ct == 0 {
-				if ct != cointype.CoinTypeVAR {
-					t.Errorf("Expected CoinTypeVAR (0), got %d", ct)
-				}
-			} else {
-				if ct < 1 || ct > 255 {
-					t.Errorf("SKA coin type %d is out of valid range (1-255)", ct)
-				}
+			if tt.coinType.IsSKA() != tt.isSKA {
+				t.Errorf("IsSKA() = %v, want %v", tt.coinType.IsSKA(), tt.isSKA)
 			}
 		})
 	}
 }
 
-// TestConsolidateBackwardCompatibility tests that the old Consolidate method
-// still works and defaults to VAR
-func TestConsolidateBackwardCompatibility(t *testing.T) {
-	// The old Consolidate() method should still work and default to VAR
-	// This test verifies the method exists and has the expected behavior
+// TestConsolidateOutputDustClassification pins the MED-6 fix from the
+// 2026-05-04 review: a sub-dust SKA consolidation output must surface as
+// errors.Policy (the operator HAS funds, just below the dust threshold),
+// not errors.InsufficientBalance ("no funds at all"). compressWalletInternal
+// now propagates the Policy classification from txrules.CheckOutput rather
+// than re-tagging.
+//
+// Tests txrules.CheckOutput directly because compressWalletInternal needs a
+// loaded wallet harness. CheckOutput is the single source of truth that
+// produces the Policy error consolidate now propagates verbatim.
+func TestConsolidateOutputDustClassification(t *testing.T) {
+	chainParams := chaincfg.SimNetParams()
+	// Plausible per-kB relay fee for testing dust thresholds; the exact
+	// value is not load-bearing — CheckOutput compares the SKA output
+	// against MinSKADustAmount (constant) and the VAR output against
+	// the per-kB-derived dust amount.
+	relayFee := cointype.SKAAmountFromInt64(100000)
 
-	t.Run("Consolidate defaults to VAR", func(t *testing.T) {
-		// Verify that calling Consolidate() without coin type parameter
-		// is equivalent to calling ConsolidateWithCoinType() with VAR
-
-		expectedCoinType := cointype.CoinTypeVAR
-		if expectedCoinType != 0 {
-			t.Errorf("Expected default coin type to be VAR (0), got %d", expectedCoinType)
+	t.Run("sub-dust SKA output yields Policy", func(t *testing.T) {
+		// MinSKADustAmount is 30 atoms; 1 atom is well below it.
+		out := &wire.TxOut{
+			Value:    0,
+			SKAValue: big.NewInt(1),
+			CoinType: cointype.CoinType(1),
+			PkScript: simnetP2PKHScript(t, chainParams),
 		}
+		err := txrules.CheckOutput(out, relayFee)
+		if err == nil {
+			t.Fatal("expected dust error for 1-atom SKA output, got nil")
+		}
+		if !errors.Is(err, errors.Policy) {
+			t.Errorf("error kind = %v, want errors.Policy (operator has funds, "+
+				"just below dust threshold; not InsufficientBalance)", err)
+		}
+	})
 
-		t.Log("✓ Consolidate() defaults to VAR (backward compatible)")
+	t.Run("above-dust SKA output passes", func(t *testing.T) {
+		// 1000 atoms is comfortably above the 30-atom MinSKADustAmount.
+		out := &wire.TxOut{
+			Value:    0,
+			SKAValue: big.NewInt(1000),
+			CoinType: cointype.CoinType(1),
+			PkScript: simnetP2PKHScript(t, chainParams),
+		}
+		if err := txrules.CheckOutput(out, relayFee); err != nil {
+			t.Errorf("unexpected error for 1000-atom SKA output: %v", err)
+		}
+	})
+
+	t.Run("VAR dust output yields Policy", func(t *testing.T) {
+		// At simnet relay fee 1e5 atoms/KB the per-output dust threshold is
+		// well above 1 atom; pick a value clearly below it.
+		out := &wire.TxOut{
+			Value:    1,
+			CoinType: cointype.CoinTypeVAR,
+			PkScript: simnetP2PKHScript(t, chainParams),
+		}
+		err := txrules.CheckOutput(out, relayFee)
+		if err == nil {
+			t.Fatal("expected dust error for 1-atom VAR output, got nil")
+		}
+		if !errors.Is(err, errors.Policy) {
+			t.Errorf("error kind = %v, want errors.Policy", err)
+		}
 	})
 }
 
-// TestConsolidateInputCount tests input count validation
-func TestConsolidateInputCount(t *testing.T) {
-	tests := []struct {
-		name   string
-		inputs int
-		valid  bool
-	}{
-		{"Zero inputs", 0, false},
-		{"One input", 1, false}, // Need at least 2 to consolidate
-		{"Two inputs", 2, true},
-		{"Ten inputs", 10, true},
-		{"Hundred inputs", 100, true},
-		{"Large count", 1000, true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Verify input count validation logic
-			if tt.inputs <= 1 && tt.valid {
-				t.Errorf("Input count %d should not be valid for consolidation", tt.inputs)
-			}
-			if tt.inputs > 1 && !tt.valid {
-				t.Errorf("Input count %d should be valid for consolidation", tt.inputs)
-			}
-		})
-	}
-}
-
-// TestConsolidateCoinTypeSeparation tests that different coin types
-// are properly separated during consolidation
-func TestConsolidateCoinTypeSeparation(t *testing.T) {
-	// This test verifies the principle that consolidation should only
-	// consolidate UTXOs of the same coin type
-
-	coinTypes := []cointype.CoinType{
-		cointype.CoinTypeVAR,
-		cointype.CoinType(1), // SKA-1
-		cointype.CoinType(2), // SKA-2
-	}
-
-	for _, ct := range coinTypes {
-		t.Run(string(rune(ct)), func(t *testing.T) {
-			// Verify that consolidation logic would only select UTXOs
-			// of the specified coin type
-
-			// Test that coin type is correctly identified
-			if ct == cointype.CoinTypeVAR {
-				t.Logf("✓ CoinType %d is VAR", ct)
-			} else {
-				t.Logf("✓ CoinType %d is SKA-%d", ct, ct)
-			}
-
-			// In the actual implementation, findEligibleOutputs() filters
-			// by coin type, ensuring only matching UTXOs are selected
-		})
-	}
-}
-
-// TestConsolidateFeesPerCoinType tests that consolidation uses the correct
-// fee rate for each coin type
-func TestConsolidateFeesPerCoinType(t *testing.T) {
-	tests := []struct {
-		name     string
-		coinType cointype.CoinType
-		desc     string
-	}{
-		{
-			name:     "VAR fees",
-			coinType: cointype.CoinTypeVAR,
-			desc:     "VAR consolidation should use VAR fee rate",
-		},
-		{
-			name:     "SKA-1 fees",
-			coinType: cointype.CoinType(1),
-			desc:     "SKA-1 consolidation should use SKA fee rate",
-		},
-		{
-			name:     "SKA-2 fees",
-			coinType: cointype.CoinType(2),
-			desc:     "SKA-2 consolidation should use SKA fee rate",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Verify that RelayFeeForCoinType() is used correctly
-			// The actual implementation calls w.RelayFeeForCoinType(ctx, coinType)
-			// which returns the appropriate fee rate for each coin type
-
-			t.Logf("✓ %s", tt.desc)
-
-			// In the actual implementation:
-			// - VAR uses the standard relay fee
-			// - SKA uses the SKA-specific fee rate (which may be different)
-		})
-	}
-}
-
-// TestConsolidateOutputCoinType tests that the consolidation output
-// has the correct coin type
-func TestConsolidateOutputCoinType(t *testing.T) {
-	coinTypes := []cointype.CoinType{
-		cointype.CoinTypeVAR,
-		cointype.CoinType(1),
-		cointype.CoinType(2),
-		cointype.CoinType(255),
-	}
-
-	for _, ct := range coinTypes {
-		t.Run(string(rune(ct)), func(t *testing.T) {
-			// Verify that the consolidation output would have the correct coin type
-			// In the actual implementation (compressWalletInternal), the output
-			// is created with: CoinType: coinType
-
-			if ct < 0 || ct > 255 {
-				t.Errorf("Invalid coin type: %d", ct)
-			}
-
-			t.Logf("✓ Consolidation output for CoinType %d would use CoinType %d", ct, ct)
-		})
+// simnetP2PKHScript returns a minimal valid P2PKH script for testing
+// CheckOutput against a real script type (the function rejects non-standard
+// scripts as dust regardless of value).
+func simnetP2PKHScript(t *testing.T, params *chaincfg.Params) []byte {
+	t.Helper()
+	// OP_DUP OP_HASH160 <20-byte pubkey hash> OP_EQUALVERIFY OP_CHECKSIG
+	return []byte{
+		0x76, 0xa9, 0x14,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x88, 0xac,
 	}
 }

@@ -25,12 +25,12 @@ func TestDualCoinTxRules(t *testing.T) {
 
 	// Test case 2: Verify that SKA outputs result in correct SKA coin type detection
 	skaOutputs := []*wire.TxOut{
-		{Value: 200000000, CoinType: cointype.CoinType(1)}, // 2 SKA-1
+		{Value: 200000000, CoinType: cointype.CoinType(1)}, // 2 SKA1
 	}
 
 	coinType = txrules.GetCoinTypeFromOutputs(skaOutputs)
 	if coinType != cointype.CoinType(1) {
-		t.Errorf("Expected SKA-1 coin type (1), got %d", coinType)
+		t.Errorf("Expected SKA1 coin type (1), got %d", coinType)
 	}
 
 	// Test case 3: Empty outputs should return VAR as default
@@ -43,33 +43,6 @@ func TestDualCoinTxRules(t *testing.T) {
 
 	// Note: Mixed coin types in outputs are no longer allowed in transactions.
 	// All outputs must have the same coin type after SSFee implementation.
-}
-
-// TestDualCoinFeeCalculation tests the fee calculation for different coin types
-func TestDualCoinFeeCalculation(t *testing.T) {
-	relayFeePerKb := dcrutil.Amount(1000) // 1000 atoms per KB
-	txSize := 250                         // bytes
-
-	// Test VAR fee calculation
-	varFee := txrules.FeeForSerializeSizeDualCoin(relayFeePerKb, txSize, cointype.CoinTypeVAR)
-	expectedVarFee := txrules.FeeForSerializeSize(relayFeePerKb, txSize)
-	if varFee != expectedVarFee {
-		t.Errorf("VAR fee calculation: expected %d, got %d", expectedVarFee, varFee)
-	}
-
-	// Test SKA fee calculation (should use same calculation as VAR)
-	skaFee := txrules.FeeForSerializeSizeDualCoin(relayFeePerKb, txSize, cointype.CoinType(1))
-	if skaFee != expectedVarFee {
-		t.Errorf("SKA fee calculation: expected %d, got %d", expectedVarFee, skaFee)
-	}
-
-	// Verify fees are non-zero for regular transactions
-	if varFee == 0 {
-		t.Error("VAR fee should not be zero for regular transactions")
-	}
-	if skaFee == 0 {
-		t.Error("SKA fee should not be zero for regular transactions")
-	}
 }
 
 // TestTxAuthorFeeHandling tests that txauthor properly handles fees for all coin types

@@ -75,9 +75,12 @@ type KnownAddress interface {
 type PubKeyHashAddress interface {
 	KnownAddress
 
-	// PubKey returns the serialized compressed public key.  This key must
-	// be included in scripts redeeming P2PKH outputs paying the address.
-	PubKey() []byte
+	// PubKey returns the serialized compressed public key. This key must be
+	// included in scripts redeeming P2PKH outputs paying the address. An
+	// error is returned only when the address is backed by a derivation
+	// path that cannot be re-derived (e.g. a corrupted xpub); under normal
+	// operation the call always succeeds.
+	PubKey() ([]byte, error)
 
 	// PubKeyHash returns the hashed compressed public key.  This hash must
 	// appear in output scripts paying to the address.
@@ -152,8 +155,11 @@ type managedP2PKHAddress struct {
 	managedAddress
 }
 
-func (m *managedP2PKHAddress) PubKey() []byte {
-	return m.addr.(udb.ManagedPubKeyAddress).PubKey()
+func (m *managedP2PKHAddress) PubKey() ([]byte, error) {
+	// The udb-backed managedAddress carries an already-serialized pubkey
+	// in memory, so this call cannot fail in practice. Surfacing an error
+	// keeps the interface uniform with the xpub-derived path.
+	return m.addr.(udb.ManagedPubKeyAddress).PubKey(), nil
 }
 func (m *managedP2PKHAddress) PubKeyHash() []byte {
 	return m.addr.(udb.ManagedPubKeyAddress).AddrHash()
@@ -302,18 +308,20 @@ func (x *xpubAddress) Path() (account, branch, child uint32) {
 	return
 }
 
-func (x *xpubAddress) PubKey() []byte {
-	// All errors are unexpected, since the P2PKH address must have already
-	// been created from the same path.
+func (x *xpubAddress) PubKey() ([]byte, error) {
+	// Errors are unexpected under correct operation — the P2PKH address has
+	// already been derived once via the same path. Returning the error
+	// rather than panicking avoids unconditionally killing the RPC server's
+	// goroutine on a corrupted xpub or an HD-derivation collision.
 	branchKey, err := x.xpub.Child(x.branch)
 	if err != nil {
-		panic(err)
+		return nil, errors.E(errors.Bug, err)
 	}
 	childKey, err := branchKey.Child(x.child)
 	if err != nil {
-		panic(err)
+		return nil, errors.E(errors.Bug, err)
 	}
-	return childKey.SerializedPubKey()
+	return childKey.SerializedPubKey(), nil
 }
 
 func (x *xpubAddress) PubKeyHash() []byte { return x.Hash160()[:] }

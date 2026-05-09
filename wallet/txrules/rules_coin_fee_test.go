@@ -89,7 +89,7 @@ func TestGetCoinTypeFromOutputs(t *testing.T) {
 			expected: cointype.CoinTypeVAR,
 		},
 		{
-			name: "All SKA-1 outputs",
+			name: "All SKA1 outputs",
 			outputs: []*wire.TxOut{
 				{CoinType: cointype.CoinType(1), Value: 1000},
 				{CoinType: cointype.CoinType(1), Value: 2000},
@@ -97,7 +97,7 @@ func TestGetCoinTypeFromOutputs(t *testing.T) {
 			expected: cointype.CoinType(1),
 		},
 		{
-			name: "All SKA-2 outputs",
+			name: "All SKA2 outputs",
 			outputs: []*wire.TxOut{
 				{CoinType: cointype.CoinType(2), Value: 1000},
 				{CoinType: cointype.CoinType(2), Value: 2000},
@@ -128,30 +128,26 @@ func TestGetCoinTypeFromOutputs(t *testing.T) {
 	}
 }
 
-// TestSKAFeeDesign verifies that SKA transactions pay fees in their own coin type.
+// TestSKAFeeDesign verifies that SKA transactions pay fees in their own coin
+// type via the big.Int FeeForSerializeSizeSKA path.
 func TestSKAFeeDesign(t *testing.T) {
-	relayFee := dcrutil.Amount(10000)
+	relayFee := cointype.SKAAmountFromInt64(10000)
 	txSize := 250
 
-	// Test that SKA transactions pay fees in their own coin type
-	skaFee := FeeForSerializeSizeDualCoin(relayFee, txSize, cointype.CoinType(1))
-
-	// Should be same calculation as VAR (fee paid in SKA coins)
-	expectedFee := relayFee * dcrutil.Amount(txSize) / 1000
-	if expectedFee == 0 && relayFee > 0 {
-		expectedFee = relayFee
+	// SKA fee uses big.Int math; should match the same arithmetic as VAR
+	// when relayFee fits in int64.
+	skaFee := FeeForSerializeSizeSKA(relayFee, txSize)
+	expectedAtoms := int64(10000) * int64(txSize) / 1000
+	got, _ := skaFee.Int64()
+	if got != expectedAtoms {
+		t.Errorf("FeeForSerializeSizeSKA: expected %d atoms, got %d", expectedAtoms, got)
 	}
 
-	if skaFee != expectedFee {
-		t.Errorf("SKA transactions should pay fees in SKA coins using same calculation as VAR, expected %d, got %d", expectedFee, skaFee)
+	// VAR fee uses int64 math.
+	varFee := FeeForSerializeSize(dcrutil.Amount(10000), txSize)
+	if int64(varFee) != expectedAtoms {
+		t.Errorf("FeeForSerializeSize VAR: expected %d atoms, got %d", expectedAtoms, varFee)
 	}
 
-	// VAR should have same calculation
-	varFee := FeeForSerializeSizeDualCoin(relayFee, txSize, cointype.CoinTypeVAR)
-	if varFee != expectedFee {
-		t.Errorf("VAR and SKA should use same fee calculation, VAR=%d, SKA=%d",
-			varFee, skaFee)
-	}
-
-	t.Logf("Fixed fee calculation: VAR=%d atoms, SKA=%d atoms (no longer zero)", varFee, skaFee)
+	t.Logf("Fee calculation: VAR=%d atoms, SKA=%d atoms", varFee, got)
 }

@@ -138,13 +138,13 @@ message TransactionDetails {
 	message Input {
 		uint32 index = 1;
 		uint32 previous_account = 2;
-		int64 previous_amount = 3;
+		string previous_amount = 3; // VAR or SKA atoms (decimal string)
 	}
 	message Output {
 		uint32 index = 1;
 		uint32 account = 2;
 		bool internal = 3;
-		int64 amount = 4;
+		string amount = 4; // VAR or SKA atoms (decimal string)
 		string address = 5;
 		bytes output_script = 6;
 	}
@@ -152,7 +152,7 @@ message TransactionDetails {
 	bytes transaction = 2;
 	repeated Input debits = 3;
 	repeated Output credits = 4;
-	int64 fee = 5;
+	string fee = 5; // VAR or SKA atoms (decimal string)
 	int64 timestamp = 6; // May be earlier than a block timestamp, but never later.
 	enum TransactionType {
 		REGULAR = 0;
@@ -210,12 +210,21 @@ message AccountsResponse {
 	message Account {
 		uint32 account_number = 1;
 		string account_name = 2;
+		// total_balance is VAR atoms only (1e8/coin). It used to also include
+		// SKA, but VAR atoms and SKA atoms (1e18/coin) are not summable into
+		// a single int64. SKA balances are reported per coin type in
+		// ska_total_balances below.
 		int64 total_balance = 3;
 		uint32 external_key_count = 4;
 		uint32 internal_key_count = 5;
 		uint32 imported_key_count = 6;
 		bool account_encrypted = 7;
 		bool account_unlocked = 8;
+		// ska_total_balances reports confirmed SKA balances for this account
+		// keyed by SKA coin type (1-255). Values are big.Int atoms in base-10
+		// decimal string form (SKA uses 1e18 atoms/coin, which exceeds int64
+		// range). Zero-balance coin types are omitted.
+		map<uint32, string> ska_total_balances = 9;
 	}
 	repeated Account accounts = 1;
 	bytes current_block_hash = 2;
@@ -483,6 +492,10 @@ message FundTransactionRequest {
 	int32 required_confirmations = 3;
 	bool include_immature_coinbases = 4;
 	bool include_change_script = 5;
+	// coin_type selects the coin to fund (0=VAR, 1-255=SKA). Default 0
+	// preserves prior VAR-only behaviour for clients that have not adopted
+	// the field yet.
+	uint32 coin_type = 6;
 }
 message FundTransactionResponse {
 	message PreviousOutput {
@@ -504,6 +517,10 @@ message UnspentOutputsRequest {
 	int64 target_amount = 2;
 	int32 required_confirmations = 3;
 	bool include_immature_coinbases = 4;
+	// coin_type selects the coin to enumerate (0=VAR, 1-255=SKA). Default 0
+	// preserves prior VAR-only behaviour for clients that have not adopted
+	// the field yet.
+	uint32 coin_type = 5;
 }
 message UnspentOutputResponse {
 	bytes transaction_hash = 1;
@@ -525,7 +542,11 @@ message ConstructTransactionRequest {
 	}
 	message Output {
 		OutputDestination destination = 1;
-		int64 amount = 2;
+		// VAR or SKA atoms (decimal string). For SKA outputs set coin_type
+		// to 1-255; all outputs in a single request must share the same
+		// coin_type.
+		string amount = 2;
+		uint32 coin_type = 3;
 	}
 	enum OutputSelectionAlgorithm {
 		UNSPECIFIED = 0;
@@ -533,15 +554,19 @@ message ConstructTransactionRequest {
 	}
 	uint32 source_account = 1;
 	int32 required_confirmations = 2;
-	int32 fee_per_kb = 3;
+	// Per-kB relay fee override (decimal-string atoms) for the inferred
+	// coin type. When empty or zero, the wallet falls back to its
+	// configured RelayFeeForCoinType.
+	string fee_per_kb = 3;
 	OutputSelectionAlgorithm output_selection_algorithm = 4;
 	repeated Output non_change_outputs = 5;
 	OutputDestination change_destination = 6;
 }
 message ConstructTransactionResponse {
 	bytes unsigned_transaction = 1;
-	int64 total_previous_output_amount = 2;
-	int64 total_output_amount = 3;
+	// VAR or SKA atoms (decimal string).
+	string total_previous_output_amount = 2;
+	string total_output_amount = 3;
 	uint32 estimated_signed_size = 4;
 	int32 change_index = 5;
 }
@@ -1141,13 +1166,20 @@ message SweepAccountRequest {
 	string source_account = 1;
 	string destination_address = 2;
 	uint32 required_confirmations = 3;
-	double fee_per_kb = 4;
+	// Per-kB relay fee override (decimal-string atoms). When empty or
+	// zero, the wallet falls back to RelayFeeForCoinType.
+	string fee_per_kb = 4;
+	// coin_type selects the coin to sweep (0=VAR, 1-255=SKA). Default 0
+	// preserves the prior VAR-only behavior. UTXOs not matching coin_type
+	// are skipped.
+	uint32 coin_type = 5;
 }
 
 message SweepAccountResponse {
 	bytes unsigned_transaction = 1;
-	int64 total_previous_output_amount = 2;
-	int64 total_output_amount = 3;
+	// VAR or SKA atoms (decimal string).
+	string total_previous_output_amount = 2;
+	string total_output_amount = 3;
 	uint32 estimated_signed_size = 4;
 }
 

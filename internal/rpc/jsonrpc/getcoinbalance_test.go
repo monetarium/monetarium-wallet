@@ -40,31 +40,26 @@ func TestRenderCoinBalanceAmountsSKAPrecision(t *testing.T) {
 
 	got := renderCoinBalanceAmounts(cb, true /* isSKA */, atomsPerSKA)
 
-	spendable, ok := got.Spendable.(string)
-	if !ok {
-		t.Fatalf("SKA Spendable should be string, got %T", got.Spendable)
-	}
 	// 5e28 atoms / 1e18 atoms-per-coin = 5e10 coins = "50000000000"
 	const wantWhole = "50000000000"
-	if spendable != wantWhole {
-		t.Errorf("SKA Spendable: want %q, got %q", wantWhole, spendable)
+	if got.Spendable != wantWhole {
+		t.Errorf("SKA Spendable: want %q, got %q", wantWhole, got.Spendable)
 	}
 
-	total, _ := got.Total.(string)
-	if total != wantWhole {
-		t.Errorf("SKA Total: want %q, got %q", wantWhole, total)
+	if got.Total != wantWhole {
+		t.Errorf("SKA Total: want %q, got %q", wantWhole, got.Total)
 	}
 
 	// Stake-only fields must be the literal "0" string for SKA — SKA does not
 	// participate in PoS.
 	if got.LockedByTickets != "0" {
-		t.Errorf("SKA LockedByTickets: want %q, got %v (%T)", "0", got.LockedByTickets, got.LockedByTickets)
+		t.Errorf("SKA LockedByTickets: want %q, got %q", "0", got.LockedByTickets)
 	}
 	if got.VotingAuthority != "0" {
-		t.Errorf("SKA VotingAuthority: want %q, got %v (%T)", "0", got.VotingAuthority, got.VotingAuthority)
+		t.Errorf("SKA VotingAuthority: want %q, got %q", "0", got.VotingAuthority)
 	}
 	if got.ImmatureStakeGeneration != "0" {
-		t.Errorf("SKA ImmatureStakeGeneration: want %q, got %v (%T)", "0", got.ImmatureStakeGeneration, got.ImmatureStakeGeneration)
+		t.Errorf("SKA ImmatureStakeGeneration: want %q, got %q", "0", got.ImmatureStakeGeneration)
 	}
 
 	// Verify that pre-fix int64 cast would have produced wrong values.
@@ -74,9 +69,9 @@ func TestRenderCoinBalanceAmountsSKAPrecision(t *testing.T) {
 	}
 }
 
-// TestRenderCoinBalanceAmountsVARFloat verifies VAR balances still render as
-// float64 (preserving the existing wire format for non-SKA queries).
-func TestRenderCoinBalanceAmountsVARFloat(t *testing.T) {
+// TestRenderCoinBalanceAmountsVARDecimal verifies VAR balances render as
+// decimal coin strings (unified API contract with SKA).
+func TestRenderCoinBalanceAmountsVARDecimal(t *testing.T) {
 	atomsPerVAR := big.NewInt(1e8)
 	cb := wallet.CoinBalance{
 		CoinType:    cointype.CoinTypeVAR,
@@ -87,23 +82,17 @@ func TestRenderCoinBalanceAmountsVARFloat(t *testing.T) {
 
 	got := renderCoinBalanceAmounts(cb, false /* isSKA */, atomsPerVAR)
 
-	spendable, ok := got.Spendable.(float64)
-	if !ok {
-		t.Fatalf("VAR Spendable should be float64, got %T", got.Spendable)
+	if got.Spendable != "1.5" {
+		t.Errorf("VAR Spendable: want %q, got %q", "1.5", got.Spendable)
 	}
-	if spendable != 1.5 {
-		t.Errorf("VAR Spendable: want 1.5, got %v", spendable)
-	}
-
-	total, _ := got.Total.(float64)
-	if total != 2.0 {
-		t.Errorf("VAR Total: want 2.0, got %v", total)
+	if got.Total != "2" {
+		t.Errorf("VAR Total: want %q, got %q", "2", got.Total)
 	}
 }
 
 // TestRenderCoinBalanceAmountsSKAZero verifies the empty-balance SKA case
-// renders as the decimal string "0", not float64(0). This pins the wire
-// format for callers iterating coin types.
+// renders as the decimal string "0". This pins the wire format for callers
+// iterating coin types.
 func TestRenderCoinBalanceAmountsSKAZero(t *testing.T) {
 	atomsPerSKA := new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil)
 	cb := wallet.CoinBalance{
@@ -117,16 +106,16 @@ func TestRenderCoinBalanceAmountsSKAZero(t *testing.T) {
 
 	got := renderCoinBalanceAmounts(cb, true, atomsPerSKA)
 
-	if s, ok := got.Spendable.(string); !ok || s != "0" {
-		t.Errorf("SKA zero Spendable: want string \"0\", got %v (%T)", got.Spendable, got.Spendable)
+	if got.Spendable != "0" {
+		t.Errorf("SKA zero Spendable: want %q, got %q", "0", got.Spendable)
 	}
-	if s, ok := got.Total.(string); !ok || s != "0" {
-		t.Errorf("SKA zero Total: want string \"0\", got %v (%T)", got.Total, got.Total)
+	if got.Total != "0" {
+		t.Errorf("SKA zero Total: want %q, got %q", "0", got.Total)
 	}
 }
 
-// TestRenderCoinBalanceAmountsVARMaxInt64 verifies the VAR float64 path
-// rounds correctly at the largest representable int64 atom value, ensuring
+// TestRenderCoinBalanceAmountsVARMaxInt64 verifies the VAR decimal-string path
+// renders correctly at the largest representable int64 atom value, ensuring
 // no regression for callers near the upper int64 limit.
 func TestRenderCoinBalanceAmountsVARMaxInt64(t *testing.T) {
 	atomsPerVAR := big.NewInt(1e8)
@@ -135,7 +124,7 @@ func TestRenderCoinBalanceAmountsVARMaxInt64(t *testing.T) {
 		Spendable: dcrutil.Amount(math.MaxInt64),
 	}
 	got := renderCoinBalanceAmounts(cb, false, atomsPerVAR)
-	if _, ok := got.Spendable.(float64); !ok {
-		t.Fatalf("VAR Spendable should be float64, got %T", got.Spendable)
+	if got.Spendable == "" {
+		t.Fatal("VAR Spendable: want non-empty decimal string, got empty")
 	}
 }

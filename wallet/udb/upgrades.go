@@ -242,10 +242,21 @@ const (
 	// entries are VAR-only and backfilled as CoinType=VAR / SKAAmount=Zero.
 	multisigCoinTypeVersion = 32
 
+	// skaSideBucketCleanupVersion is the 33rd version of the database. It
+	// creates bucketSKAStakeInvalidatedCreditAmounts and prunes any orphan
+	// entries from bucketSKACreditAmounts and bucketSKAUnminedCreditAmounts
+	// whose primary credit no longer exists. Such orphans were leaked by the
+	// pre-fix code on every rollback / stake-invalidate / unmined-credit
+	// removal of an SKA credit. Where an orphan corresponds to a
+	// stake-invalidated credit (still in bucketStakeInvalidatedCredits) the
+	// SKA amount is migrated to the new archive bucket so a subsequent
+	// stakeValidate restores the original value.
+	skaSideBucketCleanupVersion = 33
+
 	// DBVersion is the latest version of the database that is understood by the
 	// program.  Databases with recorded versions higher than this will fail to
 	// open (meaning any upgrades prevent reverting to older software).
-	DBVersion = multisigCoinTypeVersion
+	DBVersion = skaSideBucketCleanupVersion
 )
 
 // upgrades maps between old database versions and the upgrade function to
@@ -283,6 +294,7 @@ var upgrades = [...]func(walletdb.ReadWriteTx, []byte, *chaincfg.Params) error{
 	skaBucketsVersion - 1:                 skaBucketsUpgrade,
 	wireFormatV13Version - 1:              wireFormatV13Upgrade,
 	multisigCoinTypeVersion - 1:           multisigCoinTypeUpgrade,
+	skaSideBucketCleanupVersion - 1:       skaSideBucketCleanupUpgrade,
 }
 
 func lastUsedAddressIndexUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *chaincfg.Params) error {
@@ -1734,11 +1746,23 @@ func birthBlockUpgrade(tx walletdb.ReadWriteTx, _ []byte, params *chaincfg.Param
 // It also migrates all existing transaction records from the legacy wire format
 // (without CoinType) to the new format (with CoinType=VAR for all outputs).
 func dualCoinUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *chaincfg.Params) error {
+	const oldVersion = 26
 	const newVersion = 27
 
 	metadataBucket := tx.ReadWriteBucket(unifiedDBMetadata{}.rootBucketKey())
 	if metadataBucket == nil {
 		return errors.E(errors.IO, "missing metadata bucket")
+	}
+
+	// Assert this function is only called on version 26 databases. Without
+	// this guard a dispatcher refactor or direct caller would silently
+	// rewrite a different version's data through the V12 wire-format reader.
+	dbVersion, err := unifiedDBMetadata{}.getVersion(metadataBucket)
+	if err != nil {
+		return err
+	}
+	if dbVersion != oldVersion {
+		return errors.E(errors.Invalid, errors.Errorf("dualCoinUpgrade inappropriately called"))
 	}
 
 	txmgrBucket := tx.ReadWriteBucket(wtxmgrBucketKey)
@@ -1842,11 +1866,21 @@ func dualCoinUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *c
 // separate buckets for each coin type to enable efficient coin-type-specific
 // UTXO queries without runtime filtering.
 func coinTypeBucketsUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *chaincfg.Params) error {
+	const oldVersion = 27
 	const newVersion = 28
 
 	metadataBucket := tx.ReadWriteBucket(unifiedDBMetadata{}.rootBucketKey())
 	if metadataBucket == nil {
 		return errors.E(errors.IO, "missing metadata bucket")
+	}
+
+	// Assert this function is only called on version 27 databases.
+	dbVersion, err := unifiedDBMetadata{}.getVersion(metadataBucket)
+	if err != nil {
+		return err
+	}
+	if dbVersion != oldVersion {
+		return errors.E(errors.Invalid, errors.Errorf("coinTypeBucketsUpgrade inappropriately called"))
 	}
 
 	txmgrBucket := tx.ReadWriteBucket(wtxmgrBucketKey)
@@ -1855,7 +1889,7 @@ func coinTypeBucketsUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, pa
 	}
 
 	// Create buckets for VAR (always exists)
-	_, err := txmgrBucket.CreateBucketIfNotExists(bucketUnspentForCoinType(cointype.CoinTypeVAR))
+	_, err = txmgrBucket.CreateBucketIfNotExists(bucketUnspentForCoinType(cointype.CoinTypeVAR))
 	if err != nil {
 		return errors.E(errors.IO, err)
 	}
@@ -1947,7 +1981,17 @@ func Upgrade(ctx context.Context, db walletdb.DB, publicPassphrase []byte, param
 		return err
 	}
 
-	if version >= DBVersion {
+	if version > DBVersion {
+		// The DB was migrated by a newer binary. Refuse to open: opening
+		// silently would let this older binary read records via an older
+		// wire-format codepath (e.g. V12 vs V13 TxOut layouts) and produce
+		// phantom balances or silently-spent UTXOs.
+		return errors.E(errors.Invalid, errors.Errorf(
+			"wallet database version %d is newer than this binary supports (%d); "+
+				"upgrade the binary instead of running an older one against a migrated DB",
+			version, DBVersion))
+	}
+	if version == DBVersion {
 		// No upgrades necessary.
 		return nil
 	}
@@ -2217,6 +2261,115 @@ func multisigCoinTypeUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, p
 		v2[multisigOutV1Len+1] = 0
 		if err := msBucket.Put(r.k, v2); err != nil {
 			return errors.E(errors.IO, err)
+		}
+	}
+
+	return unifiedDBMetadata{}.putVersion(metadataBucket, newVersion)
+}
+
+// skaSideBucketCleanupUpgrade creates the SKA stake-invalidated archive bucket
+// and prunes orphan entries from the existing SKA side buckets that were
+// leaked by the pre-fix code (where deleteRawCredit / deleteRawUnminedCredit
+// did not cascade to bucketSKACreditAmounts / bucketSKAUnminedCreditAmounts).
+//
+// For each entry in bucketSKACreditAmounts whose primary credit is gone:
+//   - if the credit is currently in bucketStakeInvalidatedCredits, the SKA
+//     amount is migrated to the new archive bucket so a future stakeValidate
+//     restores it (recovers data orphaned by the prior leak);
+//   - otherwise the entry is deleted as a pure orphan.
+//
+// For each entry in bucketSKAUnminedCreditAmounts whose primary unmined
+// credit is gone, the entry is deleted.
+func skaSideBucketCleanupUpgrade(tx walletdb.ReadWriteTx, publicPassphrase []byte, params *chaincfg.Params) error {
+	const oldVersion = 32
+	const newVersion = 33
+
+	metadataBucket := tx.ReadWriteBucket(unifiedDBMetadata{}.rootBucketKey())
+	dbVersion, err := unifiedDBMetadata{}.getVersion(metadataBucket)
+	if err != nil {
+		return err
+	}
+	if dbVersion != oldVersion {
+		return errors.E(errors.Invalid, errors.Errorf("skaSideBucketCleanupUpgrade inappropriately called"))
+	}
+
+	txmgrBucket := tx.ReadWriteBucket(wtxmgrBucketKey)
+	if txmgrBucket == nil {
+		return errors.E(errors.IO, "missing transaction manager bucket")
+	}
+
+	// Create the new archive bucket (idempotent on retry).
+	if _, err := txmgrBucket.CreateBucketIfNotExists(bucketSKAStakeInvalidatedCreditAmounts); err != nil {
+		return errors.E(errors.IO, err)
+	}
+
+	// Prune orphans in bucketSKACreditAmounts. Buffer keys first because
+	// modifying a bucket under ForEach is not supported by all backends.
+	skaBucket := txmgrBucket.NestedReadWriteBucket(bucketSKACreditAmounts)
+	creditsBucket := txmgrBucket.NestedReadBucket(bucketCredits)
+	invCreditsBucket := txmgrBucket.NestedReadBucket(bucketStakeInvalidatedCredits)
+	if skaBucket != nil {
+		type rec struct {
+			k, v []byte
+		}
+		var orphans []rec
+		var migrate []rec
+		err = skaBucket.ForEach(func(k, v []byte) error {
+			liveExists := creditsBucket != nil && creditsBucket.Get(k) != nil
+			if liveExists {
+				return nil
+			}
+			invExists := invCreditsBucket != nil && invCreditsBucket.Get(k) != nil
+			kc := make([]byte, len(k))
+			copy(kc, k)
+			vc := make([]byte, len(v))
+			copy(vc, v)
+			if invExists {
+				migrate = append(migrate, rec{kc, vc})
+			} else {
+				orphans = append(orphans, rec{kc, vc})
+			}
+			return nil
+		})
+		if err != nil {
+			return errors.E(errors.IO, err)
+		}
+		archiveBucket := txmgrBucket.NestedReadWriteBucket(bucketSKAStakeInvalidatedCreditAmounts)
+		for _, r := range migrate {
+			if err := archiveBucket.Put(r.k, r.v); err != nil {
+				return errors.E(errors.IO, err)
+			}
+			if err := skaBucket.Delete(r.k); err != nil {
+				return errors.E(errors.IO, err)
+			}
+		}
+		for _, r := range orphans {
+			if err := skaBucket.Delete(r.k); err != nil {
+				return errors.E(errors.IO, err)
+			}
+		}
+	}
+
+	// Prune orphans in bucketSKAUnminedCreditAmounts. An entry is an orphan
+	// when no per-coin-type unmined credit exists for its key.
+	unminedSkaBucket := txmgrBucket.NestedReadWriteBucket(bucketSKAUnminedCreditAmounts)
+	if unminedSkaBucket != nil {
+		var orphanKeys [][]byte
+		err = unminedSkaBucket.ForEach(func(k, _ []byte) error {
+			if existsRawUnminedCredit(txmgrBucket, k, params) == nil {
+				kc := make([]byte, len(k))
+				copy(kc, k)
+				orphanKeys = append(orphanKeys, kc)
+			}
+			return nil
+		})
+		if err != nil {
+			return errors.E(errors.IO, err)
+		}
+		for _, k := range orphanKeys {
+			if err := unminedSkaBucket.Delete(k); err != nil {
+				return errors.E(errors.IO, err)
+			}
 		}
 	}
 

@@ -71,25 +71,25 @@ func TestOutputSelectionPolicyCoinTypeFilter(t *testing.T) {
 			description:    "VAR filter should exclude SKA outputs",
 		},
 		{
-			name:           "SKA-1 filter - SKA-1 output",
+			name:           "SKA1 filter - SKA1 output",
 			policyFilter:   func() *cointype.CoinType { ct := cointype.CoinType(1); return &ct }(),
 			outputCoinType: cointype.CoinType(1),
 			shouldInclude:  true,
-			description:    "SKA-1 filter should include SKA-1 outputs",
+			description:    "SKA1 filter should include SKA1 outputs",
 		},
 		{
-			name:           "SKA-1 filter - SKA-2 output",
+			name:           "SKA1 filter - SKA2 output",
 			policyFilter:   func() *cointype.CoinType { ct := cointype.CoinType(1); return &ct }(),
 			outputCoinType: cointype.CoinType(2),
 			shouldInclude:  false,
-			description:    "SKA-1 filter should exclude SKA-2 outputs",
+			description:    "SKA1 filter should exclude SKA2 outputs",
 		},
 		{
-			name:           "SKA-1 filter - VAR output",
+			name:           "SKA1 filter - VAR output",
 			policyFilter:   func() *cointype.CoinType { ct := cointype.CoinType(1); return &ct }(),
 			outputCoinType: cointype.CoinTypeVAR,
 			shouldInclude:  false,
-			description:    "SKA-1 filter should exclude VAR outputs",
+			description:    "SKA1 filter should exclude VAR outputs",
 		},
 	}
 
@@ -126,10 +126,10 @@ func TestCoinTypeIsolation(t *testing.T) {
 
 	testOutputs := []*TransactionOutput{
 		createTestTransactionOutput(1e8, cointype.CoinTypeVAR, 100), // VAR
-		createTestTransactionOutput(2e8, cointype.CoinType(1), 100), // SKA-1
-		createTestTransactionOutput(3e8, cointype.CoinType(2), 100), // SKA-2
+		createTestTransactionOutput(2e8, cointype.CoinType(1), 100), // SKA1
+		createTestTransactionOutput(3e8, cointype.CoinType(2), 100), // SKA2
 		createTestTransactionOutput(4e8, cointype.CoinTypeVAR, 100), // VAR
-		createTestTransactionOutput(5e8, cointype.CoinType(1), 100), // SKA-1
+		createTestTransactionOutput(5e8, cointype.CoinType(1), 100), // SKA1
 	}
 
 	// Test filtering by VAR
@@ -151,30 +151,30 @@ func TestCoinTypeIsolation(t *testing.T) {
 		}
 	}
 
-	// Test filtering by SKA-1
+	// Test filtering by SKA1
 	ska1Filter := cointype.CoinType(1)
 	ska1Outputs := filterOutputsByCoinType(testOutputs, &ska1Filter)
 	if len(ska1Outputs) != 2 {
-		t.Errorf("Expected 2 SKA-1 outputs, got %d", len(ska1Outputs))
+		t.Errorf("Expected 2 SKA1 outputs, got %d", len(ska1Outputs))
 	}
 
-	// Verify SKA-1 output values
+	// Verify SKA1 output values
 	expectedSKA1Values := []int64{2e8, 5e8}
 	for i, output := range ska1Outputs {
 		if output.Output.Value != expectedSKA1Values[i] {
-			t.Errorf("SKA-1 output %d: expected value %d, got %d",
+			t.Errorf("SKA1 output %d: expected value %d, got %d",
 				i, expectedSKA1Values[i], output.Output.Value)
 		}
 		if output.Output.CoinType != cointype.CoinType(1) {
-			t.Errorf("SKA-1 output %d: wrong coin type %v", i, output.Output.CoinType)
+			t.Errorf("SKA1 output %d: wrong coin type %v", i, output.Output.CoinType)
 		}
 	}
 
-	// Test filtering by SKA-2
+	// Test filtering by SKA2
 	ska2Filter := cointype.CoinType(2)
 	ska2Outputs := filterOutputsByCoinType(testOutputs, &ska2Filter)
 	if len(ska2Outputs) != 1 {
-		t.Errorf("Expected 1 SKA-2 output, got %d", len(ska2Outputs))
+		t.Errorf("Expected 1 SKA2 output, got %d", len(ska2Outputs))
 	}
 }
 
@@ -201,8 +201,8 @@ func TestInputStructCoinType(t *testing.T) {
 		value    int64
 	}{
 		{"VAR input", cointype.CoinTypeVAR, 1e8},
-		{"SKA-1 input", cointype.CoinType(1), 2e8},
-		{"SKA-255 input", cointype.CoinType(255), 3e8},
+		{"SKA1 input", cointype.CoinType(1), 2e8},
+		{"SKA255 input", cointype.CoinType(255), 3e8},
 	}
 
 	for _, tc := range testCases {
@@ -257,19 +257,19 @@ func TestMixedCoinTypeDetection(t *testing.T) {
 			description: "All VAR should not be considered mixed",
 		},
 		{
-			name:        "All SKA-1",
+			name:        "All SKA1",
 			coinTypes:   []cointype.CoinType{cointype.CoinType(1), cointype.CoinType(1), cointype.CoinType(1)},
 			expectMixed: false,
 			description: "All same SKA type should not be considered mixed",
 		},
 		{
-			name:        "VAR and SKA-1",
+			name:        "VAR and SKA1",
 			coinTypes:   []cointype.CoinType{cointype.CoinTypeVAR, cointype.CoinType(1)},
 			expectMixed: true,
 			description: "VAR and SKA should be considered mixed",
 		},
 		{
-			name:        "SKA-1 and SKA-2",
+			name:        "SKA1 and SKA2",
 			coinTypes:   []cointype.CoinType{cointype.CoinType(1), cointype.CoinType(2)},
 			expectMixed: true,
 			description: "Different SKA types should be considered mixed",
@@ -323,9 +323,9 @@ func TestUTXOSelectionByCoinType(t *testing.T) {
 	}{
 		{1e8, cointype.CoinTypeVAR}, // 1 VAR
 		{2e8, cointype.CoinTypeVAR}, // 2 VAR
-		{3e8, cointype.CoinType(1)}, // 3 SKA-1
-		{4e8, cointype.CoinType(1)}, // 4 SKA-1
-		{5e8, cointype.CoinType(2)}, // 5 SKA-2
+		{3e8, cointype.CoinType(1)}, // 3 SKA1
+		{4e8, cointype.CoinType(1)}, // 4 SKA1
+		{5e8, cointype.CoinType(2)}, // 5 SKA2
 	}
 
 	// Test VAR selection
@@ -351,15 +351,15 @@ func TestUTXOSelectionByCoinType(t *testing.T) {
 		}
 	}
 
-	// Test SKA-1 selection
+	// Test SKA1 selection
 	ska1Targets := []dcrutil.Amount{3e8, 6e8, 7e8}
 	for _, target := range ska1Targets {
 		selected := selectUTXOsByCoinType(utxos, target, cointype.CoinType(1))
 
-		// Verify all selected UTXOs are SKA-1
+		// Verify all selected UTXOs are SKA1
 		for _, utxo := range selected {
 			if utxo.coinType != cointype.CoinType(1) {
-				t.Errorf("Selected non-SKA-1 UTXO in SKA-1 selection: %v", utxo.coinType)
+				t.Errorf("Selected non-SKA1 UTXO in SKA1 selection: %v", utxo.coinType)
 			}
 		}
 
@@ -369,8 +369,8 @@ func TestUTXOSelectionByCoinType(t *testing.T) {
 			totalSelected += utxo.value
 		}
 
-		if target <= 7e8 && totalSelected < target { // 7e8 is max SKA-1 available
-			t.Errorf("SKA-1 selection didn't meet target: selected %v, target %v", totalSelected, target)
+		if target <= 7e8 && totalSelected < target { // 7e8 is max SKA1 available
+			t.Errorf("SKA1 selection didn't meet target: selected %v, target %v", totalSelected, target)
 		}
 	}
 }
@@ -430,7 +430,7 @@ func TestOutputSelectionPolicyValidation(t *testing.T) {
 			description: "Standard SKA policy should be valid",
 		},
 		{
-			name: "Valid SKA-255 policy",
+			name: "Valid SKA255 policy",
 			policy: OutputSelectionPolicy{
 				Account:               0,
 				RequiredConfirmations: 1,

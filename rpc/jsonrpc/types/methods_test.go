@@ -1155,6 +1155,46 @@ func TestWalletSvrCmds(t *testing.T) {
 			},
 		},
 		{
+			// SKA inputs MAY assert their atom value via skaValueIn so the
+			// wallet can populate tx.TxIn.SKAValueIn before signing when the
+			// raw tx hex was built without the V13 wire-format extension
+			// fields. The field is optional and JSON-tag-omitempty so legacy
+			// VAR callers continue to round-trip unchanged.
+			name: "signrawtransaction with skaValueIn",
+			newCmd: func() (any, error) {
+				return dcrjson.NewCmd(Method("signrawtransaction"), "001122",
+					`[{"txid":"123","vout":1,"tree":0,"scriptPubKey":"00","redeemScript":"01","skaValueIn":"1.234567890123456789"}]`)
+			},
+			staticCmd: func() any {
+				ska := "1.234567890123456789"
+				txInputs := []RawTxInput{
+					{
+						Txid:         "123",
+						Vout:         1,
+						ScriptPubKey: "00",
+						RedeemScript: "01",
+						SKAValueIn:   &ska,
+					},
+				}
+				return NewSignRawTransactionCmd("001122", &txInputs, nil, nil)
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"signrawtransaction","params":["001122",[{"txid":"123","vout":1,"tree":0,"scriptPubKey":"00","redeemScript":"01","skaValueIn":"1.234567890123456789"}]],"id":1}`,
+			unmarshalled: &SignRawTransactionCmd{
+				RawTx: "001122",
+				Inputs: &[]RawTxInput{
+					{
+						Txid:         "123",
+						Vout:         1,
+						ScriptPubKey: "00",
+						RedeemScript: "01",
+						SKAValueIn:   func(s string) *string { return &s }("1.234567890123456789"),
+					},
+				},
+				PrivKeys: nil,
+				Flags:    dcrjson.String("ALL"),
+			},
+		},
+		{
 			name: "sweepaccount - optionals provided",
 			newCmd: func() (any, error) {
 				return dcrjson.NewCmd(Method("sweepaccount"), "default", "DsUZxxoHJSty8DCfwfartwTYbuhmVct7tJu", 6, 0.05)

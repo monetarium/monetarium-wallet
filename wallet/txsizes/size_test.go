@@ -1,9 +1,11 @@
 package txsizes_test
 
 import (
+	"bytes"
 	"testing"
 
 	. "github.com/monetarium/monetarium-wallet/wallet/txsizes"
+	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/wire"
 )
 
@@ -68,6 +70,34 @@ func TestEstimateSerializeSize(t *testing.T) {
 		actualEstimate := EstimateSerializeSize(test.InputScriptSizes, outputs, test.ChangeScriptSize)
 		if actualEstimate != test.ExpectedSizeEstimate {
 			t.Errorf("Test %d: Got %v: Expected %v", i, actualEstimate, test.ExpectedSizeEstimate)
+		}
+	}
+}
+
+// TestEstimateInputSizeRoundTrip asserts that EstimateInputSize matches the
+// actual serialized size of a TxIn in the V13 wire format, including the
+// SKAValueInLen byte that is always present (0 for VAR inputs). Catches the
+// off-by-one regression where the legacy estimator forgot the SKAValueInLen
+// byte and consequently underestimated fees by 1 byte per input.
+func TestEstimateInputSizeRoundTrip(t *testing.T) {
+	scriptSizes := []int{
+		0,
+		1,
+		RedeemP2PKHSigScriptSize,
+		RedeemP2SHSigScriptSize,
+		0xfc,
+		0xfd, // varint discriminant boundary
+		0x100,
+	}
+	for _, sz := range scriptSizes {
+		sigScript := bytes.Repeat([]byte{0x01}, sz)
+		txIn := wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{}, Index: 0, Tree: 0}, 0, sigScript)
+		// Full-input wire size = prefix + witness (V13).
+		actual := txIn.SerializeSizePrefix() + txIn.SerializeSizeWitness()
+		estimated := EstimateInputSize(sz)
+		if estimated != actual {
+			t.Errorf("scriptSize=%d: EstimateInputSize=%d, actual prefix+witness=%d (delta %d)",
+				sz, estimated, actual, estimated-actual)
 		}
 	}
 }

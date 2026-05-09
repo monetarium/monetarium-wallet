@@ -14,7 +14,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime/trace"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,6 +113,11 @@ func NewServer(ctx context.Context, opts *Options, activeNet *chaincfg.Params, w
 			// Timeout connections which don't complete the initial
 			// handshake within the allowed timeframe.
 			ReadTimeout: time.Second * rpcAuthTimeoutSeconds,
+			// Cap response time and idle keep-alive to prevent slow-loris on
+			// writes and to release file descriptors held by abandoned
+			// keep-alive sockets.
+			WriteTimeout: 30 * time.Second,
+			IdleTimeout:  60 * time.Second,
 		},
 		walletLoader: walletLoader,
 		cfg:          *opts,
@@ -118,8 +125,22 @@ func NewServer(ctx context.Context, opts *Options, activeNet *chaincfg.Params, w
 		// A hash of the HTTP basic auth string is used for a constant
 		// time comparison.
 		upgrader: websocket.Upgrader{
-			// Allow all origins.
-			CheckOrigin: func(r *http.Request) bool { return true },
+			// Reject cross-origin browser upgrades. Non-browser clients (no
+			// Origin header) are allowed; browser clients must originate
+			// from the same Host the request hit. This blocks DNS-rebinding
+			// and trivial CSRF against a wallet daemon whose listen address
+			// happens to be reachable by a malicious page.
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					return true
+				}
+				u, err := url.Parse(origin)
+				if err != nil {
+					return false
+				}
+				return strings.EqualFold(u.Host, r.Host)
+			},
 		},
 		quit:                make(chan struct{}),
 		requestShutdownChan: make(chan struct{}, 1),

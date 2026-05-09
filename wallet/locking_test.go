@@ -27,7 +27,9 @@ func TestLocking(t *testing.T) {
 	}
 	for _, test := range tests {
 		test(ctx, t, w)
-		w.Lock()
+		if err := w.Lock(); err != nil {
+			t.Fatalf("Lock returned error: %v", err)
+		}
 	}
 }
 
@@ -45,7 +47,9 @@ func testUnlock(ctx context.Context, t *testing.T, w *Wallet) {
 	}
 	completedLock := make(chan struct{})
 	go func() {
-		w.Lock()
+		if err := w.Lock(); err != nil {
+			t.Errorf("Lock returned error: %v", err)
+		}
 		completedLock <- struct{}{}
 	}()
 	time.Sleep(100 * time.Millisecond)

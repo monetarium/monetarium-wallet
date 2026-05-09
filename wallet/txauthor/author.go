@@ -71,6 +71,24 @@ type ChangeSource interface {
 	ScriptSize() int
 }
 
+// nopChangeSource is a ChangeSource that produces no script. It is suitable
+// for callers that have arranged for the inputs to sum to an exact target so
+// no change output is ever required.
+type nopChangeSource struct{}
+
+func (nopChangeSource) Script() ([]byte, uint16, error) { return nil, 0, nil }
+func (nopChangeSource) ScriptSize() int                  { return 0 }
+
+// NewNopChangeSource returns a ChangeSource that never produces a change
+// script. Pass it to NewUnsignedTransaction or NewUnsignedSweepTransaction
+// when the caller knows no change output is needed (for example,
+// exact-amount sends where the inputs sum to amount + fee).
+func NewNopChangeSource() ChangeSource { return nopChangeSource{} }
+
+// sumOutputValues sums the int64 Value field across outputs. VAR-only by
+// construction: SKA outputs carry their value in SKAValue and have Value=0,
+// so the int64 sum returned here is intentionally zero on the SKA path.
+// Callers must dispatch on coin type and use sumSKAOutputValues for SKA.
 func sumOutputValues(outputs []*wire.TxOut) (totalOutput dcrutil.Amount) {
 	for _, txOut := range outputs {
 		totalOutput += dcrutil.Amount(txOut.Value)
@@ -100,9 +118,9 @@ func sumSKAOutputValues(outputs []*wire.TxOut) cointype.SKAAmount {
 // If any remaining output value can be returned to the wallet via a change
 // output without violating mempool dust rules, a P2PKH change output is
 // appended to the transaction outputs.  Since the change output may not be
-// necessary, fetchChange is called zero or one times to generate this script.
-// This function must return a P2PKH script or smaller, otherwise fee estimation
-// will be incorrect.
+// necessary, fetchChange.Script is called zero or one times to generate this
+// script. This function must return a P2PKH script or smaller, otherwise fee
+// estimation will be incorrect.
 //
 // If successful, the transaction, total input value spent, and all previous
 // output scripts are returned.  If the input source was unable to provide
@@ -111,10 +129,56 @@ func sumSKAOutputValues(outputs []*wire.TxOut) cointype.SKAAmount {
 func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmount,
 	fetchInputs InputSource, fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
 
+	coinType := cointype.CoinTypeVAR
+	if len(outputs) > 0 {
+		coinType = outputs[0].CoinType
+		// All outputs in a single transaction must share the same coin
+		// type; the node rejects mixed-coin transactions. Enforce here so
+		// CLI tools that author transactions outside the wallet (e.g.
+		// sweepaccount, movefunds) cannot bypass the wallet-level check
+		// in validateAuthoredCoinTypes.
+		for i := 1; i < len(outputs); i++ {
+			if outputs[i].CoinType != coinType {
+				return nil, errors.E(errors.Invalid, errors.Errorf(
+					"all outputs must share the same coin type: outputs[0]=%d, outputs[%d]=%d",
+					coinType, i, outputs[i].CoinType))
+			}
+		}
+	}
+	return newUnsignedTransaction(coinType, outputs, relayFeePerKb,
+		fetchInputs, fetchChange, maxTxSize)
+}
+
+// NewUnsignedSweepTransaction creates an unsigned transaction with no
+// non-change outputs of its own; the entire input value (minus fee) is
+// returned to the change output. The coin type is supplied explicitly so the
+// SKA fee/dust paths are taken even though the outputs slice is empty.
+//
+// fetchInputs is expected to return every spendable UTXO of the requested
+// coin type in a single call (sweep semantics); standard incremental input
+// sources will not produce a useful sweep tx.
+//
+// fetchChange must be a real change source whose Script produces the sweep
+// destination — passing NewNopChangeSource here would produce a tx with no
+// outputs.
+func NewUnsignedSweepTransaction(coinType cointype.CoinType,
+	relayFeePerKb cointype.SKAAmount, fetchInputs InputSource,
+	fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
+	return newUnsignedTransaction(coinType, nil, relayFeePerKb,
+		fetchInputs, fetchChange, maxTxSize)
+}
+
+// newUnsignedTransaction is the shared implementation for
+// NewUnsignedTransaction and NewUnsignedSweepTransaction. coinType is taken
+// as an explicit parameter so empty-outputs sweeps still take the SKA paths
+// for fee/dust/change construction.
+func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
+	relayFeePerKb cointype.SKAAmount, fetchInputs InputSource,
+	fetchChange ChangeSource, maxTxSize int) (*AuthoredTx, error) {
+
 	const op errors.Op = "txauthor.NewUnsignedTransaction"
 
-	// Determine if this is an SKA transaction
-	isSKA := len(outputs) > 0 && outputs[0].CoinType.IsSKA()
+	isSKA := coinType.IsSKA()
 
 	// For SKA, use big.Int amounts; for VAR, use int64
 	targetAmount := sumOutputValues(outputs)
@@ -124,11 +188,14 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmo
 	}
 
 	scriptSizes := []int{txsizes.RedeemP2PKHSigScriptSize}
-	changeScript, changeScriptVersion, err := fetchChange.Script()
-	if err != nil {
-		return nil, errors.E(op, err)
+	// ScriptSize is cheap (no key derivation) and is needed up front for
+	// fee estimation. The actual change script is fetched lazily inside
+	// the hasChange branch below, so callers that never need change pay
+	// no key-derivation cost.
+	var changeScriptSize int
+	if fetchChange != nil {
+		changeScriptSize = fetchChange.ScriptSize()
 	}
-	changeScriptSize := fetchChange.ScriptSize()
 	var maxSignedSize int
 	if isSKA {
 		maxSignedSize = txsizes.EstimateSerializeSizeSKA(scriptSizes, outputs, changeScriptSize)
@@ -136,28 +203,39 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmo
 		maxSignedSize = txsizes.EstimateSerializeSize(scriptSizes, outputs, changeScriptSize)
 	}
 
-	// Calculate initial fee for transaction size estimation using SKAAmount (big.Int)
-	// SKA emission transactions have zero fees, all other transactions use normal fees
+	// Calculate initial fee for transaction size estimation using SKAAmount (big.Int).
+	// SKA emission transactions have zero fees, but emission detection requires
+	// the populated TxIn (the SKA marker lives in TxIn[0].SignatureScript), so
+	// the determination only happens once inputs are fetched in the loop below.
+	// The first iteration may overshoot the input target if this turns out to
+	// be an emission tx; the loop's re-compute branch corrects it.
 	targetFeeSKA := txrules.FeeForSerializeSizeSKA(relayFeePerKb, maxSignedSize)
 
-	// Check if this is an SKA emission transaction (need to create temp tx to check)
-	tempTx := &wire.MsgTx{
-		SerType: wire.TxSerializeFull,
-		Version: generatedTxVersion,
-		TxOut:   outputs,
-	}
-	if wire.IsSKAEmissionTransaction(tempTx) {
-		targetFeeSKA = cointype.Zero() // SKA emission transactions have zero fees
-	}
-
-	// Convert to dcrutil.Amount for VAR compatibility (VAR fees always fit in int64)
+	// Convert to dcrutil.Amount for VAR compatibility. VAR fees always fit
+	// in int64 in normal operation; defensively check the SKAAmount→int64
+	// conversion so a misconfigured per-coin-type relay fee produces a clear
+	// error instead of silently miscomputed change.
 	targetFee := dcrutil.Amount(0)
 	if !isSKA {
-		targetFeeInt64, _ := targetFeeSKA.Int64()
+		targetFeeInt64, err := targetFeeSKA.Int64()
+		if err != nil {
+			return nil, errors.E(op, errors.Invalid,
+				"fee overflow: configured VAR relay fee rate produces a fee that exceeds int64")
+		}
 		targetFee = dcrutil.Amount(targetFeeInt64)
 	}
 
-	for {
+	// Cap the grow-fee loop so a non-monotonic fetchInputs (returning
+	// increasing-but-still-insufficient inputs across iterations) cannot
+	// spin forever. In practice the loop converges in <=3 iterations; 32 is
+	// generous safety margin without masking real input-source bugs.
+	const maxFeeGrowIterations = 32
+	for iter := 0; ; iter++ {
+		if iter >= maxFeeGrowIterations {
+			return nil, errors.E(op, errors.Invalid, errors.Errorf(
+				"fee-grow loop exceeded %d iterations — input source is non-monotonic",
+				maxFeeGrowIterations))
+		}
 		// Pass the coin-type-appropriate target. For VAR the big.Int
 		// target is Zero so the input source only stops on int64 target;
 		// for SKA the int64 target is 0 so the input source only stops on
@@ -212,9 +290,17 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmo
 			maxRequiredFeeSKA = cointype.Zero() // SKA emission transactions have zero fees
 		}
 
-		// Convert SKAAmount fee to dcrutil.Amount for VAR transactions
-		maxRequiredFeeInt64, _ := maxRequiredFeeSKA.Int64()
-		maxRequiredFee := dcrutil.Amount(maxRequiredFeeInt64)
+		// Convert SKAAmount fee to dcrutil.Amount for VAR transactions.
+		// Defensively check the conversion (see targetFee block above).
+		var maxRequiredFee dcrutil.Amount
+		if !isSKA {
+			maxRequiredFeeInt64, err := maxRequiredFeeSKA.Int64()
+			if err != nil {
+				return nil, errors.E(op, errors.Invalid,
+					"fee overflow: configured VAR relay fee rate produces a per-tx fee that exceeds int64")
+			}
+			maxRequiredFee = dcrutil.Amount(maxRequiredFeeInt64)
+		}
 
 		// Check remaining amount covers fees
 		if isSKA {
@@ -259,30 +345,49 @@ func NewUnsignedTransaction(outputs []*wire.TxOut, relayFeePerKb cointype.SKAAmo
 		// Check if change output should be added
 		var hasChange bool
 		if isSKA {
-			// For SKA, minimum 30 atoms to avoid dust (28 atoms is minimal transfer fee)
+			// For SKA, minimum 30 atoms to avoid dust (28 atoms is minimal transfer fee).
+			// TODO: Make MinSKADustAmount per-coin-type configurable via chaincfg.SKACoinConfig
+			// if different SKA denominations require different dust thresholds.
 			hasChange = !changeSKAAmount.IsNegative() && changeSKAAmount.BigInt().Cmp(cointype.MinSKADustAmount) >= 0
 		} else {
-			// For VAR, use dust check with fee rate converted to dcrutil.Amount
-			dustFeeRateInt64, _ := relayFeePerKb.Int64()
+			// For VAR, use dust check with fee rate converted to dcrutil.Amount.
+			// Defensively guard the int64 conversion (see targetFee block above).
+			dustFeeRateInt64, err := relayFeePerKb.Int64()
+			if err != nil {
+				return nil, errors.E(op, errors.Invalid,
+					"fee overflow: configured VAR relay fee rate exceeds int64 in dust check")
+			}
 			hasChange = changeAmount != 0 && !txrules.IsDustAmount(changeAmount, changeScriptSize, dcrutil.Amount(dustFeeRateInt64))
 		}
 
 		if hasChange {
+			if fetchChange == nil {
+				return nil, errors.E(op, errors.Invalid,
+					"change source required when change output would be created")
+			}
+			changeScript, changeScriptVersion, err := fetchChange.Script()
+			if err != nil {
+				return nil, errors.E(op, err)
+			}
 			if len(changeScript) > txscript.MaxScriptElementSize {
 				return nil, errors.E(errors.Invalid, "script size exceed maximum bytes "+
 					"pushable to the stack")
 			}
-
-			// Set the coin type for the change output to match the transaction
-			var changeCoinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR
-			if len(outputs) > 0 {
-				changeCoinType = outputs[0].CoinType
+			// Defense in depth against a future ChangeSource whose actual
+			// script is larger than the size its ScriptSize() declared at
+			// fee-estimation time. Fees were estimated using
+			// `changeScriptSize` above; if the real script is wider, the
+			// fee is silently underestimated. Fail loud here instead.
+			if len(changeScript) > changeScriptSize {
+				return nil, errors.E(errors.Invalid, errors.Errorf(
+					"txauthor: change script size %d exceeds estimator-declared %d; "+
+						"fee underestimated", len(changeScript), changeScriptSize))
 			}
 
 			change := &wire.TxOut{
 				Version:  changeScriptVersion,
 				PkScript: changeScript,
-				CoinType: changeCoinType,
+				CoinType: coinType,
 			}
 
 			// Set value based on coin type

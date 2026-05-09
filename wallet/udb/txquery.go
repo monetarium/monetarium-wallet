@@ -156,7 +156,10 @@ func (s *Store) unminedTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash,
 			ct := fetchRawCreditCoinType(v)
 			var skaAmt cointype.SKAAmount
 			if ct.IsSKA() {
-				skaAmt = fetchSKACreditAmount(ns, credKey)
+				skaAmt, err = fetchSKACreditAmount(ns, credKey)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			details.Debits = append(details.Debits, DebitRecord{
@@ -180,7 +183,10 @@ func (s *Store) unminedTxDetails(ns walletdb.ReadBucket, txHash *chainhash.Hash,
 		ct := fetchRawUnminedCreditCoinType(v)
 		var skaAmt cointype.SKAAmount
 		if ct.IsSKA() {
-			skaAmt = fetchSKAUnminedCreditAmount(ns, opKey)
+			skaAmt, err = fetchSKAUnminedCreditAmount(ns, opKey)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		details.Debits = append(details.Debits, DebitRecord{

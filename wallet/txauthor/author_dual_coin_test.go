@@ -118,9 +118,9 @@ func TestVARTransactionCreation(t *testing.T) {
 func TestSKATransactionCreation(t *testing.T) {
 	// Test different SKA coin types
 	skaTypes := []cointype.CoinType{
-		cointype.CoinType(1),   // SKA-1
-		cointype.CoinType(2),   // SKA-2
-		cointype.CoinType(255), // SKA-255
+		cointype.CoinType(1),   // SKA1
+		cointype.CoinType(2),   // SKA2
+		cointype.CoinType(255), // SKA255
 	}
 
 	for _, coinType := range skaTypes {
@@ -167,7 +167,7 @@ func TestMixedCoinRejection(t *testing.T) {
 	// Create mixed outputs (VAR + SKA)
 	mixedOutputs := []*wire.TxOut{
 		{Value: 1e6, CoinType: cointype.CoinTypeVAR},
-		{Value: 1e6, CoinType: cointype.CoinType(1)}, // SKA-1
+		{Value: 1e6, CoinType: cointype.CoinType(1)}, // SKA1
 	}
 
 	// Create inputs
@@ -193,8 +193,8 @@ func TestDualCoinChangeOutput(t *testing.T) {
 		coinType cointype.CoinType
 	}{
 		{"VAR change", cointype.CoinTypeVAR},
-		{"SKA-1 change", cointype.CoinType(1)},
-		{"SKA-2 change", cointype.CoinType(2)},
+		{"SKA1 change", cointype.CoinType(1)},
+		{"SKA2 change", cointype.CoinType(2)},
 	}
 
 	for _, tc := range testCases {

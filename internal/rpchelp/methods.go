@@ -130,7 +130,6 @@ var Methods = []struct {
 	{"tspendpolicy", []any{(*[]types.TSpendPolicyResult)(nil), (*types.TSpendPolicyResult)(nil)}},
 	{"unlockaccount", nil},
 	{"validateaddress", []any{(*types.ValidateAddressWalletResult)(nil)}},
-	{"validatepredcp0005cf", returnsBool},
 	{"verifymessage", returnsBool},
 	{"version", []any{(*map[string]dcrdtypes.VersionResult)(nil)}},
 	{"walletinfo", []any{(*types.WalletInfoResult)(nil)}},

@@ -119,8 +119,6 @@ func (s *Syncer) cfiltersV2FromNodes(ctx context.Context, nodes []*wallet.BlockN
 		return nil
 	}
 
-	cnet := s.wallet.ChainParams().Net
-
 	// Split fetching into batches of a max size.
 	const cfilterBatchSize = wire.MaxCFiltersV2PerBatch
 	if len(nodes) > cfilterBatchSize {
@@ -200,7 +198,7 @@ nextTry:
 		}
 
 		for i := range nodes {
-			err = validate.CFilterV2HeaderCommitment(cnet, nodes[i].Header,
+			err = validate.CFilterV2HeaderCommitment(nodes[i].Header,
 				filters[i].Filter, filters[i].ProofIndex, filters[i].Proof)
 			if err != nil {
 				errMsg := fmt.Sprintf("CFilter for block %v (height %d) "+

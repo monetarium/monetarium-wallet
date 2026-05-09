@@ -39,8 +39,8 @@ func TestCreditCoinType(t *testing.T) {
 		want     cointype.CoinType
 	}{
 		{"VAR coin (default)", cointype.CoinTypeVAR, cointype.CoinTypeVAR},
-		{"SKA-1 coin", cointype.CoinType(1), cointype.CoinType(1)},
-		{"SKA-255 coin", cointype.CoinType(255), cointype.CoinType(255)},
+		{"SKA1 coin", cointype.CoinType(1), cointype.CoinType(1)},
+		{"SKA255 coin", cointype.CoinType(255), cointype.CoinType(255)},
 	}
 
 	for _, tt := range tests {
@@ -69,9 +69,9 @@ func TestCreditSerialization(t *testing.T) {
 		coinType cointype.CoinType
 	}{
 		{"VAR serialization", cointype.CoinTypeVAR},
-		{"SKA-1 serialization", cointype.CoinType(1)},
-		{"SKA-100 serialization", cointype.CoinType(100)},
-		{"SKA-255 serialization", cointype.CoinType(255)},
+		{"SKA1 serialization", cointype.CoinType(1)},
+		{"SKA100 serialization", cointype.CoinType(100)},
+		{"SKA255 serialization", cointype.CoinType(255)},
 	}
 
 	for _, tt := range tests {

@@ -1,6 +1,7 @@
 {
-    "txfee": 10000000, 
+    "txfee": "0.0001",
     "sendtoaddress": "Ssgymtv6sjYPVEE6mwkbYJz1HzPicKpLCwc",
     "network": "simnet",
-    "dcrctlargs": "--wallet"
+    "monctlargs": "--wallet",
+    "cointype": 0
 }

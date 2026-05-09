@@ -25,16 +25,24 @@ import (
 )
 
 // ProvideSeed is used to prompt for the wallet seed which maybe required during
-// upgrades.
+// upgrades. Reads via term.ReadPassword so the seed is not echoed and the
+// returned bytes can be zeroed by the caller — bufio.Reader.ReadString returns
+// an immutable string that lingers on the heap until GC.
 func ProvideSeed() ([]byte, error) {
-	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("Enter existing wallet seed: ")
-		seedStr, err := reader.ReadString('\n')
+		seedBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 		if err != nil {
 			return nil, err
 		}
-		seedStr = strings.TrimSpace(strings.ToLower(seedStr))
+		fmt.Print("\n")
+		seedStr := strings.TrimSpace(strings.ToLower(string(seedBytes)))
+		// Zero the raw input buffer immediately; the trimmed/lowercased
+		// string copy is unavoidable but at least the original buffer
+		// is not retained.
+		for i := range seedBytes {
+			seedBytes[i] = 0
+		}
 
 		seed, err := hex.DecodeString(seedStr)
 		if err != nil || len(seed) < hdkeychain.MinSeedBytes ||

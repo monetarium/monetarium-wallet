@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"expvar"
 	"fmt"
 	"math/big"
 	"runtime"
@@ -36,7 +37,6 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
-	"github.com/monetarium/monetarium-node/crypto/blake256"
 	"github.com/monetarium/monetarium-node/dcrec"
 	"github.com/monetarium/monetarium-node/dcrec/secp256k1"
 	"github.com/monetarium/monetarium-node/dcrec/secp256k1/ecdsa"
@@ -97,6 +97,51 @@ type outpoint struct {
 	index uint32
 }
 
+// recentlyPublishedEntry tracks the metadata needed to decide when a
+// recently-published tx hash can be evicted from the in-memory map without
+// waiting for a chain-attach notification.
+type recentlyPublishedEntry struct {
+	// insertedHeight is the wallet's best-block height at the time the
+	// tx was published.  Used as a fallback expiry for txs that don't
+	// set wire.MsgTx.Expiry (Expiry == 0 means the tx never expires
+	// from a consensus perspective).
+	insertedHeight int32
+	// txExpiry mirrors wire.MsgTx.Expiry — the block height at and after
+	// which the network will reject the tx.  Zero means no expiry was set.
+	txExpiry uint32
+}
+
+// recentlyPublishedFallbackBlocks is the maximum number of attached blocks
+// we'll let an entry sit in recentlyPublished without confirmation before
+// evicting it.  Roughly 24h on mainnet at 5-min blocks.  Evicting too eagerly
+// risks redundantly processing a tx that's still propagating; too lazily
+// leaks memory for txs that never confirm.
+const recentlyPublishedFallbackBlocks = 288
+
+// markRecentlyPublished records that the wallet has just broadcast txHash.
+// Callers must hold w.recentlyPublishedMu.  insertedHeight is the wallet's
+// current best-block height; txExpiry is the wire.MsgTx.Expiry field
+// (0 when no expiry was set).
+func (w *Wallet) markRecentlyPublishedLocked(txHash chainhash.Hash, insertedHeight int32, txExpiry uint32) {
+	w.recentlyPublished[txHash] = recentlyPublishedEntry{
+		insertedHeight: insertedHeight,
+		txExpiry:       txExpiry,
+	}
+}
+
+// sweepRecentlyPublishedLocked evicts entries whose tx has either expired
+// (currentHeight >= txExpiry) or has aged past the fallback window.
+// Callers must hold w.recentlyPublishedMu.
+func (w *Wallet) sweepRecentlyPublishedLocked(currentHeight int32) {
+	for hash, entry := range w.recentlyPublished {
+		expired := entry.txExpiry != 0 && currentHeight >= int32(entry.txExpiry)
+		stale := currentHeight-entry.insertedHeight > recentlyPublishedFallbackBlocks
+		if expired || stale {
+			delete(w.recentlyPublished, hash)
+		}
+	}
+}
+
 // Wallet is a structure containing all the components for a
 // complete wallet.  It contains the Armory-style key store
 // addresses and keys),
@@ -144,12 +189,35 @@ type Wallet struct {
 	// Per-cointype fee management (manual overrides + static fallbacks)
 	// Uses SKAAmount (big.Int) to support both VAR and SKA coins
 	manualFees map[cointype.CoinType]*cointype.SKAAmount // nil = use RPC
-	staticFees map[cointype.CoinType]cointype.SKAAmount  // config fallback
+	// staticFees uses *SKAAmount (not the value type) so an explicitly-zero
+	// configured fee is distinguishable from "no fee configured for this
+	// coin type". A present-but-zero static fee is a legitimate testnet
+	// configuration and must not be silently overridden by the chainparams
+	// MinRelayTxFee fallback.
+	staticFees map[cointype.CoinType]*cointype.SKAAmount // config fallback; nil ptr = unset
 	feesMu     sync.RWMutex
 
-	allowHighFees              bool
-	disableCoinTypeUpgrades    bool
-	recentlyPublished          map[chainhash.Hash]struct{}
+	// loggedNoRelayFee deduplicates the "No relay fee configured" log line
+	// in RelayFeeForCoinType: emit once per coin type per process so a
+	// sustained misconfig (e.g. an SKA coin activated without a relay fee
+	// in chainparams) does not flood logs at the rate the wallet builds
+	// transactions. Keys are cointype.CoinType, values are unused.
+	loggedNoRelayFee sync.Map
+
+	// loggedRelayFeeOverflow deduplicates the int64-overflow error log in
+	// RelayFee(): emit once per distinct overflowing fee value so the
+	// operator sees the misconfiguration without log flooding. Keys are
+	// the offending decimal string, values are unused.
+	loggedRelayFeeOverflow sync.Map
+
+	allowHighFees           bool
+	disableCoinTypeUpgrades bool
+	// recentlyPublished tracks tx hashes the wallet has just broadcast so
+	// notifications about the same tx coming back from the network as
+	// "new" don't double-process it.  Entries are deleted on chain attach
+	// (the canonical happy path) and otherwise garbage-collected by
+	// expiry / age — see sweepRecentlyPublishedLocked.
+	recentlyPublished          map[chainhash.Hash]recentlyPublishedEntry
 	recentlyPublishedMu        sync.Mutex
 	logRescannedTransactions   bool
 	logRescannedTransactionsMu sync.Mutex
@@ -235,8 +303,13 @@ func (w *Wallet) FetchOutput(ctx context.Context, outPoint *wire.OutPoint) (*wir
 			return err
 		}
 
+		if int(outPoint.Index) >= len(outTx.TxOut) {
+			return errors.E(errors.Invalid,
+				errors.Errorf("output index %d out of range for tx %v (has %d outputs)",
+					outPoint.Index, outPoint.Hash, len(outTx.TxOut)))
+		}
 		out = outTx.TxOut[outPoint.Index]
-		return err
+		return nil
 	})
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -1007,6 +1080,13 @@ func (w *Wallet) VSPMaxFee() dcrutil.Amount {
 // RelayFee returns the current minimum relay fee (per kB of serialized
 // transaction) used when constructing transactions.
 // This method uses the 3-tier priority system (manual > RPC > static).
+//
+// Overflow fallback: if the configured effective VAR fee exceeds int64 (a
+// misconfiguration; legitimate VAR fees fit comfortably below int64.MaxValue
+// atoms), this method falls back to the legacy w.relayFee field, increments
+// the monetarium_wallet_var_relay_fee_overflow_total expvar counter, and
+// emits one ERROR-level log per distinct fee value. Operators should monitor
+// that counter to detect the misconfiguration.
 func (w *Wallet) RelayFee() dcrutil.Amount {
 	fee, _, err := w.GetEffectiveFee(context.Background(), cointype.CoinTypeVAR)
 	if err != nil {
@@ -1016,8 +1096,49 @@ func (w *Wallet) RelayFee() dcrutil.Amount {
 		w.relayFeeMu.Unlock()
 		return relayFee
 	}
-	feeInt64, _ := fee.Int64()
+	feeInt64, convErr := fee.Int64()
+	if convErr != nil {
+		feeStr := fee.String()
+		if _, loaded := w.loggedRelayFeeOverflow.LoadOrStore(feeStr, struct{}{}); !loaded {
+			log.Errorf("VAR relay fee %s exceeds int64 (%v); falling back to "+
+				"static legacy fee. This is a misconfiguration: a VAR fee must fit "+
+				"in int64 (max ~9.2e18 atoms).", feeStr, convErr)
+		}
+		// Bump a process-wide counter so monitoring (scraping
+		// /debug/vars) can alert on the condition. The dedup'd log
+		// line above is otherwise the only signal.
+		varRelayFeeOverflow().Add(1)
+		w.relayFeeMu.Lock()
+		relayFee := w.relayFee
+		w.relayFeeMu.Unlock()
+		return relayFee
+	}
 	return dcrutil.Amount(feeInt64)
+}
+
+// varRelayFeeOverflowCount counts the number of times RelayFee() observed a
+// configured VAR fee that overflows int64 and fell back to the legacy static
+// fee. Exposed via expvar at /debug/vars so monitoring can alert on the
+// misconfiguration. Lazily registered via sync.Once so test binaries that
+// import this package multiple times (or recompile under `go test -count=N`
+// without process reuse) don't panic on duplicate expvar registration.
+var (
+	varRelayFeeOverflowOnce  sync.Once
+	varRelayFeeOverflowCount *expvar.Int
+)
+
+func varRelayFeeOverflow() *expvar.Int {
+	varRelayFeeOverflowOnce.Do(func() {
+		const name = "monetarium_wallet_var_relay_fee_overflow_total"
+		if v := expvar.Get(name); v != nil {
+			if i, ok := v.(*expvar.Int); ok {
+				varRelayFeeOverflowCount = i
+				return
+			}
+		}
+		varRelayFeeOverflowCount = expvar.NewInt(name)
+	})
+	return varRelayFeeOverflowCount
 }
 
 // SetRelayFee sets a new minimum relay fee (per kB of serialized
@@ -1028,19 +1149,31 @@ func (w *Wallet) SetRelayFee(relayFee dcrutil.Amount) {
 	w.relayFee = relayFee
 	w.relayFeeMu.Unlock()
 
-	// Also update static fee map for the new fee system
+	// Also update static fee map for the new fee system. Capture by pointer
+	// so a present-but-zero entry is distinguishable from "unset".
+	fee := cointype.SKAAmountFromInt64(int64(relayFee))
 	w.feesMu.Lock()
-	w.staticFees[cointype.CoinTypeVAR] = cointype.SKAAmountFromInt64(int64(relayFee))
+	w.staticFees[cointype.CoinTypeVAR] = &fee
 	w.feesMu.Unlock()
 }
 
 // SKARelayFee returns the current minimum relay fee (per kB of serialized
 // transaction) used when constructing SKA transactions.
 // This method uses the 3-tier priority system (manual > RPC > static).
-// Returns fee for the first active SKA coin type as SKAAmount (big.Int) for full precision.
+// Returns the fee for the lowest-numbered active SKA coin type as SKAAmount
+// (big.Int) for full precision. Callers that need a per-coin-type fee should
+// use RelayFeeForCoinType — this method is provided for compatibility with
+// older code paths that assumed a single SKA coin.
 func (w *Wallet) SKARelayFee() cointype.SKAAmount {
-	// Get first active SKA coin type from chain params
-	for ct, config := range w.chainParams.SKACoins {
+	// Sort coin types ascending so the result is deterministic when more
+	// than one SKA coin is active (Go map iteration is randomized).
+	cts := make([]cointype.CoinType, 0, len(w.chainParams.SKACoins))
+	for ct := range w.chainParams.SKACoins {
+		cts = append(cts, ct)
+	}
+	sort.Slice(cts, func(i, j int) bool { return cts[i] < cts[j] })
+	for _, ct := range cts {
+		config := w.chainParams.SKACoins[ct]
 		if config != nil && config.Active {
 			fee, _, err := w.GetEffectiveFee(context.Background(), ct)
 			if err != nil {
@@ -1048,20 +1181,28 @@ func (w *Wallet) SKARelayFee() cointype.SKAAmount {
 				w.feesMu.RLock()
 				staticFee, ok := w.staticFees[ct]
 				w.feesMu.RUnlock()
-				if ok {
-					return staticFee
+				if ok && staticFee != nil {
+					return *staticFee
 				}
 				return cointype.Zero()
 			}
 			return fee
 		}
 	}
-	// Fallback if no active SKA coins - return first SKA static fee or zero
+	// Fallback if no active SKA coins - return the lowest-numbered SKA
+	// static fee or zero.
 	w.feesMu.RLock()
 	defer w.feesMu.RUnlock()
-	for ct, fee := range w.staticFees {
+	staticCTs := make([]cointype.CoinType, 0, len(w.staticFees))
+	for ct := range w.staticFees {
 		if ct != cointype.CoinTypeVAR {
-			return fee
+			staticCTs = append(staticCTs, ct)
+		}
+	}
+	sort.Slice(staticCTs, func(i, j int) bool { return staticCTs[i] < staticCTs[j] })
+	for _, ct := range staticCTs {
+		if fee := w.staticFees[ct]; fee != nil {
+			return *fee
 		}
 	}
 	return cointype.Zero()
@@ -1075,17 +1216,26 @@ func (w *Wallet) SetSKARelayFee(fee cointype.SKAAmount) {
 	w.feesMu.Lock()
 	defer w.feesMu.Unlock()
 
+	// Allocate a fresh *SKAAmount per coin type rather than sharing a
+	// single pointer across map entries. SKAAmount is a struct wrapping
+	// *big.Int, so a plain `perCoin := fee` value-copy still aliases the
+	// inner pointer; defensive-copy the underlying big.Int via fee.BigInt()
+	// (which returns a fresh copy) so a future caller mutating one entry's
+	// big.Int through unsafe/reflection access cannot silently corrupt
+	// every coin type's fee.
 	if w.chainParams != nil && w.chainParams.SKACoins != nil {
 		for ct, config := range w.chainParams.SKACoins {
 			if config != nil && config.Active {
-				w.staticFees[ct] = fee
+				perCoin := cointype.NewSKAAmount(fee.BigInt())
+				w.staticFees[ct] = &perCoin
 			}
 		}
 	} else {
-		// Fallback: update only existing SKA coin types in the map
+		// Fallback: update only existing SKA coin types in the map.
 		for ct := range w.staticFees {
 			if ct != cointype.CoinTypeVAR {
-				w.staticFees[ct] = fee
+				perCoin := cointype.NewSKAAmount(fee.BigInt())
+				w.staticFees[ct] = &perCoin
 			}
 		}
 	}
@@ -1094,20 +1244,53 @@ func (w *Wallet) SetSKARelayFee(fee cointype.SKAAmount) {
 // SetManualFee sets a manual fee override for the specified coin type.
 // This fee takes priority over RPC-queried dynamic fees.
 // Uses SKAAmount (big.Int) to support both VAR and SKA coins.
-func (w *Wallet) SetManualFee(ct cointype.CoinType, fee cointype.SKAAmount) {
+//
+// Returns an error tagged errors.Invalid if ct is VAR and fee does not fit
+// in int64, or if ct is an SKA coin that is not active or not configured for
+// the active network. The SKA write is scoped to the requested coin type
+// only — earlier code fanned out across every active SKA coin which silently
+// retuned the relay fee for unrelated coins.
+func (w *Wallet) SetManualFee(ct cointype.CoinType, fee cointype.SKAAmount) error {
+	if ct == cointype.CoinTypeVAR {
+		// Validate the int64 conversion BEFORE persisting the override so
+		// a rejected fee leaves wallet state untouched.
+		feeInt64, err := fee.Int64()
+		if err != nil {
+			return errors.E(errors.Invalid,
+				errors.Errorf("manual VAR fee %s exceeds int64: %v", fee.String(), err))
+		}
+		relayFee := dcrutil.Amount(feeInt64)
+		staticFee := cointype.SKAAmountFromInt64(int64(relayFee))
+		// Hold both mutexes for the whole multi-field update so concurrent
+		// readers cannot observe a manualFees-set / relayFee-stale window.
+		// Lock order: relayFeeMu before feesMu — these mutexes are never
+		// held together elsewhere, so this is the canonical ordering.
+		w.relayFeeMu.Lock()
+		w.feesMu.Lock()
+		w.manualFees[ct] = &fee
+		w.staticFees[cointype.CoinTypeVAR] = &staticFee
+		w.relayFee = relayFee
+		w.feesMu.Unlock()
+		w.relayFeeMu.Unlock()
+		return nil
+	}
+
+	// SKA: scope the manual-fee write to the requested coin type only.
+	// Validate that the coin is configured and active before taking the lock
+	// so a rejected request leaves wallet state untouched.
+	if w.chainParams != nil && w.chainParams.SKACoins != nil {
+		cfg := w.chainParams.SKACoins[ct]
+		if cfg == nil || !cfg.Active {
+			return errors.E(errors.Invalid,
+				errors.Errorf("SKA coin type %d is not active or not configured", ct))
+		}
+	}
+	perCoin := cointype.NewSKAAmount(fee.BigInt())
 	w.feesMu.Lock()
 	w.manualFees[ct] = &fee
+	w.staticFees[ct] = &perCoin
 	w.feesMu.Unlock()
-
-	// Also update legacy fields for backward compatibility
-	if ct == cointype.CoinTypeVAR {
-		// VAR still uses int64-based relayFee, convert with truncation for overflow
-		feeInt64, _ := fee.Int64()
-		w.SetRelayFee(dcrutil.Amount(feeInt64))
-	} else {
-		// SKA uses SKAAmount directly for full big.Int precision
-		w.SetSKARelayFee(fee)
-	}
+	return nil
 }
 
 // ClearManualFee removes manual fee override for the specified coin type,
@@ -1141,46 +1324,81 @@ func (w *Wallet) queryDynamicFee(ctx context.Context, ct cointype.CoinType) (coi
 }
 
 // GetEffectiveFee returns the fee that will actually be used for transactions.
-// Priority: manual override > RPC dynamic fee > static config fee
-// Returns the fee amount as SKAAmount (big.Int), source ("manual", "rpc", or "static"), and any error.
+// Priority: manual override > RPC dynamic fee > static config fee.
+// Returns the fee amount as SKAAmount (big.Int), the source ("manual", "rpc",
+// or "static"), and any error.
+//
+// Zero-valued configured fees at any layer are treated as unset and the next
+// fallback is consulted. This aligns with consensus reality: only SKA emission
+// transactions (which build with fee=0 directly, never going through this
+// path) are allowed to be zero-fee — every other transaction is rejected by
+// the node if it pays zero fee. If no source yields a positive fee an error
+// is returned.
 func (w *Wallet) GetEffectiveFee(ctx context.Context, ct cointype.CoinType) (cointype.SKAAmount, string, error) {
 	w.feesMu.RLock()
 	manual := w.manualFees[ct]
 	static, hasStatic := w.staticFees[ct]
 	w.feesMu.RUnlock()
 
-	// Priority 1: Manual override
-	if manual != nil {
+	// Priority 1: Manual override (positive only).
+	if manual != nil && !manual.IsZero() {
 		return *manual, "manual", nil
 	}
 
-	// Priority 2: RPC dynamic fee
-	if fee, err := w.queryDynamicFee(ctx, ct); err == nil {
+	// Priority 2: RPC dynamic fee (positive only).
+	if fee, err := w.queryDynamicFee(ctx, ct); err == nil && !fee.IsZero() {
 		return fee, "rpc", nil
 	}
 
-	// Priority 3: Static fallback
-	if hasStatic {
-		return static, "static", nil
+	// Priority 3: Static fallback (positive only).
+	if hasStatic && static != nil && !static.IsZero() {
+		return *static, "static", nil
 	}
 
-	return cointype.Zero(), "static", errors.Errorf("no fee configured for coin type %d", ct)
+	return cointype.Zero(), "static", errors.Errorf("no positive fee configured for coin type %d", ct)
 }
 
-// RelayFeeForCoinType returns the effective relay fee for the specified coin type.
-// This method queries dynamic fees from dcrd by default, unless manually overridden.
-// Returns cointype.SKAAmount (big.Int) for full precision with both VAR and SKA.
-// Callers needing dcrutil.Amount for VAR should use fee.Int64() to convert.
+// RelayFeeForCoinType returns the effective relay fee for the specified coin
+// type. Returns cointype.SKAAmount (big.Int) for full precision with both
+// VAR and SKA. Callers needing dcrutil.Amount for VAR should use fee.Int64()
+// to convert.
+//
+// Resolution order: GetEffectiveFee (which already filters out zero values
+// at every layer) → wallet staticFees map → chainParams.SKACoins[ct].
+// MinRelayTxFee (covers SKA coins activated after wallet startup, when
+// staticFees was seeded). If every source is unset or zero, an error is
+// logged loudly and zero is returned — callers building txs with a zero fee
+// will be rejected by the node, except SKA emission transactions which build
+// fee=0 explicitly without consulting this function.
 func (w *Wallet) RelayFeeForCoinType(ctx context.Context, ct cointype.CoinType) cointype.SKAAmount {
-	fee, _, err := w.GetEffectiveFee(ctx, ct)
-	if err != nil {
+	if fee, _, err := w.GetEffectiveFee(ctx, ct); err == nil {
+		return fee
+	} else {
 		log.Warnf("Failed to get effective fee for coin type %d: %v", ct, err)
-		w.feesMu.RLock()
-		static := w.staticFees[ct]
-		w.feesMu.RUnlock()
-		return static
 	}
-	return fee
+
+	w.feesMu.RLock()
+	static, ok := w.staticFees[ct]
+	w.feesMu.RUnlock()
+	if ok && static != nil && !static.IsZero() {
+		return *static
+	}
+
+	// Late-activated SKA coin: staticFees only seeds active coins at startup,
+	// so a coin that became active afterwards (e.g. emission window opened
+	// mid-session) won't be in the map. Read directly from chainparams.
+	if ct.IsSKA() && w.chainParams != nil && w.chainParams.SKACoins != nil {
+		if cfg, ok := w.chainParams.SKACoins[ct]; ok && cfg != nil &&
+			cfg.MinRelayTxFee != nil && cfg.MinRelayTxFee.Sign() > 0 {
+			return cointype.NewSKAAmount(cfg.MinRelayTxFee)
+		}
+	}
+
+	if _, loaded := w.loggedNoRelayFee.LoadOrStore(ct, struct{}{}); !loaded {
+		log.Errorf("No relay fee configured for coin type %d; "+
+			"transactions for this coin type will be refused", ct)
+	}
+	return cointype.Zero()
 }
 
 // InitialHeight is the wallet's tip height prior to syncing with the network.
@@ -1788,7 +2006,7 @@ func (w *Wallet) fetchMissingCFilters(ctx context.Context, n NetworkBackend, pro
 				if err != nil {
 					return err
 				}
-				err = validate.CFilterV2HeaderCommitment(w.chainParams.Net,
+				err = validate.CFilterV2HeaderCommitment(
 					header, cf.Filter, cf.ProofIndex, cf.Proof)
 				if err != nil {
 					return err
@@ -2074,7 +2292,7 @@ func (w *Wallet) PurchaseTickets(ctx context.Context, n NetworkBackend,
 		return nil, err
 	}
 	version, script := addr.(Address).PaymentScript()
-	a.outputs = append(a.outputs, &wire.TxOut{Version: version, PkScript: script})
+	a.outputs = append(a.outputs, &wire.TxOut{Version: version, PkScript: script, CoinType: cointype.CoinTypeVAR})
 	txsize := txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHInputSize},
 		a.outputs, txsizes.P2PKHPkScriptSize)
 	txfee := txrules.FeeForSerializeSize(relayFee, txsize)
@@ -2141,7 +2359,9 @@ func (w *Wallet) Unlock(ctx context.Context, passphrase []byte, timeout <-chan t
 	case errors.Is(err, errors.WatchingOnly):
 		return errors.E(op, err)
 	case errors.Is(err, errors.Passphrase):
-		w.Lock()
+		if lockErr := w.Lock(); lockErr != nil {
+			log.Errorf("relock after bad passphrase failed: %v", lockErr)
+		}
 		if !wasLocked {
 			log.Info("The wallet has been locked due to an incorrect passphrase.")
 		}
@@ -2243,8 +2463,11 @@ func (w *Wallet) replacePassphraseTimeout(wasLocked bool, newTimeout <-chan time
 			go func() {
 				select {
 				case <-newTimeout:
-					w.Lock()
-					log.Info("The wallet has been locked due to timeout.")
+					if err := w.Lock(); err != nil {
+						log.Errorf("timeout-driven wallet lock failed: %v", err)
+					} else {
+						log.Info("The wallet has been locked due to timeout.")
+					}
 				case <-newCancel:
 					<-newTimeout
 				}
@@ -2260,13 +2483,26 @@ func (w *Wallet) replacePassphraseTimeout(wasLocked bool, newTimeout <-chan time
 }
 
 // Lock locks the wallet's address manager.
-func (w *Wallet) Lock() {
+//
+// Returns an error if the underlying address manager fails to lock for an I/O
+// reason — callers that depend on the relock guarantee (the per-call
+// passphrase capability gate in jsonrpc.withWalletPassphraseGate, and any
+// operator-driven walletlock RPC) must surface the failure rather than
+// silently leaving the wallet unlocked. The manager's "already locked"
+// signal is intentionally absorbed: the caller's post-condition is satisfied.
+// passphraseTimeoutCancel is cleared regardless so a subsequent Unlock does
+// not observe a stale watchdog.
+func (w *Wallet) Lock() error {
 	w.passphraseUsedMu.Lock()
 	w.passphraseTimeoutMu.Lock()
-	_ = w.manager.Lock()
+	err := w.manager.Lock()
 	w.passphraseTimeoutCancel = nil
 	w.passphraseTimeoutMu.Unlock()
 	w.passphraseUsedMu.Unlock()
+	if err != nil && !errors.Is(err, errors.Locked) {
+		return errors.E(errors.IO, err)
+	}
+	return nil
 }
 
 // Locked returns whether the account manager for a wallet is locked.
@@ -2496,7 +2732,7 @@ func (w *Wallet) TotalBalanceByCoinType(ctx context.Context, coinType cointype.C
 // Example:
 //
 //	activeCoins, err := wallet.ListCoinTypes(ctx, 1)
-//	// Result might be: [0, 1, 5] representing VAR, SKA-1, and SKA-5
+//	// Result might be: [0, 1, 5] representing VAR, SKA1, and SKA5
 func (w *Wallet) ListCoinTypes(ctx context.Context, confirms int32) ([]cointype.CoinType, error) {
 	const op errors.Op = "wallet.ListCoinTypes"
 
@@ -3050,7 +3286,15 @@ func recvCategory(details *udb.TxDetails, syncHeight int32, chainParams *chaincf
 // for a listtransactions RPC.
 //
 // TODO: This should be moved to the jsonrpc package.
-func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.Manager, syncHeight int32, net *chaincfg.Params) (sends, receives []types.ListTransactionsResult) {
+func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.Manager, syncHeight int32, net *chaincfg.Params) (sends, receives []types.ListTransactionsResult, err error) {
+	// Defense-in-depth: consensus rejects mixed-coin-type transactions, but
+	// a malformed tx that reached txStore via SPV rescan or addtransaction
+	// must not silently mis-report balance. Refuse to aggregate.
+	if err := txrules.ValidateCoinTypeUniformity(details.MsgTx.TxOut); err != nil {
+		return nil, nil, errors.E(errors.Invalid,
+			fmt.Errorf("stored transaction %s has mixed coin types: %w",
+				details.Hash, err))
+	}
 	addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 
 	var (
@@ -3083,17 +3327,15 @@ func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.M
 		txTypeStr = types.LTTTRegular // Intentionally mapped to Regular for RPC compatibility
 	}
 
-	// Determine coin type from transaction outputs for proper amount conversion
-	var txCoinType cointype.CoinType
-	for _, output := range details.MsgTx.TxOut {
-		if output.CoinType.IsSKA() {
-			txCoinType = output.CoinType
-			break
-		}
-	}
+	// Determine coin type from transaction outputs for proper amount conversion.
+	// Use the canonical GetCoinTypeFromOutputs helper for consistency with
+	// notifications.go and the RPC handlers (consensus rejects mixed-coin
+	// txs, so the first output is authoritative).
+	txCoinType := txrules.GetCoinTypeFromOutputs(details.MsgTx.TxOut)
 	isSKA := txCoinType.IsSKA()
 
-	// Get atomsPerCoin for proper conversion (big.Int for SKA full precision)
+	// Get atomsPerCoin for proper conversion (big.Int for both VAR and SKA so
+	// the renderer can call cointype.AtomsToDecimalString uniformly).
 	var atomsPerCoin *big.Int
 	if isSKA {
 		if config, ok := net.SKACoins[txCoinType]; ok && config.AtomsPerCoin != nil {
@@ -3101,12 +3343,13 @@ func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.M
 		} else {
 			atomsPerCoin = cointype.AtomsPerSKACoin
 		}
+	} else {
+		atomsPerCoin = big.NewInt(cointype.AtomsPerVAR)
 	}
 
-	// Fee can only be determined if every input is a debit.
-	// Use interface{} for SKA (string) vs VAR (float64)
-	var feeValue interface{}
-	var feeF64 float64
+	// Fee can only be determined if every input is a debit. Encoded as a
+	// decimal coin string for both VAR and SKA per the unified API contract.
+	var feeValue string
 	if len(details.Debits) == len(details.MsgTx.TxIn) {
 		var debitTotal dcrutil.Amount
 		var skaDebitTotal cointype.SKAAmount
@@ -3121,8 +3364,15 @@ func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.M
 		var outputTotal dcrutil.Amount
 		var skaOutputTotal cointype.SKAAmount
 		for _, output := range details.MsgTx.TxOut {
-			if isSKA && output.SKAValue != nil {
-				skaOutputTotal = skaOutputTotal.Add(cointype.NewSKAAmount(output.SKAValue))
+			if isSKA {
+				// CoinType→Value/SKAValue is mutually exclusive at the
+				// consensus layer, so a nil SKAValue on an SKA-tagged
+				// output is malformed; treat as zero atoms rather than
+				// silently mis-attributing as VAR (which would skew the
+				// rendered fee by output.Value, normally 0).
+				if output.SKAValue != nil {
+					skaOutputTotal = skaOutputTotal.Add(cointype.NewSKAAmount(output.SKAValue))
+				}
 			} else {
 				outputTotal += dcrutil.Amount(output.Value)
 			}
@@ -3135,8 +3385,8 @@ func listTransactions(tx walletdb.ReadTx, details *udb.TxDetails, addrMgr *udb.M
 			skaFee := skaOutputTotal.Sub(skaDebitTotal)
 			feeValue = skaFee.ToDecimalString(atomsPerCoin)
 		} else {
-			feeF64 = (outputTotal - debitTotal).ToCoin()
-			feeValue = &feeF64
+			feeAtoms := big.NewInt(int64(outputTotal - debitTotal))
+			feeValue = cointype.AtomsToDecimalString(feeAtoms, atomsPerCoin)
 		}
 	}
 
@@ -3169,18 +3419,26 @@ outputs:
 			}
 		}
 
-		// Calculate amount with proper conversion for coin type
-		// Use interface{} for SKA (string) vs VAR (float64)
-		var amountValue interface{}
-		var negAmountValue interface{}
-		if isSKA && output.SKAValue != nil {
-			skaAmount := cointype.NewSKAAmount(output.SKAValue)
+		// Calculate amount with proper conversion for coin type. Both VAR
+		// and SKA emit decimal coin strings via cointype.AtomsToDecimalString,
+		// preserving full precision and matching the unified API contract.
+		var amountValue string
+		var negAmountValue string
+		if isSKA {
+			// Treat nil SKAValue as zero atoms — see fee-loop comment
+			// above. Falling through to the VAR int64 branch would
+			// silently render a malformed SKA output as VAR.
+			skaValue := output.SKAValue
+			if skaValue == nil {
+				skaValue = new(big.Int)
+			}
+			skaAmount := cointype.NewSKAAmount(skaValue)
 			amountValue = skaAmount.ToDecimalString(atomsPerCoin)
 			negAmountValue = skaAmount.Neg().ToDecimalString(atomsPerCoin)
 		} else {
-			amountF64 := dcrutil.Amount(output.Value).ToCoin()
-			amountValue = amountF64
-			negAmountValue = -amountF64
+			amtAtoms := big.NewInt(output.Value)
+			amountValue = cointype.AtomsToDecimalString(amtAtoms, atomsPerCoin)
+			negAmountValue = cointype.AtomsToDecimalString(new(big.Int).Neg(amtAtoms), atomsPerCoin)
 		}
 		result := types.ListTransactionsResult{
 			// Fields left zeroed:
@@ -3225,11 +3483,11 @@ outputs:
 			result.Account = accountName
 			result.Category = recvCat
 			result.Amount = amountValue
-			result.Fee = nil
+			result.Fee = ""
 			receives = append(receives, result)
 		}
 	}
-	return sends, receives
+	return sends, receives, nil
 }
 
 // ListSinceBlock returns a slice of objects with details about transactions
@@ -3243,8 +3501,11 @@ func (w *Wallet) ListSinceBlock(ctx context.Context, start, end, syncHeight int3
 
 		rangeFn := func(details []udb.TxDetails) (bool, error) {
 			for _, detail := range details {
-				sends, receives := listTransactions(tx, &detail,
+				sends, receives, err := listTransactions(tx, &detail,
 					w.manager, syncHeight, w.chainParams)
+				if err != nil {
+					return false, err
+				}
 				txList = append(txList, receives...)
 				txList = append(txList, sends...)
 			}
@@ -3292,8 +3553,11 @@ func (w *Wallet) ListTransactions(ctx context.Context, from, count int) ([]types
 					continue
 				}
 
-				sends, receives := listTransactions(dbtx, &details[i],
+				sends, receives, err := listTransactions(dbtx, &details[i],
 					w.manager, tipHeight, w.chainParams)
+				if err != nil {
+					return false, err
+				}
 				txList = append(txList, sends...)
 				txList = append(txList, receives...)
 
@@ -3346,8 +3610,11 @@ func (w *Wallet) ListAddressTransactions(ctx context.Context, pkHashes map[strin
 						continue
 					}
 
-					sends, receives := listTransactions(dbtx, detail,
+					sends, receives, err := listTransactions(dbtx, detail,
 						w.manager, tipHeight, w.chainParams)
+					if err != nil {
+						return false, err
+					}
 					txList = append(txList, receives...)
 					txList = append(txList, sends...)
 					continue loopDetails
@@ -3384,8 +3651,11 @@ func (w *Wallet) ListAllTransactions(ctx context.Context) ([]types.ListTransacti
 			// transactions in the reverse order they were marked
 			// mined.
 			for i := len(details) - 1; i >= 0; i-- {
-				sends, receives := listTransactions(dbtx, &details[i],
+				sends, receives, err := listTransactions(dbtx, &details[i],
 					w.manager, tipHeight, w.chainParams)
+				if err != nil {
+					return false, err
+				}
 				txList = append(txList, sends...)
 				txList = append(txList, receives...)
 			}
@@ -3423,7 +3693,10 @@ func (w *Wallet) ListTransactionDetails(ctx context.Context, txHash *chainhash.H
 		if err != nil {
 			return err
 		}
-		sends, receives := listTransactions(dbtx, txd, w.manager, tipHeight, w.chainParams)
+		sends, receives, err := listTransactions(dbtx, txd, w.manager, tipHeight, w.chainParams)
+		if err != nil {
+			return err
+		}
 		txList = make([]types.ListTransactionsResult, 0, len(sends)+len(receives))
 		txList = append(txList, receives...)
 		txList = append(txList, sends...)
@@ -4064,9 +4337,17 @@ type AccountProperties struct {
 }
 
 // AccountResult is a single account result for the AccountsResult type.
+//
+// TotalBalance is VAR atoms only (int64). SKA balances are reported per coin
+// type in SKATotalBalances (map keyed by SKA coin type 1-255, values are
+// big.Int atoms). VAR atoms (1e8/coin) and SKA atoms (1e18/coin) are not
+// summable into a single int64 — mixing them silently truncates SKA values
+// and conflates per-coin units, which is why they are exposed as separate
+// fields.
 type AccountResult struct {
 	AccountProperties
-	TotalBalance dcrutil.Amount
+	TotalBalance     dcrutil.Amount
+	SKATotalBalances map[cointype.CoinType]cointype.SKAAmount
 }
 
 // AccountsResult is the resutl of the wallet's Accounts method.  See that
@@ -4116,22 +4397,23 @@ func (w *Wallet) Accounts(ctx context.Context) (*AccountsResult, error) {
 		addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
 
 		tipHash, tipHeight = w.txStore.MainChainTip(dbtx)
-		// Get unspent outputs for active coin types only
-		var unspent []*udb.Credit
-		for _, ct := range w.getActiveCoinTypes() {
-			outputs, err := w.txStore.UnspentOutputs(dbtx, ct)
-			if err != nil {
-				return err
-			}
-			unspent = append(unspent, outputs...)
+		// AccountResult.TotalBalance is VAR-only (see the type godoc). Filter
+		// the unspent set to VAR so SKA outputs cannot leak into the int64
+		// aggregation below — VAR atoms (1e8/coin) and SKA atoms (1e18/coin)
+		// are not summable. SKA per-coin-type balances are aggregated below
+		// into AccountResult.SKATotalBalances using the same unspent-set walk.
+		unspent, err := w.txStore.UnspentOutputs(dbtx, cointype.CoinTypeVAR)
+		if err != nil {
+			return err
 		}
-		err := w.manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
+		err = w.manager.ForEachAccount(addrmgrNs, func(acct uint32) error {
 			props, err := w.manager.AccountProperties(addrmgrNs, acct)
 			if err != nil {
 				return err
 			}
 			accounts = append(accounts, AccountResult{
 				AccountProperties: *props,
+				SKATotalBalances:  make(map[cointype.CoinType]cointype.SKAAmount),
 				// TotalBalance set below
 			})
 			return nil
@@ -4140,9 +4422,11 @@ func (w *Wallet) Accounts(ctx context.Context) (*AccountsResult, error) {
 			return err
 		}
 		m := make(map[uint32]*dcrutil.Amount)
+		skaMaps := make(map[uint32]map[cointype.CoinType]cointype.SKAAmount)
 		for i := range accounts {
 			a := &accounts[i]
 			m[a.AccountNumber] = &a.TotalBalance
+			skaMaps[a.AccountNumber] = a.SKATotalBalances
 		}
 		for i := range unspent {
 			output := unspent[i]
@@ -4155,6 +4439,41 @@ func (w *Wallet) Accounts(ctx context.Context) (*AccountsResult, error) {
 				amt, ok := m[outputAcct]
 				if ok {
 					*amt += output.Amount
+				}
+			}
+		}
+
+		// Aggregate SKA balances per active coin type, mirroring the VAR walk
+		// above so semantics (which UTXOs are counted) are identical by
+		// construction. Only configured SKA coin types are walked.
+		if w.chainParams != nil && w.chainParams.SKACoins != nil {
+			for ct, cfg := range w.chainParams.SKACoins {
+				if cfg == nil {
+					continue
+				}
+				skaUnspent, err := w.txStore.UnspentOutputs(dbtx, ct)
+				if err != nil {
+					return err
+				}
+				for i := range skaUnspent {
+					output := skaUnspent[i]
+					_, addrs := stdscript.ExtractAddrs(scriptVersionAssumed, output.PkScript, w.chainParams)
+					if len(addrs) == 0 {
+						continue
+					}
+					outputAcct, err := w.manager.AddrAccount(addrmgrNs, addrs[0])
+					if err != nil {
+						continue
+					}
+					sm, ok := skaMaps[outputAcct]
+					if !ok {
+						continue
+					}
+					prev, exists := sm[ct]
+					if !exists {
+						prev = cointype.Zero()
+					}
+					sm[ct] = prev.Add(output.SKAAmount)
 				}
 			}
 		}
@@ -4210,9 +4529,11 @@ func (s creditSlice) Swap(i, j int) {
 // ListUnspent returns a slice of objects representing the unspent wallet
 // transactions fitting the given criteria. The confirmations will be more than
 // minconf, less than maxconf and if addresses is populated only the addresses
-// contained within it will be considered.  If we know nothing about a
-// transaction an empty array will be returned.
-func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addresses map[string]struct{}, accountName string) ([]*types.ListUnspentResult, error) {
+// contained within it will be considered. If coinTypeFilter is non-nil, only
+// UTXOs of that coin type are read from the per-coin-type bucket — avoiding
+// the O(VAR_utxos + SKA_utxos) scan when the caller only wants one coin type.
+// If we know nothing about a transaction an empty array will be returned.
+func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addresses map[string]struct{}, accountName string, coinTypeFilter *cointype.CoinType) ([]*types.ListUnspentResult, error) {
 	const op errors.Op = "wallet.ListUnspent"
 	var results []*types.ListUnspentResult
 	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
@@ -4222,9 +4543,16 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 		_, tipHeight := w.txStore.MainChainTip(dbtx)
 
 		filter := len(addresses) != 0
-		// Get unspent outputs for active coin types only
+		// Get unspent outputs from the requested coin-type bucket (or every
+		// active coin type's bucket if no filter is supplied).
+		var coinTypes []cointype.CoinType
+		if coinTypeFilter != nil {
+			coinTypes = []cointype.CoinType{*coinTypeFilter}
+		} else {
+			coinTypes = w.getActiveCoinTypes()
+		}
 		var unspent []*udb.Credit
-		for _, ct := range w.getActiveCoinTypes() {
+		for _, ct := range coinTypes {
 			outputs, err := w.txStore.UnspentOutputs(dbtx, ct)
 			if err != nil {
 				return err
@@ -4385,22 +4713,6 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 			// regardless of detected script type.
 			spendable = spendable && len(addrs) > 0
 
-			// Calculate amount based on coin type
-			// VAR: use float64, SKA: use string for full precision
-			var amount interface{}
-			if output.CoinType.IsSKA() {
-				// Get AtomsPerCoin for this SKA type
-				var atomsPerCoin *big.Int = cointype.AtomsPerSKACoin
-				if config, ok := w.chainParams.SKACoins[output.CoinType]; ok && config.AtomsPerCoin != nil {
-					atomsPerCoin = config.AtomsPerCoin
-				}
-				// Use SKAAmount (big.Int) for SKA coins to handle large values
-				amount = output.SKAAmount.ToDecimalString(atomsPerCoin)
-			} else {
-				// VAR: use float64
-				amount = float64(output.Amount) / cointype.AtomsPerVAR
-			}
-
 			result := &types.ListUnspentResult{
 				TxID:          output.OutPoint.Hash.String(),
 				Vout:          output.OutPoint.Index,
@@ -4409,10 +4721,28 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 				ScriptPubKey:  hex.EncodeToString(output.PkScript),
 				RedeemScript:  hex.EncodeToString(redeemScript),
 				TxType:        int(details.TxType),
-				Amount:        amount,
 				Confirmations: int64(confs),
 				Spendable:     spendable,
 				CoinType:      uint8(output.CoinType), // Dual-coin support: include coin type
+			}
+			// Format Amount as a decimal coin string for both VAR and SKA,
+			// against the coin type's atomsPerCoin scale. See ListUnspentResult
+			// godoc for the wire contract.
+			if output.CoinType.IsSKA() {
+				// Defensive-copy to avoid sharing the package-level
+				// cointype.AtomsPerSKACoin pointer or the chainparams
+				// pointer through the local — ToDecimalString does not
+				// mutate today, but future readers should not be able to
+				// corrupt shared state through this alias.
+				atomsPerCoin := cointype.GetAtomsPerSKACoin()
+				if config, ok := w.chainParams.SKACoins[output.CoinType]; ok && config.AtomsPerCoin != nil {
+					atomsPerCoin = new(big.Int).Set(config.AtomsPerCoin)
+				}
+				result.Amount = output.SKAAmount.ToDecimalString(atomsPerCoin)
+			} else {
+				result.Amount = cointype.AtomsToDecimalString(
+					big.NewInt(int64(output.Amount)),
+					big.NewInt(cointype.AtomsPerVAR))
 			}
 
 			// BUG: this should be a JSON array so that all
@@ -5283,15 +5613,20 @@ func (w *Wallet) TotalReceivedForAccounts(ctx context.Context, minConf int32) ([
 }
 
 // TotalReceivedForAddr iterates through a wallet's transaction history,
-// returning the total amount of decred received for a single wallet
-// address, optionally filtered by coin type (defaults to VAR/0).
+// returning the total amount of VAR received for a single wallet address.
+// SKA credits are not aggregated here because their atom amounts can exceed
+// int64 capacity; callers needing the SKA total must use
+// TotalReceivedSKAForAddr.
+//
+// Passing a SKA coin type via the variadic argument is rejected; this
+// function is VAR-only by contract.
 func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address, minConf int32, coinType ...cointype.CoinType) (dcrutil.Amount, error) {
 	const op errors.Op = "wallet.TotalReceivedForAddr"
 
-	// Default to VAR (coin type 0) if no coin type specified
-	filterCoinType := cointype.CoinTypeVAR
-	if len(coinType) > 0 {
-		filterCoinType = coinType[0]
+	if len(coinType) > 0 && coinType[0].IsSKA() {
+		return 0, errors.E(op, errors.Invalid, errors.Errorf(
+			"TotalReceivedForAddr is VAR-only; use TotalReceivedSKAForAddr for SKA coin type %d",
+			coinType[0]))
 	}
 
 	var amount dcrutil.Amount
@@ -5312,8 +5647,8 @@ func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address,
 				detail := &details[i]
 				for _, cred := range detail.Credits {
 					txOut := detail.MsgTx.TxOut[cred.Index]
-					// Check if this output matches the requested coin type
-					if txOut.CoinType != filterCoinType {
+					// VAR-only path: skip any non-VAR credit.
+					if txOut.CoinType != cointype.CoinTypeVAR {
 						continue
 					}
 					pkVersion := txOut.Version
@@ -5335,6 +5670,62 @@ func (w *Wallet) TotalReceivedForAddr(ctx context.Context, addr stdaddr.Address,
 		return 0, errors.E(op, err)
 	}
 	return amount, nil
+}
+
+// TotalReceivedSKAForAddr iterates through a wallet's transaction history,
+// returning the total SKA atoms received for a single wallet address for
+// the given SKA coin type. Returns an error if a VAR coin type is passed.
+//
+// This is the SKA counterpart to TotalReceivedForAddr; SKA atoms can exceed
+// int64 capacity and are accumulated as cointype.SKAAmount (big.Int).
+func (w *Wallet) TotalReceivedSKAForAddr(ctx context.Context, addr stdaddr.Address, minConf int32, coinType cointype.CoinType) (cointype.SKAAmount, error) {
+	const op errors.Op = "wallet.TotalReceivedSKAForAddr"
+
+	if !coinType.IsSKA() {
+		return cointype.Zero(), errors.E(op, errors.Invalid, errors.Errorf(
+			"coin type %d is not SKA; use TotalReceivedForAddr for VAR", coinType))
+	}
+
+	total := cointype.Zero()
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+		_, tipHeight := w.txStore.MainChainTip(dbtx)
+		var (
+			addrStr    = addr.String()
+			stopHeight int32
+		)
+		if minConf > 0 {
+			stopHeight = tipHeight - minConf + 1
+		} else {
+			stopHeight = -1
+		}
+		rangeFn := func(details []udb.TxDetails) (bool, error) {
+			for i := range details {
+				detail := &details[i]
+				for _, cred := range detail.Credits {
+					txOut := detail.MsgTx.TxOut[cred.Index]
+					if txOut.CoinType != coinType {
+						continue
+					}
+					pkVersion := txOut.Version
+					pkScript := txOut.PkScript
+					_, addrs := stdscript.ExtractAddrs(pkVersion, pkScript, w.chainParams)
+					for _, a := range addrs {
+						if addrStr == a.String() {
+							total = total.Add(cred.SKAAmount)
+							break
+						}
+					}
+				}
+			}
+			return false, nil
+		}
+		return w.txStore.RangeTransactions(ctx, txmgrNs, 0, stopHeight, rangeFn)
+	})
+	if err != nil {
+		return cointype.Zero(), errors.E(op, err)
+	}
+	return total, nil
 }
 
 // SendOutputs creates and sends payment transactions. It returns the
@@ -5486,7 +5877,11 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 	switch addr := addr.(type) {
 	case Address:
 		vers, script := addr.PaymentScript()
-		changeOut = &wire.TxOut{PkScript: script, Version: vers}
+		changeOut = &wire.TxOut{
+			PkScript: script,
+			Version:  vers,
+			CoinType: cointype.CoinTypeVAR, // VSP fees are VAR-only
+		}
 	default:
 		return fmt.Errorf("failed to convert '%T' to wallet.Address", addr)
 	}
@@ -6005,51 +6400,6 @@ func (w *Wallet) NeedsAccountsSync(ctx context.Context) (bool, error) {
 	return needsSync, err
 }
 
-// ValidatePreDCP0005CFilters verifies that all stored cfilters prior to the
-// DCP0005 activation height are the expected ones.
-//
-// Verification is done by hashing all stored cfilter data and comparing the
-// resulting hash to a known, hardcoded hash.
-func (w *Wallet) ValidatePreDCP0005CFilters(ctx context.Context) error {
-	const op errors.Op = "wallet.ValidatePreDCP0005CFilters"
-
-	// Hardcoded activation heights for mainnet and testnet3. Simnet
-	// already follows DCP0005 rules.
-	var end *BlockIdentifier
-	switch w.chainParams.Net {
-	case wire.MainNet:
-		end = NewBlockIdentifierFromHeight(validate.DCP0005ActiveHeightMainNet - 1)
-	case wire.TestNet3:
-		end = NewBlockIdentifierFromHeight(validate.DCP0005ActiveHeightTestNet3 - 1)
-	default:
-		return errors.E(op, "The current network does not have pre-DCP0005 cfilters")
-	}
-
-	// Sum up all the cfilter data.
-	hasher := blake256.New()
-	rangeFn := func(_ chainhash.Hash, _ [gcs2.KeySize]byte, filter *gcs2.FilterV2) (bool, error) {
-		_, err := hasher.Write(filter.Bytes())
-		return false, err
-	}
-
-	err := w.RangeCFiltersV2(ctx, nil, end, rangeFn)
-	if err != nil {
-		return errors.E(op, err)
-	}
-
-	// Verify against the hardcoded hash.
-	var cfsethash chainhash.Hash
-	err = cfsethash.SetBytes(hasher.Sum(nil))
-	if err != nil {
-		return errors.E(op, err)
-	}
-	err = validate.PreDCP0005CFilterHash(w.chainParams.Net, &cfsethash)
-	if err != nil {
-		return errors.E(op, err)
-	}
-	return nil
-}
-
 // ImportCFiltersV2 imports the provided v2 cfilters starting at the specified
 // block height. Headers for all the provided filters must have already been
 // imported into the wallet, otherwise this method fails. Existing filters for
@@ -6118,10 +6468,100 @@ func (w *Wallet) ManualTickets() bool {
 	return w.manualTickets
 }
 
+// IsPowerOf10 reports whether n is a positive power of 10 (1, 10, 100, ...).
+// The decimal-string ↔ atoms conversion infers decimal places by counting
+// digits of AtomsPerCoin, which is only equivalent to log10 when the value
+// is exactly 10^k. Single source of truth so chain-params validation and
+// per-call coin parsing agree on the invariant.
+func IsPowerOf10(n *big.Int) bool {
+	if n == nil || n.Sign() <= 0 {
+		return false
+	}
+	ten := big.NewInt(10)
+	one := big.NewInt(1)
+	x := new(big.Int).Set(n)
+	rem := new(big.Int)
+	for x.Cmp(one) > 0 {
+		x.DivMod(x, ten, rem)
+		if rem.Sign() != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// validateSKAChainParams ensures every SKA coin's AtomsPerCoin is a power of
+// 10. coinsToAtomsBig (and the wallet's user-facing "decimal coin amount"
+// path) infers decimal places by counting digits, which only matches the
+// coin scale when AtomsPerCoin is exactly 10^k. Failing here is loud and
+// immediate; failing later silently truncates user funds.
+func validateSKAChainParams(params *chaincfg.Params) error {
+	if params == nil || params.SKACoins == nil {
+		return nil
+	}
+	for ct, cfg := range params.SKACoins {
+		if cfg == nil {
+			continue
+		}
+		if cfg.AtomsPerCoin == nil || cfg.AtomsPerCoin.Sign() <= 0 {
+			return errors.E(errors.Invalid,
+				errors.Errorf("SKA coin %d: AtomsPerCoin must be positive "+
+					"(chain-params invariant; set in chaincfg SKACoinConfig)", ct))
+		}
+		// AtomsPerCoin = 1 (10^0) is intentionally accepted: it represents
+		// "atoms == coins" with no fractional unit, which len("1")-1 = 0
+		// decimal places parses correctly. If a future invariant ever wants
+		// to forbid this, change the check here, not in IsPowerOf10.
+		if !IsPowerOf10(cfg.AtomsPerCoin) {
+			return errors.E(errors.Invalid,
+				errors.Errorf("SKA coin %d: AtomsPerCoin %s is not a power of 10 "+
+					"(chain-params invariant; set in chaincfg SKACoinConfig)",
+					ct, cfg.AtomsPerCoin))
+		}
+		// Enforce the worst-case-value bound used by the fee estimator
+		// (txsizes.MaxSKAValueBytes). A coin whose MaxSupply exceeds this
+		// would let a single concentrated output produce a serialized
+		// SKAValue larger than the estimator's reservation, causing fee
+		// underestimation and node rejection.
+		if cfg.MaxSupply != nil && cfg.MaxSupply.Sign() > 0 {
+			if n := len(cfg.MaxSupply.Bytes()); n > txsizes.MaxSKAValueBytes {
+				return errors.E(errors.Invalid,
+					errors.Errorf("SKA coin %d: MaxSupply %s serializes to %d bytes, "+
+						"exceeds txsizes.MaxSKAValueBytes=%d (raise the constant and "+
+						"recheck fee estimation if this coin is intentional)",
+						ct, cfg.MaxSupply, n, txsizes.MaxSKAValueBytes))
+			}
+		}
+		// Enforce sum(EmissionAmounts) <= MaxSupply at startup. The
+		// runtime check in createauthorizedemission catches this only at
+		// the moment of authorization; surfacing it here lets dev/staging
+		// fail loudly during config review instead of at first emission
+		// attempt.
+		if cfg.MaxSupply != nil && cfg.MaxSupply.Sign() > 0 && len(cfg.EmissionAmounts) > 0 {
+			emissionSum := new(big.Int)
+			for _, amt := range cfg.EmissionAmounts {
+				if amt != nil {
+					emissionSum.Add(emissionSum, amt)
+				}
+			}
+			if emissionSum.Cmp(cfg.MaxSupply) > 0 {
+				return errors.E(errors.Invalid,
+					errors.Errorf("SKA coin %d: sum(EmissionAmounts)=%s exceeds "+
+						"MaxSupply=%s (chain-params misconfiguration)",
+						ct, emissionSum, cfg.MaxSupply))
+			}
+		}
+	}
+	return nil
+}
+
 // Open loads an already-created wallet from the passed database and namespaces
 // configuration options and sets it up it according to the rest of options.
 func Open(ctx context.Context, cfg *Config) (*Wallet, error) {
 	const op errors.Op = "wallet.Open"
+	if err := validateSKAChainParams(cfg.Params); err != nil {
+		return nil, errors.E(op, err)
+	}
 	// Migrate to the unified DB if necessary.
 	db := cfg.DB.internal()
 	needsMigration, err := udb.NeedsMigration(ctx, db)
@@ -6194,7 +6634,7 @@ func Open(ctx context.Context, cfg *Config) (*Wallet, error) {
 
 		lockedOutpoints: make(map[outpoint]struct{}),
 
-		recentlyPublished: make(map[chainhash.Hash]struct{}),
+		recentlyPublished: make(map[chainhash.Hash]recentlyPublishedEntry),
 
 		addressBuffers: make(map[uint32]*bip0044AccountData),
 
@@ -6302,22 +6742,27 @@ func Open(ctx context.Context, cfg *Config) (*Wallet, error) {
 	// Amounts
 	w.relayFee = cfg.RelayFee
 
-	// Initialize per-cointype fee maps (using SKAAmount for big.Int support)
+	// Initialize per-cointype fee maps (using SKAAmount for big.Int support).
+	// staticFees uses pointer values so a present-but-zero fee is
+	// distinguishable from "unset" and is honored end-to-end.
 	w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
-	w.staticFees = make(map[cointype.CoinType]cointype.SKAAmount)
+	w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
 
 	// Set static fallback fee for VAR (coin type 0)
-	w.staticFees[cointype.CoinTypeVAR] = cointype.SKAAmountFromInt64(int64(cfg.RelayFee))
+	varFee := cointype.SKAAmountFromInt64(int64(cfg.RelayFee))
+	w.staticFees[cointype.CoinTypeVAR] = &varFee
 
 	// Set static fallback fees for each active SKA coin from chain params
 	for ct, config := range w.chainParams.SKACoins {
 		if config != nil && config.Active {
+			var skaFee cointype.SKAAmount
 			if config.MinRelayTxFee != nil && config.MinRelayTxFee.Sign() > 0 {
 				// Use NewSKAAmount to wrap the *big.Int directly (no int64 conversion)
-				w.staticFees[ct] = cointype.NewSKAAmount(config.MinRelayTxFee)
+				skaFee = cointype.NewSKAAmount(config.MinRelayTxFee)
 			} else {
-				w.staticFees[ct] = cointype.SKAAmountFromInt64(int64(cfg.RelayFee)) // fallback to VAR fee
+				skaFee = cointype.SKAAmountFromInt64(int64(cfg.RelayFee)) // fallback to VAR fee
 			}
+			w.staticFees[ct] = &skaFee
 		}
 	}
 
@@ -6651,4 +7096,52 @@ func (w *Wallet) RetrieveEmissionKey(ctx context.Context, keyName string) (*secp
 		return err
 	})
 	return privateKey, err
+}
+
+// LookupEmissionAuthRecord returns the prior tx hash, signing timestamp,
+// and existence flag for a previously authored (CoinType, Nonce) emission
+// authorization. Used by the createauthorizedemission handler to detect a
+// duplicate call before producing a second valid signed full-supply
+// emission transaction.
+func (w *Wallet) LookupEmissionAuthRecord(ctx context.Context, coinType uint8, nonce uint64) (txHash [32]byte, timestamp int64, exists bool, err error) {
+	const op errors.Op = "wallet.LookupEmissionAuthRecord"
+	err = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		ns := dbtx.ReadBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errors.E(op, errors.Invalid, "address manager namespace not found")
+		}
+		var lookupErr error
+		txHash, timestamp, exists, lookupErr = w.manager.LookupEmissionAuthRecord(ns, coinType, nonce)
+		return lookupErr
+	})
+	return txHash, timestamp, exists, err
+}
+
+// StoreEmissionAuthRecord persists a record of a successful
+// createauthorizedemission so a subsequent duplicate call (same coin type
+// and nonce) can be detected and refused before it produces a second
+// signed emission tx.
+func (w *Wallet) StoreEmissionAuthRecord(ctx context.Context, coinType uint8, nonce uint64, txHash [32]byte, timestamp int64) error {
+	const op errors.Op = "wallet.StoreEmissionAuthRecord"
+	return walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		ns := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errors.E(op, errors.Invalid, "address manager namespace not found")
+		}
+		return w.manager.StoreEmissionAuthRecord(ns, coinType, nonce, txHash, timestamp)
+	})
+}
+
+// DeleteEmissionAuthRecord removes the local guard record at (CoinType,
+// Nonce). Intended for cleanup when an authored emission is observed to
+// confirm or expire on chain.
+func (w *Wallet) DeleteEmissionAuthRecord(ctx context.Context, coinType uint8, nonce uint64) error {
+	const op errors.Op = "wallet.DeleteEmissionAuthRecord"
+	return walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		ns := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if ns == nil {
+			return errors.E(op, errors.Invalid, "address manager namespace not found")
+		}
+		return w.manager.DeleteEmissionAuthRecord(ns, coinType, nonce)
+	})
 }

@@ -55,20 +55,20 @@ func TestSSFeeTransactionNotifications(t *testing.T) {
 		description string
 	}{
 		{
-			name: "SSFee SKA-1 transaction",
+			name: "SSFee SKA1 transaction",
 			createTx: func() *wire.MsgTx {
 				return createMockSSFeeTx(cointype.CoinType(1), 3, 1000)
 			},
 			wantType:    TransactionTypeSSFee,
-			description: "SKA-1 SSFee should be identified correctly",
+			description: "SKA1 SSFee should be identified correctly",
 		},
 		{
-			name: "SSFee SKA-2 transaction",
+			name: "SSFee SKA2 transaction",
 			createTx: func() *wire.MsgTx {
 				return createMockSSFeeTx(cointype.CoinType(2), 4, 2000) // Max 4 reward outputs
 			},
 			wantType:    TransactionTypeSSFee,
-			description: "SKA-2 SSFee should be identified correctly",
+			description: "SKA2 SSFee should be identified correctly",
 		},
 		{
 			name: "SSFee with single output",

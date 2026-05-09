@@ -14,6 +14,11 @@ import (
 	"github.com/monetarium/monetarium-node/dcrutil"
 )
 
+// skaAmountPtr returns the address of an SKAAmount, captured into a fresh
+// stack slot so the pointer remains valid for the lifetime of the map entry.
+// SKAAmount is immutable, so aliasing across map entries is safe.
+func skaAmountPtr(a cointype.SKAAmount) *cointype.SKAAmount { return &a }
+
 // TestCoinTypeFeeManagementMethods tests the new SKA fee management methods
 // added to the Wallet struct.
 func TestCoinTypeFeeManagementMethods(t *testing.T) {
@@ -24,12 +29,12 @@ func TestCoinTypeFeeManagementMethods(t *testing.T) {
 		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
 			1: {
 				Active:           true,
-				MinRelayTxFee:    big.NewInt(1000), // 1000 atoms/KB for SKA-1
+				MinRelayTxFee:    big.NewInt(1000), // 1000 atoms/KB for SKA1
 				MaxFeeMultiplier: 2500,
 			},
 			2: {
 				Active:           true,
-				MinRelayTxFee:    big.NewInt(1000), // 1000 atoms/KB for SKA-2
+				MinRelayTxFee:    big.NewInt(1000), // 1000 atoms/KB for SKA2
 				MaxFeeMultiplier: 2500,
 			},
 		},
@@ -46,11 +51,11 @@ func TestCoinTypeFeeManagementMethods(t *testing.T) {
 
 	// Initialize per-cointype fee maps (using SKAAmount for big.Int support)
 	w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
-	w.staticFees = make(map[cointype.CoinType]cointype.SKAAmount)
-	w.staticFees[cointype.CoinTypeVAR] = cointype.SKAAmountFromInt64(int64(varRelayFee))
+	w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+	w.staticFees[cointype.CoinTypeVAR] = skaAmountPtr(cointype.SKAAmountFromInt64(int64(varRelayFee)))
 	for ct, config := range w.chainParams.SKACoins {
 		if config != nil && config.Active && config.MinRelayTxFee != nil {
-			w.staticFees[ct] = cointype.NewSKAAmount(config.MinRelayTxFee)
+			w.staticFees[ct] = skaAmountPtr(cointype.NewSKAAmount(config.MinRelayTxFee))
 		}
 	}
 
@@ -105,19 +110,19 @@ func TestCoinTypeFeeManagementMethods(t *testing.T) {
 			t.Errorf("RelayFeeForCoinType(VAR) = %s, expected %s", varResult.String(), expectedVarFee.String())
 		}
 
-		// Test SKA coin type (SKA-1)
+		// Test SKA coin type (SKA1)
 		skaResult := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(1))
 		if skaResult.String() != skaFee.String() {
-			t.Errorf("RelayFeeForCoinType(SKA-1) = %s, expected %s", skaResult.String(), skaFee.String())
+			t.Errorf("RelayFeeForCoinType(SKA1) = %s, expected %s", skaResult.String(), skaFee.String())
 		}
 
-		// Test another SKA coin type (SKA-2)
+		// Test another SKA coin type (SKA2)
 		ska2Result := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(2))
 		if ska2Result.String() != skaFee.String() {
-			t.Errorf("RelayFeeForCoinType(SKA-2) = %s, expected %s", ska2Result.String(), skaFee.String())
+			t.Errorf("RelayFeeForCoinType(SKA2) = %s, expected %s", ska2Result.String(), skaFee.String())
 		}
 
-		t.Logf("✅ RelayFeeForCoinType: VAR=%s, SKA-1=%s, SKA-2=%s",
+		t.Logf("✅ RelayFeeForCoinType: VAR=%s, SKA1=%s, SKA2=%s",
 			varResult.String(), skaResult.String(), ska2Result.String())
 	})
 
@@ -175,11 +180,11 @@ func TestWalletFeeInitialization(t *testing.T) {
 		configRelayFee := dcrutil.Amount(8000)
 		w.relayFee = configRelayFee
 		w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
-		w.staticFees = make(map[cointype.CoinType]cointype.SKAAmount)
-		w.staticFees[cointype.CoinTypeVAR] = cointype.SKAAmountFromInt64(int64(configRelayFee))
+		w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+		w.staticFees[cointype.CoinTypeVAR] = skaAmountPtr(cointype.SKAAmountFromInt64(int64(configRelayFee)))
 		for ct, config := range w.chainParams.SKACoins {
 			if config != nil && config.Active && config.MinRelayTxFee != nil {
-				w.staticFees[ct] = cointype.NewSKAAmount(config.MinRelayTxFee)
+				w.staticFees[ct] = skaAmountPtr(cointype.NewSKAAmount(config.MinRelayTxFee))
 			}
 		}
 
@@ -216,10 +221,10 @@ func TestWalletFeeInitialization(t *testing.T) {
 		configRelayFee := dcrutil.Amount(9000)
 		w.relayFee = configRelayFee
 		w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
-		w.staticFees = make(map[cointype.CoinType]cointype.SKAAmount)
-		w.staticFees[cointype.CoinTypeVAR] = cointype.SKAAmountFromInt64(int64(configRelayFee))
+		w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+		w.staticFees[cointype.CoinTypeVAR] = skaAmountPtr(cointype.SKAAmountFromInt64(int64(configRelayFee)))
 		// No SKA fee configured, so fallback to VAR fee for SKA coins
-		w.staticFees[cointype.CoinType(1)] = cointype.SKAAmountFromInt64(int64(configRelayFee))
+		w.staticFees[cointype.CoinType(1)] = skaAmountPtr(cointype.SKAAmountFromInt64(int64(configRelayFee)))
 
 		if w.RelayFee() != configRelayFee {
 			t.Errorf("VAR fee should be initialized to config value %d, got %d",
@@ -259,17 +264,17 @@ func TestCoinTypeFeeIntegrationScenarios(t *testing.T) {
 
 	// Initialize per-cointype fee maps with SKAAmount
 	w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
-	w.staticFees = make(map[cointype.CoinType]cointype.SKAAmount)
-	w.staticFees[cointype.CoinTypeVAR] = cointype.SKAAmountFromInt64(10000)
-	w.staticFees[cointype.CoinType(1)] = cointype.SKAAmountFromInt64(1000) // SKA: 1000 atoms/KB
-	w.staticFees[cointype.CoinType(2)] = cointype.SKAAmountFromInt64(1000)
-	w.staticFees[cointype.CoinType(255)] = cointype.SKAAmountFromInt64(1000)
+	w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+	w.staticFees[cointype.CoinTypeVAR] = skaAmountPtr(cointype.SKAAmountFromInt64(10000))
+	w.staticFees[cointype.CoinType(1)] = skaAmountPtr(cointype.SKAAmountFromInt64(1000)) // SKA: 1000 atoms/KB
+	w.staticFees[cointype.CoinType(2)] = skaAmountPtr(cointype.SKAAmountFromInt64(1000))
+	w.staticFees[cointype.CoinType(255)] = skaAmountPtr(cointype.SKAAmountFromInt64(1000))
 
 	t.Run("Scenario: User wants to check current fees", func(t *testing.T) {
 		// User calls getwalletfee (no coin type = VAR default)
 		varFee := w.RelayFeeForCoinType(context.Background(), cointype.CoinTypeVAR)
 
-		// User calls getwalletfee 1 (for SKA-1)
+		// User calls getwalletfee 1 (for SKA1)
 		skaFee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(1))
 
 		t.Logf("Current fees: VAR=%s atoms/KB, SKA=%s atoms/KB", varFee.String(), skaFee.String())
@@ -308,24 +313,134 @@ func TestCoinTypeFeeIntegrationScenarios(t *testing.T) {
 
 	t.Run("Scenario: Multiple SKA coin types can have different fees", func(t *testing.T) {
 		// With per-coin configuration, each SKA coin type can have its own fee
-		ska1Fee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(1))     // SKA-1
-		ska2Fee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(2))     // SKA-2
-		ska255Fee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(255)) // SKA-255 (max)
+		ska1Fee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(1))     // SKA1
+		ska2Fee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(2))     // SKA2
+		ska255Fee := w.RelayFeeForCoinType(context.Background(), cointype.CoinType(255)) // SKA255 (max)
 
-		// SKA-1 was modified by SetSKARelayFee earlier, so it may differ from others
+		// SKA1 was modified by SetSKARelayFee earlier, so it may differ from others
 		// This verifies per-coin fees work correctly
-		t.Logf("✅ Multiple SKA types scenario: SKA-1=%s, SKA-2=%s, SKA-255=%s",
+		t.Logf("✅ Multiple SKA types scenario: SKA1=%s, SKA2=%s, SKA255=%s",
 			ska1Fee.String(), ska2Fee.String(), ska255Fee.String())
 
 		// Verify each coin type returns its configured fee
 		if ska1Fee.Cmp(cointype.SKAAmountFromInt64(500)) != 0 {
-			t.Errorf("SKA-1 should have fee 500 (set by SetSKARelayFee), got %s", ska1Fee.String())
+			t.Errorf("SKA1 should have fee 500 (set by SetSKARelayFee), got %s", ska1Fee.String())
 		}
 		if ska2Fee.Cmp(cointype.SKAAmountFromInt64(1000)) != 0 {
-			t.Errorf("SKA-2 should have fee 1000 (from staticFees), got %s", ska2Fee.String())
+			t.Errorf("SKA2 should have fee 1000 (from staticFees), got %s", ska2Fee.String())
 		}
 		if ska255Fee.Cmp(cointype.SKAAmountFromInt64(1000)) != 0 {
-			t.Errorf("SKA-255 should have fee 1000 (from staticFees), got %s", ska255Fee.String())
+			t.Errorf("SKA255 should have fee 1000 (from staticFees), got %s", ska255Fee.String())
 		}
 	})
+}
+
+// TestRelayFeeForCoinTypeExplicitZero verifies the post-2026-05-04 contract:
+// a configured zero fee is treated as UNSET at every layer (manual, RPC,
+// static) and the next fallback is consulted. This aligns with consensus
+// reality — only SKA emission transactions are allowed to be zero-fee, and
+// they construct fee=0 directly without consulting RelayFeeForCoinType.
+//
+// Earlier the test pinned the inverse "zero is legitimate" contract; that
+// was wrong because a non-emission tx with zero fee is rejected by the node.
+func TestRelayFeeForCoinTypeExplicitZero(t *testing.T) {
+	chainParams := &chaincfg.Params{
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			1: {
+				Active:           true,
+				MinRelayTxFee:    big.NewInt(4000), // chainparams fallback the test EXPECTS to pick up
+				MaxFeeMultiplier: 2500,
+			},
+		},
+	}
+	w := &Wallet{chainParams: chainParams}
+	w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+	w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+	w.staticFees[cointype.CoinTypeVAR] = skaAmountPtr(cointype.Zero()) // explicitly zero (treated as unset)
+	w.staticFees[cointype.CoinType(1)] = skaAmountPtr(cointype.Zero()) // explicitly zero (treated as unset)
+	// SKA2 is intentionally absent from both staticFees and SKACoins, so
+	// the late-activation chainparams path can't kick in either — the
+	// "no fee configured" final-zero+log path is exercised.
+
+	// queryDynamicFee with nil NetworkBackend fails; manual is unset.
+	ctx := context.Background()
+
+	// VAR: explicit-zero static fee falls through. No chainparams VAR config
+	// either, so the final return is zero (with a log.Errorf).
+	if got := w.RelayFeeForCoinType(ctx, cointype.CoinTypeVAR); !got.IsZero() {
+		t.Errorf("VAR explicit-zero with no fallbacks: got %s, want 0", got.String())
+	}
+
+	// SKA1: explicit-zero static fee falls through to the chainparams
+	// MinRelayTxFee=4000 — that's the late-activation path's only job.
+	got := w.RelayFeeForCoinType(ctx, cointype.CoinType(1))
+	wantBig := big.NewInt(4000)
+	if got.IsZero() {
+		t.Fatalf("SKA1 explicit-zero static fee: got 0, want chainparams MinRelayTxFee=%s", wantBig)
+	}
+	if v, err := got.Int64(); err != nil || v != 4000 {
+		t.Errorf("SKA1 fallback: got %s, want 4000 (from chainparams.SKACoins[1].MinRelayTxFee)",
+			got.String())
+	}
+}
+
+// TestSetManualFeeVAROverflowRejected pins the M1 fix from the 2026-05-05
+// review: SetManualFee(VAR, fee) must surface an error when fee exceeds int64
+// rather than silently truncating into the legacy dcrutil.Amount-shaped
+// relayFee field. Previously the conversion error was discarded with `_` and
+// callers received nil with a corrupted relayFee.
+func TestSetManualFeeVAROverflowRejected(t *testing.T) {
+	chainParams := &chaincfg.Params{
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			1: {Active: true, MinRelayTxFee: big.NewInt(1000), MaxFeeMultiplier: 2500},
+		},
+	}
+	w := &Wallet{chainParams: chainParams}
+	w.manualFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+	w.staticFees = make(map[cointype.CoinType]*cointype.SKAAmount)
+	w.staticFees[cointype.CoinTypeVAR] = skaAmountPtr(cointype.SKAAmountFromInt64(10000))
+	originalRelayFee := dcrutil.Amount(10000)
+	w.relayFee = originalRelayFee
+
+	// 2^63 — does not fit in int64 (max int64 is 2^63 - 1).
+	overflow := new(big.Int).Lsh(big.NewInt(1), 63)
+	overflowAmt := cointype.NewSKAAmount(overflow)
+
+	if err := w.SetManualFee(cointype.CoinTypeVAR, overflowAmt); err == nil {
+		t.Fatalf("SetManualFee(VAR, 2^63) must error; got nil")
+	}
+
+	// State must be untouched on failure: neither manualFees nor relayFee
+	// should be mutated by a rejected call.
+	if _, ok := w.manualFees[cointype.CoinTypeVAR]; ok {
+		t.Errorf("rejected SetManualFee must not persist VAR manual override")
+	}
+	if w.relayFee != originalRelayFee {
+		t.Errorf("rejected SetManualFee must not mutate w.relayFee; got %d, want %d",
+			w.relayFee, originalRelayFee)
+	}
+
+	// Sanity: a representable VAR fee succeeds and persists.
+	ok := cointype.SKAAmountFromInt64(15000)
+	if err := w.SetManualFee(cointype.CoinTypeVAR, ok); err != nil {
+		t.Fatalf("SetManualFee(VAR, 15000) must succeed; got %v", err)
+	}
+	if got, present := w.manualFees[cointype.CoinTypeVAR]; !present || got == nil ||
+		got.String() != "15000" {
+		t.Errorf("manual VAR override not persisted; got %v", got)
+	}
+	if w.relayFee != dcrutil.Amount(15000) {
+		t.Errorf("relayFee not updated; got %d, want 15000", w.relayFee)
+	}
+
+	// SKA path is big.Int-precision and accepts arbitrarily-large fees. The
+	// same overflow value that VAR rejects must be accepted on SKA1 — the
+	// int64 ceiling does not apply.
+	if err := w.SetManualFee(cointype.CoinType(1), overflowAmt); err != nil {
+		t.Fatalf("SetManualFee(SKA1, 2^63) must succeed; got %v", err)
+	}
+	if got, present := w.manualFees[cointype.CoinType(1)]; !present || got == nil ||
+		got.BigInt().Cmp(overflow) != 0 {
+		t.Errorf("manual SKA1 override not persisted at full precision; got %v", got)
+	}
 }

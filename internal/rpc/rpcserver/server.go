@@ -21,8 +21,10 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"net"
 	"sort"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -371,6 +373,25 @@ func (s *walletServer) Accounts(ctx context.Context, req *pb.AccountsRequest) (*
 	accounts := make([]*pb.AccountsResponse_Account, len(resp.Accounts))
 	for i := range resp.Accounts {
 		a := &resp.Accounts[i]
+		var skaBalances map[uint32]string
+		if len(a.SKATotalBalances) > 0 {
+			chainParams := s.wallet.ChainParams()
+			skaBalances = make(map[uint32]string, len(a.SKATotalBalances))
+			for ct, amt := range a.SKATotalBalances {
+				if amt.IsZero() {
+					continue
+				}
+				// Match the JSON-RPC contract: SKA balances are decimal-coin
+				// strings against the coin type's configured AtomsPerCoin,
+				// not raw atoms. Defensive-copy AtomsPerCoin so the chain
+				// params pointer cannot be mutated through the alias.
+				apc := cointype.GetAtomsPerSKACoin()
+				if cfg, ok := chainParams.SKACoins[ct]; ok && cfg != nil && cfg.AtomsPerCoin != nil {
+					apc = new(big.Int).Set(cfg.AtomsPerCoin)
+				}
+				skaBalances[uint32(ct)] = amt.ToDecimalString(apc)
+			}
+		}
 		accounts[i] = &pb.AccountsResponse_Account{
 			AccountNumber: a.AccountNumber,
 			AccountName:   a.AccountName,
@@ -381,6 +402,7 @@ func (s *walletServer) Accounts(ctx context.Context, req *pb.AccountsRequest) (*
 			ImportedKeyCount: a.ImportedKeyCount,
 			AccountEncrypted: a.AccountEncrypted,
 			AccountUnlocked:  a.AccountUnlocked,
+			SkaTotalBalances: skaBalances,
 		}
 	}
 	return &pb.AccountsResponse{
@@ -539,7 +561,10 @@ func (s *walletServer) NextAddress(ctx context.Context, req *pb.NextAddressReque
 	var pubKeyAddrString string
 	switch addr := addr.(type) {
 	case wallet.PubKeyHashAddress:
-		pubKey := addr.PubKey()
+		pubKey, err := addr.PubKey()
+		if err != nil {
+			return nil, translateError(err)
+		}
 		pubKeyAddr, err := stdaddr.NewAddressPubKeyEcdsaSecp256k1V0Raw(
 			pubKey, s.wallet.ChainParams())
 		if err != nil {
@@ -571,7 +596,10 @@ func (s *walletServer) Address(ctx context.Context, req *pb.AddressRequest) (
 	var pubKeyAddrString string
 	switch addr := addr.(type) {
 	case wallet.PubKeyHashAddress:
-		pubKey := addr.PubKey()
+		pubKey, err := addr.PubKey()
+		if err != nil {
+			return nil, translateError(err)
+		}
 		pubKeyAddr, err := stdaddr.NewAddressPubKeyEcdsaSecp256k1V0Raw(
 			pubKey, s.wallet.ChainParams())
 		if err != nil {
@@ -942,21 +970,95 @@ func sumOutputValues(outputs []*wire.TxOut) (totalOutput dcrutil.Amount) {
 	return totalOutput
 }
 
-func (s *walletServer) SweepAccount(ctx context.Context, req *pb.SweepAccountRequest) (*pb.SweepAccountResponse, error) {
-	feePerKb := s.wallet.RelayFee()
+// parseAtomsOverride parses a decimal-string atomic amount that may carry
+// either VAR or SKA atoms, returning the zero value to signal "no override
+// supplied" (caller should fall back to its configured default). Empty string
+// and "0" are treated as no-override; any other parse error is reported via
+// the supplied field name. Negative values are rejected.
+func parseAtomsOverride(s, fieldName string) (cointype.SKAAmount, error) {
+	if s == "" {
+		return cointype.Zero(), nil
+	}
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return cointype.Zero(), status.Errorf(codes.InvalidArgument,
+			"invalid %s %q", fieldName, s)
+	}
+	if v.Sign() < 0 {
+		return cointype.Zero(), status.Errorf(codes.InvalidArgument,
+			"%s cannot be negative", fieldName)
+	}
+	if v.Sign() == 0 {
+		return cointype.Zero(), nil
+	}
+	return cointype.NewSKAAmount(v), nil
+}
 
-	// Use provided fee per Kb if specified.
-	if req.FeePerKb < 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "%s",
-			"fee per kb argument cannot be negative")
+// setTxOutAmount populates Value/SKAValue on out from a decimal coin string
+// for the given coin type. Both VAR and SKA branches consume the same decimal
+// shape ("1.5" → 1.5 coin) so this gRPC contract stays in lockstep with the
+// JSON-RPC createrawtransaction parser. Returns gRPC InvalidArgument errors
+// suitable for direct return from a handler.
+func setTxOutAmount(out *wire.TxOut, amount string, coinType cointype.CoinType, skaConfig *chaincfg.SKACoinConfig) error {
+	if amount == "" {
+		return status.Errorf(codes.InvalidArgument, "amount required")
+	}
+	if coinType.IsSKA() {
+		if skaConfig == nil {
+			return status.Errorf(codes.InvalidArgument,
+				"SKA coin %d not configured", coinType)
+		}
+		bigAtoms, err := cointype.DecimalStringToAtoms(amount, skaConfig.AtomsPerCoin)
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument,
+				"invalid amount %q: %v", amount, err)
+		}
+		if bigAtoms.Sign() <= 0 {
+			return status.Errorf(codes.InvalidArgument,
+				"amount must be positive: %s", amount)
+		}
+		out.Value = 0
+		out.SKAValue = bigAtoms
+		return nil
 	}
 
-	if req.FeePerKb > 0 {
-		var err error
-		feePerKb, err = dcrutil.NewAmount(req.FeePerKb)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	// VAR branch: decimal coin string, mirroring the JSON-RPC contract.
+	bigAtoms, err := cointype.DecimalStringToAtoms(amount, big.NewInt(int64(cointype.AtomsPerVAR)))
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument,
+			"invalid amount %q: %v", amount, err)
+	}
+	if bigAtoms.Sign() <= 0 {
+		return status.Errorf(codes.InvalidArgument,
+			"amount must be positive: %s", amount)
+	}
+	if !bigAtoms.IsInt64() {
+		return status.Errorf(codes.InvalidArgument,
+			"VAR amount %s exceeds int64 capacity", amount)
+	}
+	varAtoms := bigAtoms.Int64()
+	if varAtoms > int64(cointype.MaxVARAmount) {
+		return status.Errorf(codes.InvalidArgument,
+			"amount %d exceeds VAR maximum %d", varAtoms, int64(cointype.MaxVARAmount))
+	}
+	out.Value = varAtoms
+	return nil
+}
+
+func (s *walletServer) SweepAccount(ctx context.Context, req *pb.SweepAccountRequest) (*pb.SweepAccountResponse, error) {
+	// Coin type defaults to VAR; SKA accounts opt in via coin_type.
+	sweepCoinType := cointype.CoinTypeVAR
+	if req.CoinType != 0 {
+		sweepCoinType = cointype.CoinType(req.CoinType)
+		if !sweepCoinType.IsValid() {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"coin_type %d invalid; must be 0 (VAR) or 1-255 (SKA)", req.CoinType)
 		}
+	}
+
+	feePerKbOverride, err := parseAtomsOverride(req.FeePerKb, "fee_per_kb")
+	if err != nil {
+		return nil, err
 	}
 
 	account, err := s.wallet.AccountNumber(ctx, req.SourceAccount)
@@ -969,9 +1071,8 @@ func (s *walletServer) SweepAccount(ctx context.Context, req *pb.SweepAccountReq
 		return nil, translateError(err)
 	}
 
-	tx, err := s.wallet.NewUnsignedTransaction(ctx, nil, feePerKb, account,
-		int32(req.RequiredConfirmations), wallet.OutputSelectionAlgorithmAll,
-		changeSource, nil)
+	tx, err := s.wallet.NewUnsignedSweepTransactionForCoinType(ctx, sweepCoinType,
+		feePerKbOverride, account, int32(req.RequiredConfirmations), changeSource)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -984,10 +1085,21 @@ func (s *walletServer) SweepAccount(ctx context.Context, req *pb.SweepAccountReq
 	}
 
 	res := &pb.SweepAccountResponse{
-		UnsignedTransaction:       txBuf.Bytes(),
-		TotalPreviousOutputAmount: int64(tx.TotalInput),
-		TotalOutputAmount:         int64(sumOutputValues(tx.Tx.TxOut)),
-		EstimatedSignedSize:       uint32(tx.EstimatedSignedSerializeSize),
+		UnsignedTransaction: txBuf.Bytes(),
+		EstimatedSignedSize: uint32(tx.EstimatedSignedSerializeSize),
+	}
+	if sweepCoinType.IsSKA() {
+		var prevIn string
+		if tx.SKATotalInput.IsZero() {
+			prevIn = "0"
+		} else {
+			prevIn = tx.SKATotalInput.BigInt().String()
+		}
+		res.TotalPreviousOutputAmount = prevIn
+		res.TotalOutputAmount = sumSKAOutputValues(tx.Tx.TxOut).String()
+	} else {
+		res.TotalPreviousOutputAmount = strconv.FormatInt(int64(tx.TotalInput), 10)
+		res.TotalOutputAmount = strconv.FormatInt(int64(sumOutputValues(tx.Tx.TxOut)), 10)
 	}
 
 	return res, nil
@@ -1031,13 +1143,20 @@ func (s *walletServer) BlockInfo(ctx context.Context, req *pb.BlockInfoRequest) 
 }
 
 func (s *walletServer) UnspentOutputs(req *pb.UnspentOutputsRequest, svr pb.WalletService_UnspentOutputsServer) error {
+	// gRPC UnspentOutputs is VAR-only today: TargetAmount is int64 and the
+	// per-output Amount field is int64, neither of which fits SKA atoms.
+	// Accept coin_type=0 (default) or coin_type=VAR; reject SKA explicitly
+	// so clients receive an actionable error instead of an empty result set.
+	ct := cointype.CoinType(req.CoinType)
+	if ct != cointype.CoinTypeVAR {
+		return status.Errorf(codes.Unimplemented,
+			"UnspentOutputs is VAR-only over gRPC; use the JSON-RPC listunspent for SKA (got coin_type=%d)", req.CoinType)
+	}
 	policy := wallet.OutputSelectionPolicy{
 		Account:               req.Account,
 		RequiredConfirmations: req.RequiredConfirmations,
-		CoinType:              cointype.CoinTypeVAR, // Default to VAR for backward compatibility
+		CoinType:              cointype.CoinTypeVAR,
 	}
-	// gRPC UnspentOutputs is VAR-only (policy.CoinType == VAR); pass Zero
-	// for the SKA target since the pb carries only int64 TargetAmount.
 	inputDetail, err := s.wallet.SelectInputs(svr.Context(), dcrutil.Amount(req.TargetAmount), cointype.Zero(), policy)
 	// Do not return errors to caller when there was insufficient spendable
 	// outputs available for the target amount.
@@ -1080,13 +1199,20 @@ func (s *walletServer) UnspentOutputs(req *pb.UnspentOutputsRequest, svr pb.Wall
 func (s *walletServer) FundTransaction(ctx context.Context, req *pb.FundTransactionRequest) (
 	*pb.FundTransactionResponse, error) {
 
+	// gRPC FundTransaction is VAR-only today: TargetAmount is int64 and the
+	// per-output Amount field is int64, neither of which fits SKA atoms.
+	// Accept coin_type=0 (default) or coin_type=VAR; reject SKA explicitly so
+	// clients receive an actionable error instead of an empty result set.
+	ct := cointype.CoinType(req.CoinType)
+	if ct != cointype.CoinTypeVAR {
+		return nil, status.Errorf(codes.Unimplemented,
+			"FundTransaction is VAR-only over gRPC; use the JSON-RPC fundrawtransaction for SKA (got coin_type=%d)", req.CoinType)
+	}
 	policy := wallet.OutputSelectionPolicy{
 		Account:               req.Account,
 		RequiredConfirmations: req.RequiredConfirmations,
-		CoinType:              cointype.CoinTypeVAR, // Default to VAR for backward compatibility
+		CoinType:              cointype.CoinTypeVAR,
 	}
-	// gRPC FundTransaction is VAR-only (policy.CoinType == VAR); pass Zero
-	// for the SKA target since the pb carries only int64 TargetAmount.
 	inputDetail, err := s.wallet.SelectInputs(ctx, dcrutil.Amount(req.TargetAmount), cointype.Zero(), policy)
 	// Do not return errors to caller when there was insufficient spendable
 	// outputs available for the target amount.
@@ -1187,6 +1313,44 @@ func (s *walletServer) ConstructTransaction(ctx context.Context, req *pb.Constru
 			"non_change_outputs and change_destination may not both be empty or null")
 	}
 
+	// Determine the transaction's coin type. Every output's declared
+	// coin_type must match (consensus forbids mixing VAR and SKA in one
+	// tx), so collect the distinct set first and reject mismatches with a
+	// clear error rather than letting the build loop fail downstream.
+	var txCoinType cointype.CoinType
+	first := true
+	for _, o := range req.NonChangeOutputs {
+		oct := cointype.CoinType(o.CoinType)
+		if first {
+			txCoinType = oct
+			first = false
+			continue
+		}
+		if oct != txCoinType {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"all outputs must declare the same coin_type (got %d and %d)",
+				txCoinType, oct)
+		}
+	}
+
+	var skaConfig *chaincfg.SKACoinConfig
+	if txCoinType.IsSKA() {
+		if chainParams.SKACoins == nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"no SKA coin %d configured for this network", txCoinType)
+		}
+		cfg, ok := chainParams.SKACoins[txCoinType]
+		if !ok || cfg == nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"no SKA coin %d configured for this network", txCoinType)
+		}
+		if !cfg.Active {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"SKA coin %d is not active", txCoinType)
+		}
+		skaConfig = cfg
+	}
+
 	outputs := make([]*wire.TxOut, 0, len(req.NonChangeOutputs))
 	for _, o := range req.NonChangeOutputs {
 		script, version, err := decodeDestination(o.Destination, chainParams)
@@ -1194,9 +1358,12 @@ func (s *walletServer) ConstructTransaction(ctx context.Context, req *pb.Constru
 			return nil, err
 		}
 		output := &wire.TxOut{
-			Value:    o.Amount,
 			Version:  version,
 			PkScript: script,
+			CoinType: txCoinType,
+		}
+		if err := setTxOutAmount(output, o.Amount, txCoinType, skaConfig); err != nil {
+			return nil, err
 		}
 		outputs = append(outputs, output)
 	}
@@ -1211,13 +1378,15 @@ func (s *walletServer) ConstructTransaction(ctx context.Context, req *pb.Constru
 		return nil, status.Errorf(codes.InvalidArgument, "unknown output selection algorithm")
 	}
 
-	feePerKb := txrules.DefaultRelayFeePerKb
-	if req.FeePerKb != 0 {
-		feePerKb = dcrutil.Amount(req.FeePerKb)
+	// Resolve the per-kB relay fee override (decimal-string atoms) for
+	// either VAR or SKA. When empty or zero, leave the override unset and
+	// let NewUnsignedTransaction fall back to RelayFeeForCoinType.
+	feePerKbOverride, err := parseAtomsOverride(req.FeePerKb, "fee_per_kb")
+	if err != nil {
+		return nil, err
 	}
 
 	var changeSource txauthor.ChangeSource
-	var err error
 	if req.ChangeDestination != nil {
 		changeSource, err = makeTxChangeSource(req.ChangeDestination, chainParams)
 		if err != nil {
@@ -1225,7 +1394,7 @@ func (s *walletServer) ConstructTransaction(ctx context.Context, req *pb.Constru
 		}
 	}
 
-	tx, err := s.wallet.NewUnsignedTransaction(ctx, outputs, feePerKb, req.SourceAccount,
+	tx, err := s.wallet.NewUnsignedTransaction(ctx, outputs, feePerKbOverride, req.SourceAccount,
 		req.RequiredConfirmations, algo, changeSource, nil)
 	if err != nil {
 		return nil, translateError(err)
@@ -1243,13 +1412,35 @@ func (s *walletServer) ConstructTransaction(ctx context.Context, req *pb.Constru
 	}
 
 	res := &pb.ConstructTransactionResponse{
-		UnsignedTransaction:       txBuf.Bytes(),
-		TotalPreviousOutputAmount: int64(tx.TotalInput),
-		TotalOutputAmount:         int64(sumOutputValues(tx.Tx.TxOut)),
-		EstimatedSignedSize:       uint32(tx.EstimatedSignedSerializeSize),
-		ChangeIndex:               int32(tx.ChangeIndex),
+		UnsignedTransaction: txBuf.Bytes(),
+		EstimatedSignedSize: uint32(tx.EstimatedSignedSerializeSize),
+		ChangeIndex:         int32(tx.ChangeIndex),
+	}
+	if txCoinType.IsSKA() {
+		var prevIn string
+		if tx.SKATotalInput.IsZero() {
+			prevIn = "0"
+		} else {
+			prevIn = tx.SKATotalInput.BigInt().String()
+		}
+		res.TotalPreviousOutputAmount = prevIn
+		res.TotalOutputAmount = sumSKAOutputValues(tx.Tx.TxOut).String()
+	} else {
+		res.TotalPreviousOutputAmount = strconv.FormatInt(int64(tx.TotalInput), 10)
+		res.TotalOutputAmount = strconv.FormatInt(int64(sumOutputValues(tx.Tx.TxOut)), 10)
 	}
 	return res, nil
+}
+
+// sumSKAOutputValues sums SKAValue across all outputs, returning a *big.Int.
+func sumSKAOutputValues(outs []*wire.TxOut) *big.Int {
+	total := new(big.Int)
+	for _, o := range outs {
+		if o.SKAValue != nil {
+			total.Add(total, o.SKAValue)
+		}
+	}
+	return total
 }
 
 func (s *walletServer) GetAccountExtendedPubKey(ctx context.Context, req *pb.GetAccountExtendedPubKeyRequest) (*pb.GetAccountExtendedPubKeyResponse, error) {
@@ -2114,7 +2305,11 @@ func (s *walletServer) ValidateAddress(ctx context.Context, req *pb.ValidateAddr
 
 	switch ka := ka.(type) {
 	case wallet.PubKeyHashAddress:
-		result.PubKey = ka.PubKey()
+		pubKey, err := ka.PubKey()
+		if err != nil {
+			return nil, err
+		}
+		result.PubKey = pubKey
 		pubKeyAddr, err := stdaddr.NewAddressPubKeyEcdsaSecp256k1V0Raw(result.PubKey,
 			s.wallet.ChainParams())
 		if err != nil {
@@ -2214,6 +2409,19 @@ func (s *walletServer) GetCFilters(req *pb.GetCFiltersRequest, server pb.WalletS
 	return nil
 }
 
+// varOrSKAAmountString returns the decimal-atoms representation of either VAR
+// (int64 atoms) or SKA (big.Int atoms). Per the dual-coin convention exactly
+// one of varAmount/skaAmount is meaningful for any given input/output/fee, so
+// the SKA value wins when present and non-zero; otherwise the VAR value is
+// formatted. The result is always a decimal string (never empty), so callers
+// can rely on a single field for either coin type.
+func varOrSKAAmountString(varAmount dcrutil.Amount, skaAmount *big.Int) string {
+	if skaAmount != nil && skaAmount.Sign() != 0 {
+		return skaAmount.String()
+	}
+	return strconv.FormatInt(int64(varAmount), 10)
+}
+
 func marshalTransactionInputs(v []wallet.TransactionSummaryInput) []*pb.TransactionDetails_Input {
 	inputs := make([]*pb.TransactionDetails_Input, len(v))
 	for i := range v {
@@ -2221,7 +2429,7 @@ func marshalTransactionInputs(v []wallet.TransactionSummaryInput) []*pb.Transact
 		inputs[i] = &pb.TransactionDetails_Input{
 			Index:           input.Index,
 			PreviousAccount: input.PreviousAccount,
-			PreviousAmount:  int64(input.PreviousAmount),
+			PreviousAmount:  varOrSKAAmountString(input.PreviousAmount, input.PreviousSKAAmount),
 		}
 	}
 	return inputs
@@ -2239,7 +2447,7 @@ func marshalTransactionOutputs(v []wallet.TransactionSummaryOutput) []*pb.Transa
 			Index:        output.Index,
 			Account:      output.Account,
 			Internal:     output.Internal,
-			Amount:       int64(output.Amount),
+			Amount:       varOrSKAAmountString(output.Amount, output.SKAAmount),
 			Address:      address,
 			OutputScript: output.OutputScript,
 		}
@@ -2271,7 +2479,7 @@ func marshalTransactionDetails(tx *wallet.TransactionSummary) *pb.TransactionDet
 		Transaction:     tx.Transaction,
 		Debits:          marshalTransactionInputs(tx.MyInputs),
 		Credits:         marshalTransactionOutputs(tx.MyOutputs),
-		Fee:             int64(tx.Fee),
+		Fee:             varOrSKAAmountString(tx.Fee, tx.SKAFee),
 		Timestamp:       tx.Timestamp,
 		TransactionType: marshalTxType(tx.Type),
 	}
@@ -3965,7 +4173,9 @@ func (s *walletServer) UnlockWallet(ctx context.Context, req *pb.UnlockWalletReq
 func (s *walletServer) LockWallet(ctx context.Context, req *pb.LockWalletRequest) (
 	*pb.LockWalletResponse, error) {
 
-	s.wallet.Lock()
+	if err := s.wallet.Lock(); err != nil {
+		return nil, translateError(err)
+	}
 	return &pb.LockWalletResponse{}, nil
 }
 

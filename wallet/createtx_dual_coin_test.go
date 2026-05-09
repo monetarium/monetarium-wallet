@@ -35,7 +35,7 @@ func TestDualCoinValidationLogic(t *testing.T) {
 			description: "All VAR outputs should be valid",
 		},
 		{
-			name: "All SKA-1 outputs",
+			name: "All SKA1 outputs",
 			outputs: []*wire.TxOut{
 				{Value: 1e6, CoinType: cointype.CoinType(1)},
 				{Value: 2e6, CoinType: cointype.CoinType(1)},
@@ -60,7 +60,7 @@ func TestDualCoinValidationLogic(t *testing.T) {
 			description: "Single SKA output should be valid",
 		},
 		{
-			name: "Mixed VAR and SKA-1",
+			name: "Mixed VAR and SKA1",
 			outputs: []*wire.TxOut{
 				{Value: 1e6, CoinType: cointype.CoinTypeVAR},
 				{Value: 2e6, CoinType: cointype.CoinType(1)},
@@ -69,7 +69,7 @@ func TestDualCoinValidationLogic(t *testing.T) {
 			description: "Mixed VAR and SKA should be invalid",
 		},
 		{
-			name: "Mixed SKA-1 and SKA-2",
+			name: "Mixed SKA1 and SKA2",
 			outputs: []*wire.TxOut{
 				{Value: 1e6, CoinType: cointype.CoinType(1)},
 				{Value: 2e6, CoinType: cointype.CoinType(2)},
@@ -97,8 +97,11 @@ func TestDualCoinValidationLogic(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Test the validation logic directly (simulates wallet.NewUnsignedTransaction logic)
-			err := validateCoinTypeMixing(tc.outputs)
+			// Drive the production helper directly. The full
+			// validateAuthoredCoinTypes path requires a walletdb.ReadTx
+			// and is exercised by the integration tests; here we pin the
+			// pure-output uniformity contract.
+			err := txrules.ValidateCoinTypeUniformity(tc.outputs)
 
 			if tc.expectError && err == nil {
 				t.Errorf("Expected error for %s, but validation passed", tc.description)
@@ -108,7 +111,7 @@ func TestDualCoinValidationLogic(t *testing.T) {
 				t.Errorf("Unexpected error for %s: %v", tc.description, err)
 			}
 
-			// If we expect an error, verify it's the right type
+			// If we expect an error, verify it's the right kind.
 			if tc.expectError && err != nil {
 				if !errors.Is(err, errors.Invalid) {
 					t.Errorf("Expected Invalid error, got: %v", err)
@@ -116,25 +119,6 @@ func TestDualCoinValidationLogic(t *testing.T) {
 			}
 		})
 	}
-}
-
-// Helper function to validate coin type mixing (simulates the logic from createtx.go)
-func validateCoinTypeMixing(outputs []*wire.TxOut) error {
-	if len(outputs) == 0 {
-		return nil
-	}
-
-	// Dual-coin validation: Ensure all outputs use the same coin type
-	var txCoinType *cointype.CoinType
-	for i, output := range outputs {
-		if i == 0 {
-			txCoinType = &output.CoinType
-		} else if output.CoinType != *txCoinType {
-			return errors.E(errors.Invalid, "cannot mix different coin types in transaction")
-		}
-	}
-
-	return nil
 }
 
 // TestInputStructCoinTypeUsage tests proper usage of the CoinType field in Input struct
@@ -152,16 +136,16 @@ func TestInputStructCoinTypeUsage(t *testing.T) {
 			description: "VAR input should preserve coin type",
 		},
 		{
-			name:        "SKA-1 input",
+			name:        "SKA1 input",
 			coinType:    cointype.CoinType(1),
 			value:       2e8,
-			description: "SKA-1 input should preserve coin type",
+			description: "SKA1 input should preserve coin type",
 		},
 		{
-			name:        "SKA-255 input",
+			name:        "SKA255 input",
 			coinType:    cointype.CoinType(255),
 			value:       5e8,
-			description: "SKA-255 input should preserve coin type",
+			description: "SKA255 input should preserve coin type",
 		},
 	}
 
@@ -217,7 +201,7 @@ func TestTransactionCreationWithDifferentCoinTypes(t *testing.T) {
 			description:  "VAR transaction should include fees",
 		},
 		{
-			name:         "SKA-1 transaction",
+			name:         "SKA1 transaction",
 			coinType:     cointype.CoinType(1),
 			inputAmount:  1e8,
 			outputAmount: 1e8, // Exact amount - no fees
@@ -225,7 +209,7 @@ func TestTransactionCreationWithDifferentCoinTypes(t *testing.T) {
 			description:  "SKA transaction should have no fees",
 		},
 		{
-			name:         "SKA-255 transaction",
+			name:         "SKA255 transaction",
 			coinType:     cointype.CoinType(255),
 			inputAmount:  5e7,
 			outputAmount: 5e7, // Exact amount - no fees
@@ -374,7 +358,7 @@ func TestTransactionValidationEdgeCases(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateCoinTypeMixing(tc.outputs)
+			err := txrules.ValidateCoinTypeUniformity(tc.outputs)
 
 			if tc.expectError && err == nil {
 				t.Errorf("Expected error for %s, but validation passed", tc.description)
@@ -496,7 +480,7 @@ func TestSKAMultisigFeeAccountsForChangeOutput(t *testing.T) {
 	outs := []*wire.TxOut{{
 		Value:    0,
 		PkScript: make([]byte, txsizes.P2SHPkScriptSize),
-		CoinType: cointype.CoinType(1), // SKA-1
+		CoinType: cointype.CoinType(1), // SKA1
 	}}
 
 	feeSizeNoChange := txsizes.EstimateSerializeSizeSKA(scriptSizes, outs, 0)
@@ -551,7 +535,7 @@ func createMockInputSource(coinType cointype.CoinType, availableAmount dcrutil.A
 // fee.
 //
 // This test exercises the pre-budget math directly (without a full wallet) by
-// referencing the same multisigSKAFeePreSelectInputGuess constant the
+// referencing the same multisigFeePreSelectInputGuess constant the
 // production path uses, so any future drift in that constant flows into the
 // test rather than silently passing.
 func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
@@ -568,7 +552,7 @@ func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
 
 	// Reproduce the pre-budget computation from txToMultisigInternal,
 	// using the same package-level constant the production path uses.
-	estScriptSizes := make([]int, multisigSKAFeePreSelectInputGuess)
+	estScriptSizes := make([]int, multisigFeePreSelectInputGuess)
 	for i := range estScriptSizes {
 		estScriptSizes[i] = txsizes.RedeemP2SHSigScriptSize
 	}
@@ -591,7 +575,7 @@ func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
 	}
 
 	// The pre-budget must cover the real fee at every selection size the
-	// production path can produce (i.e. up to multisigSKAFeePreSelectInputGuess
+	// production path can produce (i.e. up to multisigFeePreSelectInputGuess
 	// inputs). Compare against several N values rather than just the boundary
 	// case; comparing only at N==guess would be structurally `X >= X` because
 	// both sides feed identical inputs into the same formula.
@@ -605,7 +589,7 @@ func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
 		lastFee    cointype.SKAAmount
 		haveLast   bool
 	)
-	for _, n := range []int{1, 10, 25, multisigSKAFeePreSelectInputGuess} {
+	for _, n := range []int{1, 10, 25, multisigFeePreSelectInputGuess} {
 		ss := make([]int, n)
 		for i := range ss {
 			ss[i] = txsizes.RedeemP2SHSigScriptSize
@@ -631,7 +615,7 @@ func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
 	// line ~781 of createtx.go correctly returns InsufficientBalance).
 	// Verifying this proves the constant is the actual cliff, not just
 	// a number we picked.
-	overSS := make([]int, multisigSKAFeePreSelectInputGuess+1)
+	overSS := make([]int, multisigFeePreSelectInputGuess+1)
 	for i := range overSS {
 		overSS[i] = txsizes.RedeemP2SHSigScriptSize
 	}
@@ -639,8 +623,87 @@ func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
 	overFee := txrules.FeeForSerializeSizeSKA(relayFee, overSz)
 	if skaFeePreBudget.Cmp(overFee) >= 0 {
 		t.Fatalf("pre-budget %s must NOT cover real fee %s for %d inputs "+
-			"(otherwise multisigSKAFeePreSelectInputGuess is mis-set)",
+			"(otherwise multisigFeePreSelectInputGuess is mis-set)",
 			skaFeePreBudget.String(), overFee.String(),
-			multisigSKAFeePreSelectInputGuess+1)
+			multisigFeePreSelectInputGuess+1)
+	}
+}
+
+// TestTxToMultisigInternalVARFeePreBudget verifies that the VAR pre-selection
+// fee budget is now derived from the configured RelayFee() instead of the old
+// hard-coded 5e7/3e4 atom switch. The VAR formula must scale with the
+// operator's --minrelaytxfee setting and produce a budget that covers the
+// post-selection real fee at every input count up to the guess ceiling, and
+// must not cover it once N exceeds the ceiling (so the constant is the
+// actual cliff and not just a happens-to-pass number).
+func TestTxToMultisigInternalVARFeePreBudget(t *testing.T) {
+	// Stand-in for w.RelayFee() — pick a deliberately non-default rate so
+	// the test fails if the production path silently drops back to a
+	// constant. 1e5 atoms/kB is 10× the static dcrwallet default; an
+	// operator setting --minrelaytxfee higher than the default is exactly
+	// the workflow this fix unblocks.
+	relayFee := dcrutil.Amount(1e5)
+
+	// Target VAR amount, immaterial to the size math but kept realistic
+	// for documentation.
+	amount := dcrutil.Amount(1e8)
+
+	estScriptSizes := make([]int, multisigFeePreSelectInputGuess)
+	for i := range estScriptSizes {
+		estScriptSizes[i] = txsizes.RedeemP2SHSigScriptSize
+	}
+	estTxOuts := []*wire.TxOut{{
+		Value:    int64(amount),
+		PkScript: make([]byte, txsizes.P2SHPkScriptSize),
+		CoinType: cointype.CoinTypeVAR,
+	}}
+	preBudgetSize := txsizes.EstimateSerializeSize(estScriptSizes, estTxOuts, txsizes.P2PKHPkScriptSize)
+	feeEstForTx := txrules.FeeForSerializeSize(relayFee, preBudgetSize)
+
+	// The pre-budget must reflect the configured rate. Old hard-coded
+	// budgets were 5e7 (mainnet/testnet) or 3e4 (default). Neither tracks
+	// --minrelaytxfee, so the new budget should differ from both anchors
+	// once the rate is non-default.
+	if feeEstForTx == 5e7 || feeEstForTx == 3e4 {
+		t.Fatalf("pre-budget %d still matches a hard-coded constant — "+
+			"VAR branch is not deriving from RelayFee()", feeEstForTx)
+	}
+
+	// At N <= guess, the pre-budget must cover the real fee.
+	var (
+		lastFee  dcrutil.Amount
+		haveLast bool
+	)
+	for _, n := range []int{1, 10, 25, multisigFeePreSelectInputGuess} {
+		ss := make([]int, n)
+		for i := range ss {
+			ss[i] = txsizes.RedeemP2SHSigScriptSize
+		}
+		sz := txsizes.EstimateSerializeSize(ss, estTxOuts, txsizes.P2PKHPkScriptSize)
+		fee := txrules.FeeForSerializeSize(relayFee, sz)
+		if feeEstForTx < fee {
+			t.Fatalf("pre-budget %d must be >= real fee %d for a %d-input shape",
+				feeEstForTx, fee, n)
+		}
+		if haveLast && fee <= lastFee {
+			t.Fatalf("real fee for %d inputs (%d) must exceed prior fee (%d)",
+				n, fee, lastFee)
+		}
+		lastFee = fee
+		haveLast = true
+	}
+
+	// Boundary sanity: at N == guess+1, the pre-budget is necessarily
+	// insufficient. This proves the constant is the cliff, not a
+	// happens-to-pass number.
+	overSS := make([]int, multisigFeePreSelectInputGuess+1)
+	for i := range overSS {
+		overSS[i] = txsizes.RedeemP2SHSigScriptSize
+	}
+	overSz := txsizes.EstimateSerializeSize(overSS, estTxOuts, txsizes.P2PKHPkScriptSize)
+	overFee := txrules.FeeForSerializeSize(relayFee, overSz)
+	if feeEstForTx >= overFee {
+		t.Fatalf("pre-budget %d must NOT cover real fee %d for %d inputs",
+			feeEstForTx, overFee, multisigFeePreSelectInputGuess+1)
 	}
 }

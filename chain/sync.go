@@ -266,7 +266,7 @@ func (s *Syncer) getHeaders(ctx context.Context) error {
 					return err
 				}
 
-				err = validate.CFilterV2HeaderCommitment(cnet, header,
+				err = validate.CFilterV2HeaderCommitment(header,
 					filter, proofIndex, proof)
 				if err != nil {
 					return err
@@ -872,12 +872,12 @@ func (s *Syncer) handleBlockConnected(ctx context.Context, header *wire.BlockHea
 		return err
 	}
 
-	cnet := s.wallet.ChainParams().Net
-	err = validate.CFilterV2HeaderCommitment(cnet, header, filter, proofIndex, proof)
+	err = validate.CFilterV2HeaderCommitment(header, filter, proofIndex, proof)
 	if err != nil {
 		return err
 	}
 
+	cnet := s.wallet.ChainParams().Net
 	s.sidechainsMu.Lock()
 	defer s.sidechainsMu.Unlock()
 

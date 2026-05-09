@@ -5,7 +5,10 @@
 
 package txsizes
 
-import "github.com/monetarium/monetarium-node/wire"
+import (
+	"github.com/monetarium/monetarium-node/cointype"
+	"github.com/monetarium/monetarium-node/wire"
+)
 
 // Worst case script and input/output size estimates.
 const (
@@ -126,10 +129,14 @@ func sumOutputSerializeSizes(outputs []*wire.TxOut) (serializeSize int) {
 }
 
 // EstimateSerializeSize returns a worst case serialize size estimate for a
-// signed transaction that spends a number of outputs and contains each
+// signed VAR transaction that spends a number of outputs and contains each
 // transaction output from txOuts. The estimated size is incremented for an
 // additional change output if changeScriptSize is greater than 0. Passing 0
 // does not add a change output.
+//
+// VAR-only: callers building SKA transactions must use
+// EstimateSerializeSizeForCoinType (or the explicit SKA variant) so the
+// witness-bytes accounting picks the correct SKAValueIn worst-case width.
 func EstimateSerializeSize(scriptSizes []int, txOuts []*wire.TxOut, changeScriptSize int) int {
 	return estimateSerializeSizeInternal(scriptSizes, txOuts, changeScriptSize, false)
 }
@@ -139,6 +146,15 @@ func EstimateSerializeSize(scriptSizes []int, txOuts []*wire.TxOut, changeScript
 // (1-byte length prefix for the value), so change output estimation differs.
 func EstimateSerializeSizeSKA(scriptSizes []int, txOuts []*wire.TxOut, changeScriptSize int) int {
 	return estimateSerializeSizeInternal(scriptSizes, txOuts, changeScriptSize, true)
+}
+
+// EstimateSerializeSizeForCoinType is the coin-type-parameterised wrapper
+// over EstimateSerializeSize / EstimateSerializeSizeSKA. Prefer this entry
+// point so a single dispatch on ct routes to the correct witness/output
+// width — calling the VAR variant on a slice that contains SKA outputs
+// silently under-estimates the witness bytes.
+func EstimateSerializeSizeForCoinType(ct cointype.CoinType, scriptSizes []int, txOuts []*wire.TxOut, changeScriptSize int) int {
+	return estimateSerializeSizeInternal(scriptSizes, txOuts, changeScriptSize, ct.IsSKA())
 }
 
 func estimateSerializeSizeInternal(scriptSizes []int, txOuts []*wire.TxOut, changeScriptSize int, isSKA bool) int {
@@ -224,14 +240,15 @@ func EstimateSerializeSizeFromScriptSizes(inputSizes []int, outputSizes []int, c
 //   - 32 bytes previous tx
 //   - 4 bytes output index
 //   - 1 byte tree
-//   - 8 bytes amount
+//   - 8 bytes amount (ValueIn)
+//   - 1 byte SKAValueInLen (V13: always present, 0 for VAR inputs)
 //   - 4 bytes block height
 //   - 4 bytes block index
 //   - the compact int representation of the script size
 //   - the supplied script size
 //   - 4 bytes sequence
 func EstimateInputSize(scriptSize int) int {
-	return 32 + 4 + 1 + 8 + 4 + 4 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize + 4
+	return 32 + 4 + 1 + 8 + 1 + 4 + 4 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize + 4
 }
 
 // EstimateOutputSize returns the worst case serialize size estimate for a tx output
@@ -244,21 +261,27 @@ func EstimateOutputSize(scriptSize int) int {
 	return 8 + 1 + 2 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize
 }
 
+// MaxSKAValueBytes is the worst-case length in bytes of a serialized SKA
+// value (big.Int atoms). The wire format encodes any value up to 255 bytes,
+// but for fee estimation we use this bound — chain-params validation rejects
+// any SKA coin whose MaxSupply exceeds it, so the assumption is safe.
+//
+// SKA1 currently configured at 900T coins × 1e18 atoms/coin ≈ 14 bytes; 16
+// gives ~2 bytes of headroom for future configurations within the same order
+// of magnitude. Coins that need more must update this constant and the
+// chain-params validator together.
+const MaxSKAValueBytes = 16
+
 // EstimateOutputSizeSKA returns the serialize size estimate for an SKA tx output.
 // SKA outputs have a different format from VAR:
 //   - 1 byte coin type
 //   - 1 byte value length prefix
-//   - N bytes value (up to 16 bytes for large amounts)
+//   - N bytes value (up to MaxSKAValueBytes)
 //   - 2 bytes version
 //   - the compact int representation of the script size
 //   - the supplied script size
-//
-// We use worst-case 16 bytes for value to ensure fee is never underestimated.
-// SKA amounts can be very large (900T * 1e18 = ~14 bytes), so we round up.
 func EstimateOutputSizeSKA(scriptSize int) int {
-	// SKA format: CoinType(1) + ValLen(1) + Value(16 max) + Version(2) + VarInt + PkScript
-	// Always overestimate to avoid fee rejection
-	return 1 + 1 + 16 + 2 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize
+	return 1 + 1 + MaxSKAValueBytes + 2 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize
 }
 
 // EstimateInputPrefixSize returns the serialize size estimate for a tx input prefix
@@ -284,9 +307,9 @@ func EstimateInputWitnessSize(scriptSize int) int {
 }
 
 // EstimateInputWitnessSizeSKA returns the serialize size estimate for an SKA tx input witness.
-// SKA inputs include SKAValueIn which can be up to 16 bytes for large amounts.
-// We use worst-case 16 bytes to ensure fee is never underestimated.
+// SKA inputs include SKAValueIn which can be up to MaxSKAValueBytes for large
+// amounts. The bound is enforced by chain-params validation at wallet open.
 func EstimateInputWitnessSizeSKA(scriptSize int) int {
-	// V13 SKA format: ValueIn(8) + SKAValueInLen(1) + SKAValueIn(16 max) + BlockHeight(4) + BlockIndex(4) + VarInt + SigScript
-	return 8 + 1 + 16 + 4 + 4 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize
+	// V13 SKA format: ValueIn(8) + SKAValueInLen(1) + SKAValueIn(MaxSKAValueBytes) + BlockHeight(4) + BlockIndex(4) + VarInt + SigScript
+	return 8 + 1 + MaxSKAValueBytes + 4 + 4 + wire.VarIntSerializeSize(uint64(scriptSize)) + scriptSize
 }

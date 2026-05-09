@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
+	"github.com/monetarium/monetarium-node/chaincfg"
+	"github.com/monetarium/monetarium-node/hdkeychain"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
 // expectedAddr is used to house the expected return values from a managed
@@ -175,7 +177,10 @@ func testKnownAddresses(ctx context.Context, tc *testContext, prefix string, unl
 				tests[i].branch, branch)
 		}
 
-		pubKey := a.PubKey()
+		pubKey, err := a.PubKey()
+		if err != nil {
+			tc.t.Errorf("%s: PubKey: %v", prefix, err)
+		}
 		if !bytes.Equal(pubKey, tests[i].pubKey) {
 			tc.t.Errorf("%s: expected pubkey %v got %v",
 				prefix, hex.EncodeToString(tests[i].pubKey),
@@ -306,4 +311,66 @@ func useAddress(child uint32) func(ctx context.Context, t *testing.T, w *Wallet)
 		}
 		watchFutureAddresses(ctx, t, w)
 	}
+}
+
+// TestXpubAddressPubKeyError verifies that xpubAddress.PubKey() returns an
+// error rather than panicking when the underlying HD derivation fails. This
+// is the regression test for the inherited-from-upstream `panic(err)` calls
+// removed in favor of explicit error propagation: a hardened branch index
+// against a public-only extended key is the canonical case where Child()
+// fails (hdkeychain.ErrDeriveHardFromPublic), and a long-running RPC server
+// must surface this as an error rather than dropping the goroutine.
+func TestXpubAddressPubKeyError(t *testing.T) {
+	// Build a real public-only extended key from a deterministic seed.
+	seed := bytes.Repeat([]byte{0x42}, hdkeychain.RecommendedSeedLen)
+	master, err := hdkeychain.NewMaster(seed, chaincfg.SimNetParams())
+	if err != nil {
+		t.Fatalf("NewMaster: %v", err)
+	}
+	xpub := master.Neuter()
+
+	t.Run("hardened branch fails on xpub", func(t *testing.T) {
+		x := &xpubAddress{
+			xpub:   xpub,
+			branch: hdkeychain.HardenedKeyStart, // unreachable from a public xpub
+			child:  0,
+		}
+		got, err := x.PubKey()
+		if err == nil {
+			t.Fatalf("expected error from hardened-branch derivation, got bytes %x", got)
+		}
+		if got != nil {
+			t.Errorf("expected nil pubkey on error, got %x", got)
+		}
+	})
+
+	t.Run("hardened child fails on xpub", func(t *testing.T) {
+		x := &xpubAddress{
+			xpub:   xpub,
+			branch: 0,
+			child:  hdkeychain.HardenedKeyStart,
+		}
+		got, err := x.PubKey()
+		if err == nil {
+			t.Fatalf("expected error from hardened-child derivation, got bytes %x", got)
+		}
+		if got != nil {
+			t.Errorf("expected nil pubkey on error, got %x", got)
+		}
+	})
+
+	t.Run("valid branch and child succeed", func(t *testing.T) {
+		x := &xpubAddress{
+			xpub:   xpub,
+			branch: 0,
+			child:  0,
+		}
+		got, err := x.PubKey()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) == 0 {
+			t.Fatal("expected non-empty pubkey")
+		}
+	})
 }

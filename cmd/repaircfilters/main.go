@@ -172,7 +172,8 @@ func repair() error {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(rpcCertificate)
 	tc := &tls.Config{
-		RootCAs: pool,
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
 	}
 	addr := "wss://" + opts.RPCConnect + "/ws"
 	rpcopts = append(rpcopts, wsrpc.WithTLSConfig(tc))
@@ -190,8 +191,8 @@ func repair() error {
 	height := int32(0)
 	for {
 		n, ioErr := cffile.Read(cfbuf[readOffset:])
-		if err != nil && !errors.Is(ioErr, io.EOF) {
-			return errContext(err, "cfiltersfile read error")
+		if ioErr != nil && !errors.Is(ioErr, io.EOF) {
+			return errContext(ioErr, "cfiltersfile read error")
 		}
 
 		var filters []string

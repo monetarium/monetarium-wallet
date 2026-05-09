@@ -200,13 +200,13 @@ func TestListUnspentResultWithCoinType(t *testing.T) {
 		Tree:          0,
 		Address:       "SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc",
 		Account:       "default",
-		Amount:        1.5,
+		Amount:        "1.5",
 		Confirmations: 10,
 		Spendable:     true,
-		CoinType:      1, // SKA-1
+		CoinType:      1, // SKA1
 	}
 
-	expectedJSON := `{"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0,"tree":0,"txtype":0,"address":"SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc","account":"default","scriptPubKey":"","amount":1.5,"confirmations":10,"spendable":true,"cointype":1}`
+	expectedJSON := `{"txid":"1111111111111111111111111111111111111111111111111111111111111111","vout":0,"tree":0,"txtype":0,"address":"SsWKp7wtdTZYabYFYSc9cnxhwFEjA5g4pFc","account":"default","scriptPubKey":"","amount":"1.5","confirmations":10,"spendable":true,"cointype":1}`
 
 	// Test marshaling
 	got, err := json.Marshal(result)
@@ -282,6 +282,105 @@ func TestCommandConstructors(t *testing.T) {
 		if *cmd.CoinType != 1 {
 			t.Errorf("CoinType = %d, want 1", *cmd.CoinType)
 		}
+	})
+}
+
+// TestSpendOutputsCmdWithCoinType pins the JSON wire format for the
+// SKA extension to spendoutputs: optional CoinType field and AddressAmountPair
+// Amount as a unified decimal coin string for both VAR and SKA.
+func TestSpendOutputsCmdWithCoinType(t *testing.T) {
+	t.Run("VAR (no CoinType, decimal-string amount)", func(t *testing.T) {
+		cmd := &SpendOutputsCmd{
+			Account:           "default",
+			PreviousOutpoints: []string{"abc:0"},
+			Outputs: []AddressAmountPair{
+				{Address: "addr1", Amount: "1.5"},
+			},
+		}
+		got, err := json.Marshal(cmd)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		want := `{"Account":"default","PreviousOutpoints":["abc:0"],"Outputs":[{"address":"addr1","amount":"1.5"}]}`
+		if string(got) != want {
+			t.Errorf("Marshal: got %s, want %s", got, want)
+		}
+
+		var round SpendOutputsCmd
+		if err := json.Unmarshal(got, &round); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if round.CoinType != nil {
+			t.Errorf("CoinType: want nil, got %v", *round.CoinType)
+		}
+		if round.Outputs[0].Amount != "1.5" {
+			t.Errorf("Amount: want \"1.5\", got %q", round.Outputs[0].Amount)
+		}
+	})
+
+	t.Run("SKA with CoinType and decimal-string amount", func(t *testing.T) {
+		cmd := &SpendOutputsCmd{
+			Account:           "default",
+			PreviousOutpoints: []string{"abc:0"},
+			Outputs: []AddressAmountPair{
+				{Address: "addr1", Amount: "50000000000.123"},
+			},
+			CoinType: uint8Ptr(1),
+		}
+		got, err := json.Marshal(cmd)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		var round SpendOutputsCmd
+		if err := json.Unmarshal(got, &round); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if round.CoinType == nil || *round.CoinType != 1 {
+			t.Errorf("CoinType: want 1, got %v", round.CoinType)
+		}
+		if round.Outputs[0].Amount != "50000000000.123" {
+			t.Errorf("Amount: want \"50000000000.123\", got %q", round.Outputs[0].Amount)
+		}
+	})
+
+	t.Run("Unmarshal rejects legacy JSON-number amount", func(t *testing.T) {
+		// Post-unification, Amount is a string. JSON numbers must fail to
+		// unmarshal — this is the breaking change documented on the type.
+		varJSON := `{"Account":"default","PreviousOutpoints":["abc:0"],"Outputs":[{"address":"addr1","amount":2.0}]}`
+		var varCmd SpendOutputsCmd
+		if err := json.Unmarshal([]byte(varJSON), &varCmd); err == nil {
+			t.Errorf("Unmarshal of float Amount: want error (string field), got nil")
+		}
+	})
+
+	roundtripDeepEqual := func(t *testing.T, cmd *SpendOutputsCmd) {
+		t.Helper()
+		bs, err := json.Marshal(cmd)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		var got SpendOutputsCmd
+		if err := json.Unmarshal(bs, &got); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if !reflect.DeepEqual(&got, cmd) {
+			t.Errorf("round-trip mismatch: got %+v, want %+v", &got, cmd)
+		}
+	}
+	t.Run("DeepEqual round-trip VAR", func(t *testing.T) {
+		roundtripDeepEqual(t, &SpendOutputsCmd{
+			Account:           "default",
+			PreviousOutpoints: []string{"abc:0"},
+			Outputs:           []AddressAmountPair{{Address: "addr1", Amount: "1.5"}},
+		})
+	})
+	t.Run("DeepEqual round-trip SKA", func(t *testing.T) {
+		roundtripDeepEqual(t, &SpendOutputsCmd{
+			Account:           "default",
+			PreviousOutpoints: []string{"abc:0"},
+			Outputs:           []AddressAmountPair{{Address: "addr1", Amount: "1.5"}},
+			CoinType:          uint8Ptr(1),
+		})
 	})
 }
 

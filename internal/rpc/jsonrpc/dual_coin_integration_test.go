@@ -106,7 +106,7 @@ func TestGetCoinBalanceIntegration(t *testing.T) {
 			wantErr:  false,
 		},
 		{
-			name:     "SKA-1 balance test",
+			name:     "SKA1 balance test",
 			coinType: 1,
 			minConf:  1,
 			wantErr:  false,
@@ -212,7 +212,7 @@ func TestListCoinTypesIntegration(t *testing.T) {
 					if coinType == cointype.CoinTypeVAR {
 						expectedName = "VAR"
 					} else {
-						expectedName = fmt.Sprintf("SKA-%d", coinType)
+						expectedName = fmt.Sprintf("SKA%d", coinType)
 					}
 
 					t.Logf("Coin type %d (%s) balance: %v", coinType, expectedName, balance.Spendable)

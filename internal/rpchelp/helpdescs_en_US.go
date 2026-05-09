@@ -79,12 +79,14 @@ var helpDescsEnUS = map[string]string{
 
 	// CreateAuthorizedEmissionCmd help.
 	"createauthorizedemission--synopsis": "Creates a cryptographically authorized SKA emission transaction using governance-defined parameters.\n" +
-		"The wallet must be unlocked for this request to succeed.",
+		"The wallet is unlocked for this single call using the supplied passphrase and re-locked on return.",
 	"createauthorizedemission-cointype":        "SKA coin type to emit (1-255)",
 	"createauthorizedemission-emissionkeyname": "Name of the imported emission private key",
 	"createauthorizedemission-passphrase":      "Wallet passphrase for key access",
 	"createauthorizedemission-height":          "Optional: explicit block height to sign into the emission authorization. Defaults to the wallet's local synced tip, which can be stale during reorgs.",
 	"createauthorizedemission-nonce":           "Optional: emission nonce. Defaults to 1 (first emission). Override only when re-authorizing a coin type that has already been emitted.",
+	"createauthorizedemission-forcewindow":     "Optional: bypass the out-of-window-height safety error and produce the (likely inert) authorization anyway. Default false.",
+	"createauthorizedemission-forcenonce":      "Optional: bypass the non-default-nonce safety error and produce the (likely inert) authorization anyway. Default false.",
 	"createauthorizedemission--result0":        "Hex-encoded bytes of the signed emission transaction",
 
 	// CreateRawTransactionCmd help.
@@ -98,6 +100,12 @@ var helpDescsEnUS = map[string]string{
 	"createrawtransaction-amounts--desc":  "The destination address as the key and the amount in VAR as the value",
 	"createrawtransaction-locktime":       "Locktime value; a non-zero value will also locktime-activate the inputs",
 	"createrawtransaction-expiry":         "Expiry value; a non-zero value when the transaction expiry",
+	"createrawtransaction-cointype":       "Optional coin type (0=VAR default, 1-255=SKA). When set to a SKA coin, supply skaamounts instead of amounts.",
+	"createrawtransaction-inputamounts":   "Optional decimal-coin override per input (index-aligned with inputs). Supplied entries replace the legacy float64 input amount with full precision; required for VAR amounts above ~9e7 VAR where float64 round-trip loses precision.",
+	"createrawtransaction-skaamounts":     "JSON object of destination addresses to decimal-string atomic SKA amounts (use when cointype is a SKA coin)",
+	"createrawtransaction-skaamounts--key":   "address",
+	"createrawtransaction-skaamounts--value": "n.nnn",
+	"createrawtransaction-skaamounts--desc":  "The destination address as the key and the SKA amount in decimal-string atoms as the value",
 	"createrawtransaction--result0":       "Hex-encoded bytes of the serialized transaction",
 
 	// CreateSignatureCmd help.
@@ -142,18 +150,20 @@ var helpDescsEnUS = map[string]string{
 	"fundrawtransaction-fundaccount":          "Account of outputs to spend in transaction",
 	"fundrawtransaction-options":              "Object to specify fixed change address, alternative fee rate, and confirmation target",
 	"fundrawtransactionoptions-conf_target":   "Required confirmations of selected previous outputs",
-	"fundrawtransactionoptions-feerate":       "Alternative fee rate",
+	"fundrawtransactionoptions-feerate":       "Alternative fee rate (VAR only; rejected for SKA-coin transactions, which use the wallet's configured SKA relay fee)",
 	"fundrawtransactionoptions-changeaddress": "Provide a change address rather than deriving one from the funding account",
 	"fundrawtransactionresult-hex":            "Funded transaction in hex encoding",
-	"fundrawtransactionresult-fee":            "Absolute fee of funded transaction",
+	"fundrawtransactionresult-fee":            "Absolute fee of the funded transaction as a decimal coin string (VAR or SKA, formatted in the coin type's native scale)",
 
 	// GenerateEmissionKeyCmd help.
 	"generateemissionkey--synopsis": "Generates a new private key for SKA emission authorization.\n" +
-		"The wallet must be unlocked (via walletpassphrase) for this request to succeed.\n" +
+		"The wallet is unlocked for this single call using the supplied walletpassphrase and re-locked on return; " +
+		"the ambient walletpassphrase unlock window is NOT used.\n" +
 		"The key is stored in the wallet database under the scrypt-protected master key; " +
 		"the wallet DB is the canonical backup target.",
 	"generateemissionkey-keyname":               "Unique identifier for this emission key",
-	"generateemissionkey-passphrase":            "Passphrase used to encrypt the returned backup blob (only relevant when returnencryptedbackup=true); unrelated to the wallet-unlock passphrase",
+	"generateemissionkey-walletpassphrase":      "Wallet master passphrase. Used only to unlock the wallet for this single call; the wallet is re-locked on return if it was locked beforehand. NOT the backup-blob passphrase.",
+	"generateemissionkey-passphrase":            "Backup-blob encryption passphrase (only used when returnencryptedbackup=true). Unrelated to the wallet master passphrase. Minimum 12 characters when returnencryptedbackup=true.",
 	"generateemissionkey-cointype":              "Optional SKA coin type (1-255) for organization",
 	"generateemissionkey-returnencryptedbackup": "If true, include the encrypted private-key backup in the response; default false",
 	"generateemissionkey--result0":              "The public key corresponding to the generated private key",
@@ -416,7 +426,9 @@ var helpDescsEnUS = map[string]string{
 	"getmultisigoutinfo-index":     "Index of input.",
 	"getmultisigoutinfo-hash":      "Input hash to check.",
 
-	"getmultisigoutinforesult-amount":       "Amount of coins contained.",
+	"getmultisigoutinforesult-amount":       "Amount of coins contained (VAR, float64).",
+	"getmultisigoutinforesult-skaamount":    "Amount of SKA coins contained (string, full precision).",
+	"getmultisigoutinforesult-cointype":     "Coin type (0=VAR, 1-255=SKA).",
 	"getmultisigoutinforesult-spentbyindex": "Index of spending tx.",
 	"getmultisigoutinforesult-spentby":      "Hash of spending tx.",
 	"getmultisigoutinforesult-spent":        "If it has been spent.",
@@ -586,12 +598,14 @@ var helpDescsEnUS = map[string]string{
 
 	// ImportEmissionKeyCmd help.
 	"importemissionkey--synopsis": "Imports a private key for SKA emission authorization (emergency/recovery only).\n" +
-		"The wallet must be unlocked for this request to succeed.",
-	"importemissionkey-keyname":    "Unique identifier for this emission key",
-	"importemissionkey-privatekey": "Hex-encoded secp256k1 private key or encrypted format",
-	"importemissionkey-passphrase": "Wallet passphrase for key encryption",
-	"importemissionkey-cointype":   "Optional SKA coin type (1-255) for organization",
-	"importemissionkey--result0":   "The public key corresponding to the imported private key",
+		"The wallet is unlocked for this single call using the supplied walletpassphrase and re-locked on return; " +
+		"the ambient walletpassphrase unlock window is NOT used.",
+	"importemissionkey-keyname":          "Unique identifier for this emission key",
+	"importemissionkey-privatekey":       "Hex-encoded secp256k1 private key or encrypted format",
+	"importemissionkey-walletpassphrase": "Wallet master passphrase. Used only to unlock the wallet for this single call; the wallet is re-locked on return if it was locked beforehand. NOT the backup-blob passphrase.",
+	"importemissionkey-passphrase":       "Backup-blob passphrase (only used when privatekey is an aes256gcm: backup blob). Unrelated to the wallet master passphrase. Ignored when privatekey is plain hex.",
+	"importemissionkey-cointype":         "Optional SKA coin type (1-255) for organization",
+	"importemissionkey--result0":         "The public key corresponding to the imported private key",
 
 	// ImportPrivKeyCmd help.
 	"importprivkey--synopsis": "Imports a WIF-encoded private key to the 'imported' account.",
@@ -627,9 +641,10 @@ var helpDescsEnUS = map[string]string{
 	"inforesult-proxy":           "The proxy used by the server",
 	"inforesult-difficulty":      "The current target difficulty",
 	"inforesult-testnet":         "Whether or not server is using testnet",
-	"inforesult-relayfee":        "The minimum relay fee for non-free transactions in VAR/KB",
+	"inforesult-relayfee":        "The minimum relay fee for non-free transactions, as a decimal coin string per KB",
 	"inforesult-errors":          "Any current errors",
-	"inforesult-paytxfee":        "The fee per kB of the serialized tx size used each time more fee is required for an authored transaction",
+	"inforesult-cointype":        "Active coin type. Not available for watching-only wallets.",
+	"inforesult-paytxfee":        "The fee per kB of the serialized tx size used each time more fee is required for an authored transaction, as a decimal coin string",
 	"inforesult-balance":         "The balance of all accounts calculated with one block confirmation",
 	"inforesult-walletversion":   "The version of the address manager database",
 	"inforesult-unlocked_until":  "Unset",
@@ -665,6 +680,7 @@ var helpDescsEnUS = map[string]string{
 	// ListReceivedByAccountResult help.
 	"listreceivedbyaccountresult-account":       "The name of the account",
 	"listreceivedbyaccountresult-amount":        "Total amount received by payment addresses of the account valued in Monetarium",
+	"listreceivedbyaccountresult-amountstr":     "Total amount as a full-precision decimal string",
 	"listreceivedbyaccountresult-confirmations": "Number of block confirmations of the most recent transaction relevant to the account",
 
 	// ListReceivedByAddressCmd help.
@@ -677,6 +693,7 @@ var helpDescsEnUS = map[string]string{
 	"listreceivedbyaddressresult-account":           "DEPRECATED -- Unset",
 	"listreceivedbyaddressresult-address":           "The payment address",
 	"listreceivedbyaddressresult-amount":            "Total amount received by the payment address valued in Monetarium",
+	"listreceivedbyaddressresult-amountstr":          "Total amount as a full-precision decimal string",
 	"listreceivedbyaddressresult-confirmations":     "Number of block confirmations of the most recent transaction relevant to the address",
 	"listreceivedbyaddressresult-txids":             "Transaction hashes of all transactions involving this address",
 	"listreceivedbyaddressresult-involvesWatchonly": "Unset",
@@ -738,7 +755,7 @@ var helpDescsEnUS = map[string]string{
 	"listunspentresult-account":       "The account associated with the receiving payment address",
 	"listunspentresult-scriptPubKey":  "The output script encoded as a hexadecimal string",
 	"listunspentresult-redeemScript":  "The redeemScript if scriptPubKey is P2SH",
-	"listunspentresult-amount":        "The amount of the output valued in Monetarium",
+	"listunspentresult-amount":        "The amount of the output as a decimal coin string (VAR or SKA, formatted in the coin type's native scale)",
 	"listunspentresult-confirmations": "The number of block confirmations of the transaction",
 	"listunspentresult-spendable":     "Whether the output is entirely controlled by wallet keys/scripts (false for partially controlled multisig outputs or outputs to watch-only addresses)",
 	"listunspentresult-txtype":        "The type of the transaction",
@@ -807,7 +824,7 @@ var helpDescsEnUS = map[string]string{
 	"redeemmultisigoutresult-hex":      "Resulting hash.",
 
 	// RedeemMultiSigouts help.
-	"redeemmultisigouts--synopsis":       "Takes a hash, looks up all unspent outpoints and generates list artially signed transactions spending to either an address specified or internal addresses. At most 256 outpoints are processed per call; the response's truncated field indicates whether more outpoints remain to be redeemed.",
+	"redeemmultisigouts--synopsis":       "Takes a hash, looks up all unspent outpoints and generates list artially signed transactions spending to either an address specified or internal addresses. At most 256 outpoints are processed per call; the response's truncated field indicates whether more outpoints remain to be redeemed. Per-output failures do not abort the batch — failed outpoints appear in results with Complete=false and the error in Errors[].",
 	"redeemmultisigouts-number":          "Maximum number of outpoints to redeem in this call (server-side cap of 256 applies).",
 	"redeemmultisigouts-toaddress":       "Address to look for (if not internal addresses).",
 	"redeemmultisigouts-fromscraddress":  "Input script hash address.",
@@ -1008,9 +1025,10 @@ var helpDescsEnUS = map[string]string{
 	"spendoutputs-account":           "Account of specified previous outpoints, and account used to return change",
 	"spendoutputs-previousoutpoints": `Array of outpoints in string encoding ("hash:index")`,
 	"spendoutputs-outputs":           "Array of JSON objects, each specifying an address string and amount",
+	"spendoutputs-cointype":          "Coin type for the spend (omit or 0 for VAR; 1-255 for SKA). All inputs and outputs must share this coin type.",
 	"spendoutputs--result0":          "The published transaction hash",
 	"addressamountpair-address":      "Address to pay",
-	"addressamountpair-amount":       "Amount to pay the address",
+	"addressamountpair-amount":       "Amount to pay the address (JSON number for VAR; decimal string for SKA precision)",
 
 	// SweepAccount help.
 	"sweepaccount--synopsis":             "Moves as much value as possible in a transaction from an account.\n",
@@ -1018,12 +1036,15 @@ var helpDescsEnUS = map[string]string{
 	"sweepaccount-destinationaddress":    "The destination address to pay to.",
 	"sweepaccount-requiredconfirmations": "The minimum utxo confirmation requirement (optional).",
 	"sweepaccount-feeperkb":              "The minimum relay fee policy (optional).",
+	"sweepaccount-cointype":              "Optional: Coin type to sweep (0=VAR, 1-255=SKA). Default is VAR (0). UTXOs of other coin types are ignored.",
 
 	// SweepAccountResult help.
-	"sweepaccountresult-unsignedtransaction":       "The hex encoded string of the unsigned transaction.",
-	"sweepaccountresult-totalpreviousoutputamount": "The total transaction input amount.",
-	"sweepaccountresult-totaloutputamount":         "The total transaction output amount.",
-	"sweepaccountresult-estimatedsignedsize":       "The estimated size of the transaction when signed.",
+	"sweepaccountresult-unsignedtransaction":          "The hex encoded string of the unsigned transaction.",
+	"sweepaccountresult-totalpreviousoutputamount":    "The total transaction input amount as a float64 in coin units (lossy for SKA; prefer totalpreviousoutputamountstr).",
+	"sweepaccountresult-totaloutputamount":            "The total transaction output amount as a float64 in coin units (lossy for SKA; prefer totaloutputamountstr).",
+	"sweepaccountresult-totalpreviousoutputamountstr": "The total transaction input amount as a base-10 decimal coin string (full precision for SKA).",
+	"sweepaccountresult-totaloutputamountstr":         "The total transaction output amount as a base-10 decimal coin string (full precision for SKA).",
+	"sweepaccountresult-estimatedsignedsize":          "The estimated size of the transaction when signed.",
 
 	// TicketInfoCmd help.
 	"ticketinfo--synopsis":           "Returns details of each wallet ticket transaction",
@@ -1104,10 +1125,6 @@ var helpDescsEnUS = map[string]string{
 		"Not available for imported accounts. Only present for BIP0044 derived addresses.",
 	"validateaddressresult-branch": "The HD branch. Only present for BIP0044 derived addresses.",
 	"validateaddressresult-index":  "The HD index. Only present for BIP0044 derived addresses.",
-
-	// ValidatePreDCP0005CFCmd help
-	"validatepredcp0005cf--synopsis": "Validate whether all stored cfilters from before DCP0005 activation are correct according to the expected hardcoded hash",
-	"validatepredcp0005cf--result0":  "Whether the cfilters are valid",
 
 	// VerifyMessageCmd help.
 	"verifymessage--synopsis": "Verify a message was signed with the associated private key of some address.",

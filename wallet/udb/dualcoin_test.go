@@ -31,15 +31,15 @@ func TestDualCoinCredit(t *testing.T) {
 			description: "Standard VAR coin from mining",
 		},
 		{
-			name:        "SKA-1 emission",
+			name:        "SKA1 emission",
 			coinType:    cointype.CoinType(1),
-			amount:      dcrutil.Amount(100000000), // 1 SKA-1
+			amount:      dcrutil.Amount(100000000), // 1 SKA1
 			description: "SKA coin type 1 from emission",
 		},
 		{
-			name:        "SKA-255 maximum",
+			name:        "SKA255 maximum",
 			coinType:    cointype.CoinType(255),
-			amount:      dcrutil.Amount(250000000), // 2.5 SKA-255
+			amount:      dcrutil.Amount(250000000), // 2.5 SKA255
 			description: "Maximum SKA coin type",
 		},
 	}
@@ -139,7 +139,7 @@ func TestNewCreditRecord(t *testing.T) {
 			},
 			{
 				Value:    int64(200000000),
-				CoinType: cointype.CoinType(1), // SKA-1
+				CoinType: cointype.CoinType(1), // SKA1
 				PkScript: []byte{0xa9, 0x14},   // Mock P2SH script
 			},
 		},
@@ -237,11 +237,11 @@ func TestDualCoinTransactionValidation(t *testing.T) {
 			description: "All VAR inputs and outputs",
 		},
 		{
-			name:        "pure SKA-1 transaction",
+			name:        "pure SKA1 transaction",
 			inputTypes:  []cointype.CoinType{cointype.CoinType(1), cointype.CoinType(1)},
 			outputTypes: []cointype.CoinType{cointype.CoinType(1)},
 			valid:       true,
-			description: "All SKA-1 inputs and outputs",
+			description: "All SKA1 inputs and outputs",
 		},
 		{
 			name:        "mixed coin transaction (invalid)",
@@ -309,12 +309,12 @@ func TestUnminedCreditCoinType(t *testing.T) {
 			amount:   100000000, // 1 VAR
 		},
 		{
-			name:     "SKA-1 unmined credit",
+			name:     "SKA1 unmined credit",
 			coinType: cointype.CoinType(1),
 			amount:   50000000, // 0.5 SKA
 		},
 		{
-			name:     "SKA-2 unmined credit",
+			name:     "SKA2 unmined credit",
 			coinType: cointype.CoinType(2),
 			amount:   25000000, // 0.25 SKA
 		},

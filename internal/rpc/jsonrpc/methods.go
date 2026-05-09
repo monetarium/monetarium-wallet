@@ -17,11 +17,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/monetarium/monetarium-wallet/chain"
@@ -93,17 +95,18 @@ const (
 )
 
 // resolveRedeemMultiSigOutsCap clamps a caller-supplied cmd.Number against
-// the server-side redeemMultiSigOutsMax and reports whether more outputs
-// were available than will be processed in a single call. A nil or zero
-// cmd.Number is treated as "use the default cap" — never as "return zero
-// results" — so callers that omit the field don't get a silently empty
-// response. Factored out for unit testing without a fully-mocked wallet.
-func resolveRedeemMultiSigOutsCap(reqNumber *int, available int) (limit uint32, truncated bool) {
+// the server-side redeemMultiSigOutsMax. A nil or zero cmd.Number is treated
+// as "use the default cap" — never as "return zero results" — so callers
+// that omit the field don't get a silently empty response.
+//
+// Whether the result was truncated is computed downstream by
+// redeemMultiSigOutsCollect after coin-type filtering, since pre-filter
+// counts overstate truncation in mixed-coin-type wallets.
+func resolveRedeemMultiSigOutsCap(reqNumber *int) (limit uint32) {
 	limit = redeemMultiSigOutsMax
 	if reqNumber != nil && *reqNumber > 0 && uint32(*reqNumber) < limit {
 		limit = uint32(*reqNumber)
 	}
-	truncated = uint32(available) > limit
 	return
 }
 
@@ -115,37 +118,215 @@ func validateCoinType(coinType cointype.CoinType) error {
 	return nil
 }
 
+// validateCoinTypeConfigured combines validateCoinType with a chain-config
+// presence check: an SKA coin type that passes validateCoinType still has to
+// be configured in chainParams.SKACoins for the active network. Without the
+// presence check, a caller-supplied SKA coin type that is in range but not
+// configured would silently fall through to coin-type-agnostic codepaths and
+// produce confusing downstream errors. VAR (0) is always valid and present.
+func validateCoinTypeConfigured(params *chaincfg.Params, ct cointype.CoinType) error {
+	if err := validateCoinType(ct); err != nil {
+		return err
+	}
+	if ct.IsSKA() {
+		if params == nil || params.SKACoins == nil || params.SKACoins[ct] == nil {
+			return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"SKA coin type %d is not configured for this network", ct)
+		}
+	}
+	return nil
+}
+
+// skaCreditLookup is the wallet UTXO lookup used by populateSKAValueIn. The
+// real implementation is wallet.UnspentOutput; tests inject a stub.
+type skaCreditLookup func(ctx context.Context, op wire.OutPoint) (*udb.Credit, error)
+
+// populateSKAValueIn fills tx.TxIn[i].SKAValueIn for SKA inputs that arrived
+// with SKAValueIn=nil before the tx is handed to wallet.SignTransaction. Pin
+// for the HIGH-2 finding from the 2026-05-04 review.
+//
+// The wire format carries SKAValueIn through deserialize/serialize for txs
+// built by this wallet, so the common case is a no-op. This function defends
+// against a third-party tool that builds wire.MsgTx from primitives (only
+// PreviousOutPoint + ValueIn + SignatureScript — the upstream dcrwallet shape)
+// without the V13 wire-format extension fields, which would otherwise
+// produce an SKA tx with SKAValueIn=nil; the wallet would happily sign it
+// and the node would reject the broadcast with a fraud-proof error.
+//
+// Detection: a transaction's outputs cannot mix coin types (consensus
+// invariant; defense-in-depth check is in sendRawTransaction). The tx coin
+// type is therefore the first output's CoinType. VAR transactions are a
+// no-op.
+//
+// Population priority per input:
+//  1. Caller-supplied decimal-coin string in callerSKA (parsed against the
+//     SKA coin's atomsPerCoin via coinsToAtomsBig).
+//  2. Wallet UTXO set via the lookup callback (credit.SKAAmount).
+//  3. Refuse with ErrRPCInvalidParameter — the operator must either supply
+//     skaValueIn on the RawTxInput or sign on a wallet that owns the prevout.
+func populateSKAValueIn(ctx context.Context, tx *wire.MsgTx, params *chaincfg.Params,
+	callerSKA map[wire.OutPoint]string, lookup skaCreditLookup) error {
+
+	txCoinType := txrules.GetCoinTypeFromOutputs(tx.TxOut)
+	if !txCoinType.IsSKA() {
+		return nil
+	}
+	atomsPerCoin := getAtomsPerCoin(params, txCoinType)
+	for i, txIn := range tx.TxIn {
+		op := txIn.PreviousOutPoint
+		if txIn.SKAValueIn != nil && txIn.SKAValueIn.Sign() > 0 {
+			// On-wire SKAValueIn must satisfy the chain's MaxSupply bound
+			// regardless of source. Without this check, a peer-built tx with
+			// an out-of-bound SKAValueIn would reach signing; the node would
+			// reject the broadcast, but a non-broadcast caller (emission-tx
+			// pre-flight, multisig coordinator) would lose the magnitude
+			// guarantee. The contract is uniform: the bound is a property
+			// of the chain, not the source of the value.
+			if err := validateSKAAtomMagnitude(params, txCoinType, txIn.SKAValueIn); err != nil {
+				return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"skaValueIn for input %d (%s:%d): %v",
+					i, op.Hash, op.Index, err)
+			}
+			// On-wire SKAValueIn already populated. If the JSON RPC caller
+			// also supplied a skaValueIn, validate it (parse error / non-
+			// positive / out-of-magnitude all reject the call) and prefer
+			// the caller value when it differs — caller-priority is the
+			// wallet's documented contract; see TestPopulateSKAValueIn.
+			// The override is logged at Warn so operator logs surface it.
+			if s, ok := callerSKA[op]; ok {
+				atoms, err := coinsToAtomsBig(s, atomsPerCoin)
+				if err != nil {
+					return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"skaValueIn for input %d (%s:%d) is not a valid "+
+							"decimal coin string for coin type %d: %v",
+						i, op.Hash, op.Index, txCoinType, err)
+				}
+				if atoms.Sign() <= 0 {
+					return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"skaValueIn for input %d (%s:%d) must be positive",
+						i, op.Hash, op.Index)
+				}
+				if err := validateSKAAtomMagnitude(params, txCoinType, atoms); err != nil {
+					return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"skaValueIn for input %d (%s:%d): %v",
+						i, op.Hash, op.Index, err)
+				}
+				if atoms.Cmp(txIn.SKAValueIn) != 0 {
+					log.Warnf("populateSKAValueIn: caller-supplied skaValueIn=%s overrides on-wire %s for input %d (%s:%d)",
+						atoms.String(), txIn.SKAValueIn.String(), i, op.Hash, op.Index)
+					txIn.ValueIn = 0
+					txIn.SKAValueIn = atoms
+				}
+			}
+			continue
+		}
+		// 1. Caller-supplied decimal coin string. The caller value
+		// intentionally takes priority over the wallet's UTXO lookup so
+		// that operators can correct a stale wallet view (e.g. during
+		// reorgs or resync); this is exercised by
+		// TestPopulateSKAValueIn/"caller value beats wallet lookup".
+		if s, ok := callerSKA[op]; ok {
+			atoms, err := coinsToAtomsBig(s, atomsPerCoin)
+			if err != nil {
+				return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"skaValueIn for input %d (%s:%d) is not a valid "+
+						"decimal coin string for coin type %d: %v",
+					i, op.Hash, op.Index, txCoinType, err)
+			}
+			if atoms.Sign() <= 0 {
+				return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"skaValueIn for input %d (%s:%d) must be positive",
+					i, op.Hash, op.Index)
+			}
+			if err := validateSKAAtomMagnitude(params, txCoinType, atoms); err != nil {
+				return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"skaValueIn for input %d (%s:%d): %v",
+					i, op.Hash, op.Index, err)
+			}
+			txIn.ValueIn = 0
+			txIn.SKAValueIn = atoms
+			continue
+		}
+		// 2. Wallet UTXO set.
+		if lookup != nil {
+			credit, err := lookup(ctx, op)
+			if err == nil && credit != nil {
+				if credit.CoinType != txCoinType {
+					return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"input %d (%s:%d) is coin type %d but transaction "+
+							"outputs are coin type %d",
+						i, op.Hash, op.Index, credit.CoinType, txCoinType)
+				}
+				ska := credit.SKAAmount.BigInt()
+				if ska == nil || ska.Sign() <= 0 {
+					return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"input %d (%s:%d) has no SKA value recorded in "+
+							"wallet UTXO set", i, op.Hash, op.Index)
+				}
+				txIn.ValueIn = 0
+				txIn.SKAValueIn = new(big.Int).Set(ska)
+				continue
+			}
+		}
+		// 3. No source available — refuse with an actionable error.
+		return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"SKA input %d (%s:%d) has no SKAValueIn; provide it via "+
+				"the skaValueIn field on RawTxInput, or sign on a "+
+				"wallet that owns the prevout",
+			i, op.Hash, op.Index)
+	}
+	return nil
+}
+
+// validateSKAAtomMagnitude rejects SKA atom values that exceed the configured
+// MaxSupply for the given coin type. Used by populateSKAValueIn to bound
+// caller-supplied skaValueIn before the wallet commits expensive work
+// (signing, validation) on behalf of an authenticated RPC client. A no-op for
+// VAR or for unknown coin types (the latter is caught earlier by
+// validateCoinType / GetCoinTypeFromOutputs).
+func validateSKAAtomMagnitude(params *chaincfg.Params, ct cointype.CoinType, atoms *big.Int) error {
+	if atoms == nil || !ct.IsSKA() || params == nil {
+		return nil
+	}
+	cfg, ok := params.SKACoins[ct]
+	if !ok || cfg == nil || cfg.MaxSupply == nil {
+		return nil
+	}
+	if atoms.Cmp(cfg.MaxSupply) > 0 {
+		return fmt.Errorf("value %s atoms exceeds MaxSupply %s for coin type %d",
+			atoms.String(), cfg.MaxSupply.String(), ct)
+	}
+	return nil
+}
+
 // getAtomsPerCoin returns AtomsPerCoin for the given coin type from chain params.
-// VAR uses 1e8, SKA uses configured value (typically 1e18).
+// VAR uses 1e8, SKA uses configured value (typically 1e18). Always returns a
+// freshly-allocated *big.Int — never the underlying chain-params pointer or
+// the package-level cointype.AtomsPerSKACoin — so callers cannot accidentally
+// mutate shared state through the returned value.
 func getAtomsPerCoin(chainParams *chaincfg.Params, ct cointype.CoinType) *big.Int {
 	if ct.IsVAR() {
 		return big.NewInt(cointype.AtomsPerVAR)
 	}
 	if config, ok := chainParams.SKACoins[ct]; ok && config.AtomsPerCoin != nil {
-		return config.AtomsPerCoin
+		return new(big.Int).Set(config.AtomsPerCoin)
 	}
-	return cointype.AtomsPerSKACoin
+	return cointype.GetAtomsPerSKACoin()
 }
 
-// atomsToCoins converts atoms to coin units for display.
-// Uses the appropriate AtomsPerCoin based on coin type.
-func atomsToCoins(atoms int64, atomsPerCoin *big.Int) float64 {
+// atomsToDecimalString converts an int64 atom count to a decimal coin string
+// against the supplied atomsPerCoin. Used by VAR result renderers so the JSON
+// wire format is a uniform decimal string for both VAR and SKA.
+func atomsToDecimalString(atoms int64, atomsPerCoin *big.Int) string {
 	if atomsPerCoin == nil || atomsPerCoin.Sign() == 0 {
-		return float64(atoms) / cointype.AtomsPerVAR
+		atomsPerCoin = big.NewInt(cointype.AtomsPerVAR)
 	}
-	apc, _ := atomsPerCoin.Float64()
-	return float64(atoms) / apc
+	return cointype.AtomsToDecimalString(big.NewInt(atoms), atomsPerCoin)
 }
 
-// coinsToAtoms converts coin units to atoms for transaction creation.
-// Uses the appropriate AtomsPerCoin based on coin type.
-// WARNING: This loses precision for large SKA amounts. Use coinsToAtomsBig for SKA.
-func coinsToAtoms(coins float64, atomsPerCoin *big.Int) int64 {
-	if atomsPerCoin == nil || atomsPerCoin.Sign() == 0 {
-		return int64(coins * cointype.AtomsPerVAR)
-	}
-	apc, _ := atomsPerCoin.Float64()
-	return int64(coins * apc)
+// varAtomsToDecimalString is a shorthand for VAR amounts (1e8 atoms per coin).
+func varAtomsToDecimalString(amt dcrutil.Amount) string {
+	return cointype.AtomsToDecimalString(big.NewInt(int64(amt)), big.NewInt(cointype.AtomsPerVAR))
 }
 
 // coinsToAtomsBig converts a coin amount (as string or float64) to atoms using big.Int.
@@ -156,9 +337,31 @@ func coinsToAtoms(coins float64, atomsPerCoin *big.Int) int64 {
 // Negative amounts and fractional parts longer than the configured precision
 // are rejected — callers must validate before calling and never attempt to
 // represent debits as negative values.
+//
+// Precondition: atomsPerCoin must be a positive power of ten. The decimal-place
+// count is inferred from len(atomsPerCoin.String())-1, which is only equivalent
+// to log10 under that invariant — a non-pow10 value (e.g. 99999999) would
+// yield a fractional-precision count off by one. validateSKAChainParams in
+// wallet/wallet.go enforces this at wallet Open and rejects misconfigured
+// chain parameters with an actionable error, so by the time RPC handlers call
+// this function the invariant is guaranteed for the active chain.
 func coinsToAtomsBig(amount interface{}, atomsPerCoin *big.Int) (*big.Int, error) {
 	if atomsPerCoin == nil || atomsPerCoin.Sign() == 0 {
 		atomsPerCoin = big.NewInt(cointype.AtomsPerVAR)
+	}
+
+	// Defense in depth: validateSKAChainParams enforces that all SKA
+	// AtomsPerCoin values are exact powers of 10 at wallet open. The
+	// `decimals := len(atomsPerCoin.String())-1` shortcut below is only
+	// equivalent to log10(atomsPerCoin) under that invariant. A future
+	// call site that bypasses wallet-open validation must not silently
+	// corrupt the decimal-string ↔ atoms conversion. Reject negatives too —
+	// they would make the loop spin or produce a nonsensical scale.
+	if atomsPerCoin.Sign() < 0 {
+		return nil, fmt.Errorf("atomsPerCoin must be positive; got %s", atomsPerCoin.String())
+	}
+	if !wallet.IsPowerOf10(atomsPerCoin) {
+		return nil, fmt.Errorf("atomsPerCoin must be a power of 10; got %s", atomsPerCoin.String())
 	}
 
 	var amountStr string
@@ -166,7 +369,12 @@ func coinsToAtomsBig(amount interface{}, atomsPerCoin *big.Int) (*big.Int, error
 	case string:
 		amountStr = v
 	case float64:
-		// Format with enough precision for VAR (8 decimals)
+		// float64 has ~15 significant digits; reject for coin types with
+		// more decimal places (e.g. SKA with 18) to prevent silent precision loss.
+		decimals := len(atomsPerCoin.String()) - 1
+		if decimals > 15 {
+			return nil, fmt.Errorf("float64 amounts not supported for coin types with more than 15 decimal places; use string")
+		}
 		amountStr = strconv.FormatFloat(v, 'f', -1, 64)
 	case int64:
 		amountStr = strconv.FormatInt(v, 10)
@@ -178,6 +386,17 @@ func coinsToAtomsBig(amount interface{}, atomsPerCoin *big.Int) (*big.Int, error
 
 	if amountStr == "" {
 		return nil, fmt.Errorf("amount must not be empty")
+	}
+
+	// Cap the input length so an authenticated RPC caller cannot coerce the
+	// wallet into parsing a multi-megabyte decimal into a multi-megabyte
+	// big.Int. 100 chars is generous: 60 integer digits + '.' + 18 fractional
+	// digits + slack covers any legitimate amount under any configured
+	// AtomsPerCoin. Same DoS rationale as the salt/N/r/p caps in
+	// decryptPrivateKeyWithPassphrase.
+	const maxAmountStrLen = 100
+	if len(amountStr) > maxAmountStrLen {
+		return nil, fmt.Errorf("amount string too long (%d chars, max %d)", len(amountStr), maxAmountStrLen)
 	}
 
 	// Parse the decimal amount string
@@ -198,6 +417,17 @@ func coinsToAtomsBig(amount interface{}, atomsPerCoin *big.Int) (*big.Int, error
 
 	if strings.HasPrefix(intPart, "-") {
 		return nil, fmt.Errorf("amount must be non-negative: %s", amountStr)
+	}
+	// big.Int.SetString accepts a leading '+', and the empty integer part
+	// produced by inputs like "." or ".5" parses as 0 after fractional
+	// padding. Both violate the decimal-coin-string contract — reject them
+	// here so silently-zero or sign-prefixed amounts cannot reach the
+	// downstream Sign() checks.
+	if strings.HasPrefix(intPart, "+") {
+		return nil, fmt.Errorf("amount must not have a leading '+': %s", amountStr)
+	}
+	if intPart == "" {
+		return nil, fmt.Errorf("invalid amount format (missing integer part): %s", amountStr)
 	}
 
 	if len(fracPart) > decimals {
@@ -391,7 +621,6 @@ var handlers = map[string]handler{
 	"tspendpolicy":                     {fn: (*Server).tspendPolicy},
 	"unlockaccount":                    {fn: (*Server).unlockAccount},
 	"validateaddress":                  {fn: (*Server).validateAddress},
-	"validatepredcp0005cf":             {fn: (*Server).validatePreDCP0005CF},
 	"verifymessage":                    {fn: (*Server).verifyMessage},
 	"version":                          {fn: (*Server).version},
 	"walletinfo":                       {fn: (*Server).walletInfo},
@@ -628,7 +857,10 @@ func walletPubKeys(ctx context.Context, w *wallet.Wallet, keys []string) ([][]by
 		var pubKey []byte
 		switch a := a.(type) {
 		case wallet.PubKeyHashAddress:
-			pubKey = a.PubKey()
+			pubKey, err = a.PubKey()
+			if err != nil {
+				return nil, err
+			}
 		default:
 			err = errors.New("address has no associated public key")
 			return nil, rpcError(dcrjson.ErrRPCInvalidAddressOrKey, err)
@@ -812,10 +1044,11 @@ func (s *Server) consolidate(ctx context.Context, icmd any) (any, error) {
 	ct := cointype.CoinTypeVAR
 	if cmd.CoinType != nil {
 		ct = cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinTypeConfigured(w.ChainParams(), ct); err != nil {
+			return nil, err
+		}
 	}
 
-	// TODO In the future this should take the optional account and
-	// only consolidate UTXOs found within that account.
 	txHash, err := w.ConsolidateWithCoinType(ctx, cmd.Inputs, account, changeAddr, ct)
 	if err != nil {
 		return nil, err
@@ -869,10 +1102,42 @@ func (s *Server) createRawTransaction(ctx context.Context, icmd any) (any, error
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "Locktime out of range")
 	}
 
+	// Cap the output map size before allocating intermediate state. A
+	// multi-megabyte map would force the wallet through proportional
+	// sorted-slice + decoded-address + big.Int allocations before the
+	// downstream max-tx-size check rejects the resulting tx. 500 mirrors
+	// realistic standard-tx output counts.
+	const maxCreateRawTxAmounts = 500
+	if len(cmd.Amounts) > maxCreateRawTxAmounts {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"too many output addresses: got %d, limit %d",
+			len(cmd.Amounts), maxCreateRawTxAmounts)
+	}
+
+	// Determine coin type up front so input parsing can take the correct
+	// scale-aware path. Default to VAR (CoinType nil or 0). Amounts is a
+	// single map[string]string for both VAR and SKA — decimal coin strings
+	// preserve full SKA precision (1 SKA = 1e18 atoms) and avoid float64
+	// round-trip loss for VAR amounts above ~9e7 VAR.
+	ct := cointype.CoinTypeVAR
+	if cmd.CoinType != nil {
+		ct = cointype.CoinType(*cmd.CoinType)
+	}
+	varAtomsPerCoin := big.NewInt(cointype.AtomsPerVAR)
+
 	// Add all transaction inputs to a new transaction after performing
-	// some validity checks.
+	// some validity checks. For VAR inputs, prefer cmd.InputAmounts[i]
+	// (decimal coin string, lossless) when supplied, otherwise fall back to
+	// the legacy float64 input.Amount — float64 round-trips lose precision
+	// for VAR values above ~9e7 VAR. SKA inputs ignore the int64/float64
+	// value field entirely; SKAValueIn is populated from the wallet's UTXO
+	// set further below.
+	var inputAmounts []string
+	if cmd.InputAmounts != nil {
+		inputAmounts = *cmd.InputAmounts
+	}
 	mtx := wire.NewMsgTx()
-	for _, input := range cmd.Inputs {
+	for i, input := range cmd.Inputs {
 		txHash, err := chainhash.NewHashFromStr(input.Txid)
 		if err != nil {
 			return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
@@ -885,63 +1150,219 @@ func (s *Server) createRawTransaction(ctx context.Context, icmd any) (any, error
 				"Tx tree must be regular or stake")
 		}
 
-		amt, err := dcrutil.NewAmount(input.Amount)
-		if err != nil {
-			return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
-		}
-		if amt < 0 {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
-				"Positive input amount is required")
+		var valueIn int64
+		if !ct.IsSKA() {
+			if i < len(inputAmounts) && inputAmounts[i] != "" {
+				atoms, err := coinsToAtomsBig(inputAmounts[i], varAtomsPerCoin)
+				if err != nil {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"InputAmounts[%d] %q: %v", i, inputAmounts[i], err)
+				}
+				if atoms.Sign() < 0 {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"InputAmounts[%d]: negative amount not allowed", i)
+				}
+				if !atoms.IsInt64() {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"InputAmounts[%d]: VAR amount overflows int64", i)
+				}
+				valueIn = atoms.Int64()
+			} else {
+				amt, err := dcrutil.NewAmount(input.Amount)
+				if err != nil {
+					return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
+				}
+				if amt < 0 {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"Positive input amount is required")
+				}
+				valueIn = int64(amt)
+			}
 		}
 
 		prevOut := wire.NewOutPoint(txHash, input.Vout, input.Tree)
-		txIn := wire.NewTxIn(prevOut, int64(amt), nil)
+		txIn := wire.NewTxIn(prevOut, valueIn, nil)
 		if cmd.LockTime != nil && *cmd.LockTime != 0 {
 			txIn.Sequence = wire.MaxTxInSequenceNum - 1
 		}
 		mtx.AddTxIn(txIn)
 	}
-
-	// Add all transaction outputs to the transaction after performing
-	// some validity checks.
-	for encodedAddr, amount := range cmd.Amounts {
-		// Decode the provided address.  This also ensures the network encoded
-		// with the address matches the network the server is currently on.
-		addr, err := stdaddr.DecodeAddress(encodedAddr, s.activeNet)
-		if err != nil {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidAddressOrKey,
-				"Address %q: %v", encodedAddr, err)
-		}
-
-		// Ensure the address is one of the supported types.
-		switch addr.(type) {
-		case *stdaddr.AddressPubKeyHashEcdsaSecp256k1V0:
-		case *stdaddr.AddressScriptHashV0:
-		default:
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidAddressOrKey,
-				"Invalid type: %T", addr)
-		}
-
-		// Create a new script which pays to the provided address.
-		vers, pkScript := addr.PaymentScript()
-
-		atomic, err := dcrutil.NewAmount(amount)
-		if err != nil {
-			return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
-				"New amount: %v", err)
-		}
-		// Ensure amount is in the valid range for monetary amounts.
-		if atomic <= 0 || atomic > dcrutil.Amount(cointype.MaxVARAmount) {
+	if ct.IsSKA() {
+		if len(cmd.Amounts) == 0 {
 			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
-				"Amount outside valid range: %v", atomic)
+				"amounts required when cointype is a SKA coin")
+		}
+		w, ok := s.walletLoader.LoadedWallet()
+		if !ok {
+			return nil, errUnloadedWallet
 		}
 
-		txOut := &wire.TxOut{
-			Value:    int64(atomic),
-			Version:  vers,
-			PkScript: pkScript,
+		params := w.ChainParams()
+		if params.SKACoins == nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"No SKA coin %d configured for this network", ct)
 		}
-		mtx.AddTxOut(txOut)
+		cfg, ok := params.SKACoins[ct]
+		if !ok || cfg == nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"No SKA coin %d configured for this network", ct)
+		}
+		if !cfg.Active {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"SKA coin %d is not active", ct)
+		}
+		atomsPerCoin := cfg.AtomsPerCoin
+
+		// SKA inputs require SKAValueIn populated on each TxIn — without it
+		// the node rejects the tx (TxPaysHighFeesSKA et al. read SKAValueIn,
+		// not the legacy Value field). Population priority per input:
+		//   1. Caller-supplied decimal coin string in cmd.InputAmounts[i]
+		//      (parsed via coinsToAtomsBig against the SKA coin's
+		//      atomsPerCoin and magnitude-bounded by MaxSupply). This
+		//      supports cross-wallet flows where the prevout is not in this
+		//      wallet's UTXO set — multisig coordinators in particular.
+		//   2. Wallet UTXO set via UnspentOutput (credit.SKAAmount).
+		//   3. Refuse with ErrRPCInvalidParameter — the operator must
+		//      either supply InputAmounts[i] for the SKA value, or sign on
+		//      a wallet that owns the prevout.
+		for i, txIn := range mtx.TxIn {
+			if i < len(inputAmounts) && inputAmounts[i] != "" {
+				atoms, err := coinsToAtomsBig(inputAmounts[i], atomsPerCoin)
+				if err != nil {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"InputAmounts[%d] %q: %v", i, inputAmounts[i], err)
+				}
+				if atoms.Sign() <= 0 {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"InputAmounts[%d]: SKA amount must be positive", i)
+				}
+				if err := validateSKAAtomMagnitude(params, ct, atoms); err != nil {
+					return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"InputAmounts[%d]: %v", i, err)
+				}
+				txIn.ValueIn = 0
+				txIn.SKAValueIn = atoms
+				continue
+			}
+			credit, err := w.UnspentOutput(ctx, txIn.PreviousOutPoint, true)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"SKA input %d (%s:%d) not found in this wallet's UTXO "+
+						"set; supply the SKA value via InputAmounts[%d] "+
+						"to author across wallet boundaries",
+					i, txIn.PreviousOutPoint.Hash, txIn.PreviousOutPoint.Index, i)
+			}
+			if credit.CoinType != ct {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"input %d coin type %d does not match output cointype %d",
+					i, credit.CoinType, ct)
+			}
+			ska := credit.SKAAmount.BigInt()
+			if ska == nil || ska.Sign() <= 0 {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"input %d has no SKA value recorded in wallet UTXO set",
+					i)
+			}
+			txIn.ValueIn = 0
+			txIn.SKAValueIn = new(big.Int).Set(ska)
+		}
+		// Sort destination addresses so the on-the-wire output ordering is
+		// deterministic across calls. Iterating cmd.Amounts directly would
+		// produce different tx hashes for identical input on every call,
+		// because Go's map iteration order is randomized.
+		encodedAddrs := make([]string, 0, len(cmd.Amounts))
+		for encodedAddr := range cmd.Amounts {
+			encodedAddrs = append(encodedAddrs, encodedAddr)
+		}
+		sort.Strings(encodedAddrs)
+		for _, encodedAddr := range encodedAddrs {
+			amountStr := cmd.Amounts[encodedAddr]
+			addr, err := stdaddr.DecodeAddress(encodedAddr, s.activeNet)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidAddressOrKey,
+					"Address %q: %v", encodedAddr, err)
+			}
+			switch addr.(type) {
+			case *stdaddr.AddressPubKeyHashEcdsaSecp256k1V0:
+			case *stdaddr.AddressScriptHashV0:
+			default:
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidAddressOrKey,
+					"Invalid type: %T", addr)
+			}
+			vers, pkScript := addr.PaymentScript()
+			bigAtoms, err := coinsToAtomsBig(amountStr, atomsPerCoin)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"Amount %q: %v", amountStr, err)
+			}
+			if bigAtoms.Sign() <= 0 {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"Amount must be positive: %s", amountStr)
+			}
+			if cfg.MaxSupply != nil && cfg.MaxSupply.Sign() > 0 &&
+				bigAtoms.Cmp(cfg.MaxSupply) > 0 {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"Amount %s exceeds SKA%d max supply %s", amountStr, ct, cfg.MaxSupply)
+			}
+			mtx.AddTxOut(&wire.TxOut{
+				Value:    0,
+				SKAValue: bigAtoms,
+				CoinType: ct,
+				Version:  vers,
+				PkScript: pkScript,
+			})
+		}
+	} else {
+		// VAR path: parse decimal coin strings via coinsToAtomsBig for full
+		// precision (avoids float64 round-trip loss for amounts above ~9e7 VAR).
+		atomsPerCoin := big.NewInt(cointype.AtomsPerVAR)
+		// Sort destination addresses so the on-the-wire output ordering is
+		// deterministic across calls. See the SKA branch above for rationale.
+		encodedAddrs := make([]string, 0, len(cmd.Amounts))
+		for encodedAddr := range cmd.Amounts {
+			encodedAddrs = append(encodedAddrs, encodedAddr)
+		}
+		sort.Strings(encodedAddrs)
+		for _, encodedAddr := range encodedAddrs {
+			amountStr := cmd.Amounts[encodedAddr]
+			addr, err := stdaddr.DecodeAddress(encodedAddr, s.activeNet)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidAddressOrKey,
+					"Address %q: %v", encodedAddr, err)
+			}
+			switch addr.(type) {
+			case *stdaddr.AddressPubKeyHashEcdsaSecp256k1V0:
+			case *stdaddr.AddressScriptHashV0:
+			default:
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidAddressOrKey,
+					"Invalid type: %T", addr)
+			}
+			vers, pkScript := addr.PaymentScript()
+			bigAtoms, err := coinsToAtomsBig(amountStr, atomsPerCoin)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"Amount %q: %v", amountStr, err)
+			}
+			if bigAtoms.Sign() <= 0 {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"Amount must be positive: %s", amountStr)
+			}
+			if !bigAtoms.IsInt64() {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"VAR amount %s exceeds int64 capacity", amountStr)
+			}
+			atomic := dcrutil.Amount(bigAtoms.Int64())
+			if atomic > dcrutil.Amount(cointype.MaxVARAmount) {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"Amount outside valid range: %v", atomic)
+			}
+			mtx.AddTxOut(&wire.TxOut{
+				Value:    int64(atomic),
+				Version:  vers,
+				PkScript: pkScript,
+				CoinType: cointype.CoinTypeVAR,
+			})
+		}
 	}
 
 	// Set the Locktime, if given.
@@ -1094,6 +1515,26 @@ func (s *Server) dumpPrivKey(ctx context.Context, icmd any) (any, error) {
 	return key, nil
 }
 
+// fundRawTxFeeRateOverride returns the per-kB relay-fee override that
+// fundRawTransaction passes into NewUnsignedTransaction.
+//
+// For VAR outputs the caller-supplied (or network-default) VAR per-kB fee is
+// wrapped as a SKA-amount carrier and used as an override. For SKA outputs the
+// override is zero-valued so that NewUnsignedTransaction falls through to the
+// per-coin-type default via RelayFeeForCoinType. Wrapping the VAR per-kB rate
+// (typically ~1e5 atoms / kB) as if it were SKA atoms underpays by the
+// AtomsPerCoin ratio (commonly 1e18 vs 1e8), producing a tx that the node
+// would silently reject — keep this gate. opts.FeeRate is rejected upstream
+// for SKA outputs (it is a coins-as-float64 field that cannot represent SKA's
+// per-coin scale without precision loss), so the SKA branch here will only be
+// taken when no explicit fee rate was supplied by the caller.
+func fundRawTxFeeRateOverride(outputCoinType cointype.CoinType, varFeeRate dcrutil.Amount) cointype.SKAAmount {
+	if outputCoinType.IsSKA() {
+		return cointype.SKAAmount{}
+	}
+	return cointype.NewSKAAmount(big.NewInt(int64(varFeeRate)))
+}
+
 func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.FundRawTransactionCmd)
 	w, ok := s.walletLoader.LoadedWallet()
@@ -1104,6 +1545,7 @@ func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) 
 	var (
 		changeAddress string
 		feeRate       = w.RelayFee()
+		feeRateSet    bool
 		confs         = int32(1)
 	)
 	if cmd.Options != nil {
@@ -1117,6 +1559,7 @@ func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) 
 			if err != nil {
 				return nil, err
 			}
+			feeRateSet = true
 		}
 		if opts.ConfTarget != nil {
 			confs = *opts.ConfTarget
@@ -1141,6 +1584,17 @@ func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) 
 		return nil, errors.New("transaction must not already have inputs")
 	}
 
+	// Reject the fee-rate option for SKA outputs: opts.FeeRate is a float64
+	// in coins which converts cleanly to int64 atoms for VAR (1e8 atoms/coin)
+	// but cannot represent SKA's per-coin scale (typically 1e18 atoms/coin)
+	// without precision loss. Fall back to the network default for SKA.
+	outputCoinType := txrules.GetCoinTypeFromOutputs(tx.TxOut)
+	if feeRateSet && outputCoinType.IsSKA() {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"fee-rate option is unsupported for SKA outputs; "+
+				"the network default fee rate will be used")
+	}
+
 	accountNum, err := w.AccountNumber(ctx, cmd.FundAccount)
 	if err != nil {
 		return nil, err
@@ -1155,7 +1609,8 @@ func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) 
 			return nil, err
 		}
 	}
-	atx, err := w.NewUnsignedTransaction(ctx, tx.TxOut, feeRate, accountNum, confs,
+	feeRateOverride := fundRawTxFeeRateOverride(outputCoinType, feeRate)
+	atx, err := w.NewUnsignedTransaction(ctx, tx.TxOut, feeRateOverride, accountNum, confs,
 		wallet.OutputSelectionAlgorithmDefault, changeSource, nil)
 	if err != nil {
 		return nil, err
@@ -1168,10 +1623,29 @@ func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) 
 		tx.TxOut = append(tx.TxOut, atx.Tx.TxOut[atx.ChangeIndex])
 	}
 
-	// Determine the absolute fee of the funded transaction
-	fee := atx.TotalInput
-	for i := range tx.TxOut {
-		fee -= dcrutil.Amount(tx.TxOut[i].GetValue())
+	// Determine the absolute fee of the funded transaction. Branch on coin
+	// type so SKA fees retain big.Int precision instead of being squashed
+	// through float64; both branches emit Fee as a decimal coin string in
+	// the coin type's native scale.
+	txCoinType := txrules.GetCoinTypeFromOutputs(atx.Tx.TxOut)
+	res := &types.FundRawTransactionResult{}
+	if txCoinType.IsSKA() {
+		fee := new(big.Int).Set(atx.SKATotalInput.BigInt())
+		for i := range tx.TxOut {
+			if tx.TxOut[i].SKAValue != nil {
+				fee.Sub(fee, tx.TxOut[i].SKAValue)
+			}
+		}
+		atomsPerCoin := getAtomsPerCoin(w.ChainParams(), txCoinType)
+		res.Fee = cointype.AtomsToDecimalString(fee, atomsPerCoin)
+	} else {
+		fee := atx.TotalInput
+		for i := range tx.TxOut {
+			fee -= dcrutil.Amount(tx.TxOut[i].GetValue())
+		}
+		res.Fee = cointype.AtomsToDecimalString(
+			big.NewInt(int64(fee)),
+			big.NewInt(cointype.AtomsPerVAR))
 	}
 
 	b := new(strings.Builder)
@@ -1180,10 +1654,7 @@ func (s *Server) fundRawTransaction(ctx context.Context, icmd any) (any, error) 
 	if err != nil {
 		return nil, err
 	}
-	res := &types.FundRawTransactionResult{
-		Hex: b.String(),
-		Fee: fee.ToCoin(),
-	}
+	res.Hex = b.String()
 	return res, nil
 }
 
@@ -1276,7 +1747,7 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 	// Validate coin type if specified
 	if cmd.CoinType != nil {
 		coinType := cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(coinType); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 			return nil, err
 		}
 	}
@@ -1370,13 +1841,13 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 
 						json := types.GetAccountBalanceResult{
 							AccountName:             accountName,
-							ImmatureCoinbaseRewards: coinBal.ImmatureCoinbaseRewards.ToCoin(),
-							ImmatureStakeGeneration: coinBal.ImmatureStakeGeneration.ToCoin(),
-							LockedByTickets:         coinBal.LockedByTickets.ToCoin(),
-							Spendable:               coinBal.Spendable.ToCoin(),
-							Total:                   coinBal.Total.ToCoin(),
-							Unconfirmed:             coinBal.Unconfirmed.ToCoin(),
-							VotingAuthority:         coinBal.VotingAuthority.ToCoin(),
+							ImmatureCoinbaseRewards: varAtomsToDecimalString(coinBal.ImmatureCoinbaseRewards),
+							ImmatureStakeGeneration: varAtomsToDecimalString(coinBal.ImmatureStakeGeneration),
+							LockedByTickets:         varAtomsToDecimalString(coinBal.LockedByTickets),
+							Spendable:               varAtomsToDecimalString(coinBal.Spendable),
+							Total:                   varAtomsToDecimalString(coinBal.Total),
+							Unconfirmed:             varAtomsToDecimalString(coinBal.Unconfirmed),
+							VotingAuthority:         varAtomsToDecimalString(coinBal.VotingAuthority),
 						}
 						result.Balances = append(result.Balances, json)
 					}
@@ -1392,13 +1863,13 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 				result.TotalVotingAuthority = "0"
 				result.CumulativeTotal = skaCumTot.ToDecimalString(atomsPerCoin)
 			} else {
-				result.TotalImmatureCoinbaseRewards = totImmatureCoinbase.ToCoin()
-				result.TotalImmatureStakeGeneration = totImmatureStakegen.ToCoin()
-				result.TotalLockedByTickets = totLocked.ToCoin()
-				result.TotalSpendable = totSpendable.ToCoin()
-				result.TotalUnconfirmed = totUnconfirmed.ToCoin()
-				result.TotalVotingAuthority = totVotingAuthority.ToCoin()
-				result.CumulativeTotal = cumTot.ToCoin()
+				result.TotalImmatureCoinbaseRewards = varAtomsToDecimalString(totImmatureCoinbase)
+				result.TotalImmatureStakeGeneration = varAtomsToDecimalString(totImmatureStakegen)
+				result.TotalLockedByTickets = varAtomsToDecimalString(totLocked)
+				result.TotalSpendable = varAtomsToDecimalString(totSpendable)
+				result.TotalUnconfirmed = varAtomsToDecimalString(totUnconfirmed)
+				result.TotalVotingAuthority = varAtomsToDecimalString(totVotingAuthority)
+				result.CumulativeTotal = varAtomsToDecimalString(cumTot)
 			}
 
 			return result, nil
@@ -1443,25 +1914,25 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 
 			json := types.GetAccountBalanceResult{
 				AccountName:             accountName,
-				ImmatureCoinbaseRewards: bal.ImmatureCoinbaseRewards.ToCoin(),
-				ImmatureStakeGeneration: bal.ImmatureStakeGeneration.ToCoin(),
-				LockedByTickets:         bal.LockedByTickets.ToCoin(),
-				Spendable:               bal.Spendable.ToCoin(),
-				Total:                   bal.Total.ToCoin(),
-				Unconfirmed:             bal.Unconfirmed.ToCoin(),
-				VotingAuthority:         bal.VotingAuthority.ToCoin(),
+				ImmatureCoinbaseRewards: varAtomsToDecimalString(bal.ImmatureCoinbaseRewards),
+				ImmatureStakeGeneration: varAtomsToDecimalString(bal.ImmatureStakeGeneration),
+				LockedByTickets:         varAtomsToDecimalString(bal.LockedByTickets),
+				Spendable:               varAtomsToDecimalString(bal.Spendable),
+				Total:                   varAtomsToDecimalString(bal.Total),
+				Unconfirmed:             varAtomsToDecimalString(bal.Unconfirmed),
+				VotingAuthority:         varAtomsToDecimalString(bal.VotingAuthority),
 			}
 
 			result.Balances = append(result.Balances, json)
 		}
 
-		result.TotalImmatureCoinbaseRewards = totImmatureCoinbase.ToCoin()
-		result.TotalImmatureStakeGeneration = totImmatureStakegen.ToCoin()
-		result.TotalLockedByTickets = totLocked.ToCoin()
-		result.TotalSpendable = totSpendable.ToCoin()
-		result.TotalUnconfirmed = totUnconfirmed.ToCoin()
-		result.TotalVotingAuthority = totVotingAuthority.ToCoin()
-		result.CumulativeTotal = cumTot.ToCoin()
+		result.TotalImmatureCoinbaseRewards = varAtomsToDecimalString(totImmatureCoinbase)
+		result.TotalImmatureStakeGeneration = varAtomsToDecimalString(totImmatureStakegen)
+		result.TotalLockedByTickets = varAtomsToDecimalString(totLocked)
+		result.TotalSpendable = varAtomsToDecimalString(totSpendable)
+		result.TotalUnconfirmed = varAtomsToDecimalString(totUnconfirmed)
+		result.TotalVotingAuthority = varAtomsToDecimalString(totVotingAuthority)
+		result.CumulativeTotal = varAtomsToDecimalString(cumTot)
 	} else {
 		account, err := w.AccountNumber(ctx, accountName)
 		if err != nil {
@@ -1494,16 +1965,16 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 					VotingAuthority:         "0",
 				}
 			} else {
-				// Use native .ToCoin() for VAR
+				// Decimal coin string for VAR via cointype.AtomsToDecimalString.
 				json = types.GetAccountBalanceResult{
 					AccountName:             accountName,
-					ImmatureCoinbaseRewards: coinBal.ImmatureCoinbaseRewards.ToCoin(),
-					ImmatureStakeGeneration: coinBal.ImmatureStakeGeneration.ToCoin(),
-					LockedByTickets:         coinBal.LockedByTickets.ToCoin(),
-					Spendable:               coinBal.Spendable.ToCoin(),
-					Total:                   coinBal.Total.ToCoin(),
-					Unconfirmed:             coinBal.Unconfirmed.ToCoin(),
-					VotingAuthority:         coinBal.VotingAuthority.ToCoin(),
+					ImmatureCoinbaseRewards: varAtomsToDecimalString(coinBal.ImmatureCoinbaseRewards),
+					ImmatureStakeGeneration: varAtomsToDecimalString(coinBal.ImmatureStakeGeneration),
+					LockedByTickets:         varAtomsToDecimalString(coinBal.LockedByTickets),
+					Spendable:               varAtomsToDecimalString(coinBal.Spendable),
+					Total:                   varAtomsToDecimalString(coinBal.Total),
+					Unconfirmed:             varAtomsToDecimalString(coinBal.Unconfirmed),
+					VotingAuthority:         varAtomsToDecimalString(coinBal.VotingAuthority),
 				}
 			}
 			result.Balances = append(result.Balances, json)
@@ -1519,13 +1990,13 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 			}
 			json := types.GetAccountBalanceResult{
 				AccountName:             accountName,
-				ImmatureCoinbaseRewards: bal.ImmatureCoinbaseRewards.ToCoin(),
-				ImmatureStakeGeneration: bal.ImmatureStakeGeneration.ToCoin(),
-				LockedByTickets:         bal.LockedByTickets.ToCoin(),
-				Spendable:               bal.Spendable.ToCoin(),
-				Total:                   bal.Total.ToCoin(),
-				Unconfirmed:             bal.Unconfirmed.ToCoin(),
-				VotingAuthority:         bal.VotingAuthority.ToCoin(),
+				ImmatureCoinbaseRewards: varAtomsToDecimalString(bal.ImmatureCoinbaseRewards),
+				ImmatureStakeGeneration: varAtomsToDecimalString(bal.ImmatureStakeGeneration),
+				LockedByTickets:         varAtomsToDecimalString(bal.LockedByTickets),
+				Spendable:               varAtomsToDecimalString(bal.Spendable),
+				Total:                   varAtomsToDecimalString(bal.Total),
+				Unconfirmed:             varAtomsToDecimalString(bal.Unconfirmed),
+				VotingAuthority:         varAtomsToDecimalString(bal.VotingAuthority),
 			}
 			result.Balances = append(result.Balances, json)
 		}
@@ -2166,6 +2637,14 @@ func (s *Server) getInfo(ctx context.Context, icmd any) (any, error) {
 		spendableBalance += balance.Spendable
 	}
 
+	infoCoinType, err := w.CoinType(ctx)
+	if errors.Is(err, errors.WatchingOnly) {
+		infoCoinType = 0
+	} else if err != nil {
+		log.Errorf("Failed to retrieve the active coin type: %v", err)
+		infoCoinType = 0
+	}
+
 	info := &types.InfoResult{
 		Version:         version.Integer,
 		ProtocolVersion: int32(p2p.Pver),
@@ -2180,8 +2659,9 @@ func (s *Server) getInfo(ctx context.Context, icmd any) (any, error) {
 		KeypoolOldest:   0,
 		KeypoolSize:     0,
 		UnlockedUntil:   0,
-		PaytxFee:        w.RelayFee().ToCoin(),
-		RelayFee:        0,
+		PaytxFee:        varAtomsToDecimalString(w.RelayFee()),
+		RelayFee:        "0",
+		CoinType:        infoCoinType,
 		Errors:          "",
 	}
 
@@ -2197,7 +2677,7 @@ func (s *Server) getInfo(ctx context.Context, icmd any) (any, error) {
 		info.TimeOffset = consensusInfo.TimeOffset
 		info.Connections = consensusInfo.Connections
 		info.Proxy = consensusInfo.Proxy
-		info.RelayFee = consensusInfo.RelayFee
+		info.RelayFee = strconv.FormatFloat(consensusInfo.RelayFee, 'f', -1, 64)
 		info.Errors = consensusInfo.Errors
 	}
 
@@ -2600,6 +3080,12 @@ func (s *Server) createNewAccount(ctx context.Context, icmd any) (any, error) {
 
 // createAuthorizedEmission handles a createauthorizedemission request by creating a
 // cryptographically signed SKA emission transaction.
+//
+// Capability gate: cmd.Passphrase is required. The wallet is unlocked for the
+// duration of this single call and re-locked on return; the ambient
+// walletpassphrase unlock window is intentionally NOT used. This prevents a
+// concurrent authenticated RPC client from minting authorized emissions during
+// an operator's open unlock window.
 func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.CreateAuthorizedEmissionCmd)
 	w, ok := s.walletLoader.LoadedWallet()
@@ -2611,7 +3097,7 @@ func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, e
 	// produces a clear error instead of falling through to a misleading
 	// "not configured in governance settings" message.
 	ct := cointype.CoinType(cmd.CoinType)
-	if err := validateCoinType(ct); err != nil {
+	if err := validateCoinTypeConfigured(w.ChainParams(), ct); err != nil {
 		return nil, err
 	}
 	if !ct.IsSKA() {
@@ -2666,31 +3152,34 @@ func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, e
 			totalAmount.String(), skaConfig.MaxSupply.String(), cmd.CoinType)
 	}
 
-	// Zero the cleartext passphrase copy on return. cmd.Passphrase itself
-	// is a string we cannot mutate, but the []byte copy passed to Unlock
-	// can be wiped.
-	passphrase := []byte(cmd.Passphrase)
-	defer func() {
-		for i := range passphrase {
-			passphrase[i] = 0
-		}
-	}()
-
-	// If the wallet was locked before this call, re-lock on exit so the
-	// emission passphrase only unlocks the wallet for the duration of the
-	// authorization. Mirrors the pattern used by sendToBurn.
-	wasLocked := w.Locked()
-	err := w.Unlock(ctx, passphrase, nil)
-	if err != nil {
-		// Do not wrap the underlying error (matches walletpassphrase /
-		// importprivkey / other handlers); wrapping would leak internal
-		// DB/cipher strings to clients.
-		return nil, rpcErrorf(dcrjson.ErrRPCWalletPassphraseIncorrect, "incorrect passphrase")
-	}
-	if wasLocked {
-		defer w.Lock()
+	// Require an explicit wallet passphrase. Falling back to the ambient
+	// walletpassphrase unlock window would preserve the very gap this
+	// per-call gate is closing.
+	if cmd.Passphrase == "" {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"walletpassphrase is required")
 	}
 
+	// Per-call capability gate: unlock the wallet for this single call only.
+	// The ambient walletpassphrase unlock window is intentionally NOT used.
+	return withWalletUnlocked(ctx, w, cmd.Passphrase, func() (any, error) {
+		return s.createAuthorizedEmissionUnlocked(ctx, w, cmd, skaConfig, totalAmount, emissionAddresses, emissionAmounts)
+	})
+}
+
+// createAuthorizedEmissionUnlocked runs the post-unlock body of the
+// createauthorizedemission handler. Split out so the unlock/relock plumbing
+// stays inside withWalletUnlocked while the long body keeps a flat
+// non-nested return shape.
+func (s *Server) createAuthorizedEmissionUnlocked(
+	ctx context.Context,
+	w *wallet.Wallet,
+	cmd *types.CreateAuthorizedEmissionCmd,
+	skaConfig *chaincfg.SKACoinConfig,
+	totalAmount *big.Int,
+	emissionAddresses []string,
+	emissionAmounts []*big.Int,
+) (any, error) {
 	// Get emission private key for this coin type from wallet
 	emissionPrivKey, err := getEmissionKeyForCoinType(w, ctx, cointype.CoinType(cmd.CoinType), cmd.EmissionKeyName)
 	if err != nil {
@@ -2711,18 +3200,32 @@ func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, e
 		currentHeight = *cmd.Height
 	}
 
-	// Footgun guard: warn if the resolved height is outside this coin
-	// type's configured emission window. The node enforces window-bounds
-	// in validateEmissionAuthorization, so an out-of-window signature is
-	// inert on chain — but the operator probably misconfigured something
-	// and would otherwise discover that only at broadcast time.
+	// Footgun guards: reject out-of-window heights and non-default nonces
+	// unless the corresponding force flag is set. The node enforces both in
+	// validateEmissionAuthorization, so an authorization that violates either
+	// is inert on chain — but the operator probably misconfigured something
+	// and would otherwise discover that only at broadcast time. The two
+	// flags are independent: bypassing the window is unrelated to bypassing
+	// the nonce-must-be-1 invariant, and conflating them previously let one
+	// override unlock both.
+	forceWindow := cmd.ForceWindow != nil && *cmd.ForceWindow
+	forceNonce := cmd.ForceNonce != nil && *cmd.ForceNonce
 	emissionStart := int64(skaConfig.EmissionHeight)
 	emissionEnd := emissionStart + int64(skaConfig.EmissionWindow)
 	if currentHeight < emissionStart || currentHeight > emissionEnd {
-		log.Warnf("createauthorizedemission: height %d is outside emission "+
-			"window [%d, %d] for coin type %d; node will reject this "+
-			"authorization at validation time",
-			currentHeight, emissionStart, emissionEnd, cmd.CoinType)
+		if !forceWindow {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"height %d is outside emission window [%d, %d] for coin type %d; "+
+					"node will reject this authorization at validation time. "+
+					"Pass forcewindow=true to override (only if you understand the consequences)",
+				currentHeight, emissionStart, emissionEnd, cmd.CoinType)
+		}
+		log.Warnf("createauthorizedemission: signing at height %d outside "+
+			"emission window [%d, %d] for coin type %d (wallet local tip=%d); "+
+			"node will reject this authorization at validation time "+
+			"(forcewindow=true)",
+			currentHeight, emissionStart, emissionEnd, cmd.CoinType,
+			currentHeight32)
 	}
 
 	// Default nonce to 1 (first and only emission per coin type under the
@@ -2733,15 +3236,50 @@ func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, e
 		nonce = *cmd.Nonce
 	}
 
-	// Footgun guard: warn on non-default nonces. The node accepts only
-	// currentNonce+1 per coin type and each coin type emits exactly once,
-	// so any nonce other than 1 is inert; surfacing it here helps the
-	// operator notice a stale --nonce flag before broadcasting.
+	// Footgun guard: reject non-default nonces unless forcenonce=true. The
+	// node accepts only currentNonce+1 per coin type and each coin type emits
+	// exactly once, so any nonce other than 1 is inert; forcenonce=true is
+	// reserved for re-authorizing a coin type whose prior emission failed.
 	if nonce != 1 {
-		log.Warnf("createauthorizedemission: nonce %d != 1 for coin type %d; "+
-			"node only accepts the next-expected nonce per coin type and "+
-			"emissions are one-shot",
-			nonce, cmd.CoinType)
+		if !forceNonce {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"nonce %d != 1 for coin type %d; node only accepts the next-expected "+
+					"nonce per coin type and emissions are one-shot. "+
+					"Pass forcenonce=true to override (only valid when re-authorizing a coin type)",
+				nonce, cmd.CoinType)
+		}
+		log.Warnf("createauthorizedemission: signing nonce %d (!= 1) for coin "+
+			"type %d at height %d (wallet local tip=%d); node only accepts the "+
+			"next-expected nonce per coin type and emissions are one-shot "+
+			"(forcenonce=true)",
+			nonce, cmd.CoinType, currentHeight, currentHeight32)
+	}
+
+	// Local one-shot guard: refuse a duplicate (CoinType, Nonce) pair to
+	// stop a confused operator from producing two signed full-supply
+	// emission transactions for the same logical authorization (e.g. after
+	// a network blip during broadcast). The node rejects the second tx,
+	// but until that round trip the wallet would have minted both. The
+	// guard is bypassed when the operator passes forcenonce=true, which
+	// is also the path used to re-author after a prior emission failed.
+	priorHash, priorTs, priorExists, err := w.LookupEmissionAuthRecord(ctx, cmd.CoinType, nonce)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+			"failed to check prior emission authorization: %v", err)
+	}
+	if priorExists && !forceNonce {
+		priorHashStr := hex.EncodeToString(priorHash[:])
+		// The DB stores hashes in raw byte order; surface the wire-format
+		// chainhash string (reversed-hex) as well for direct comparison
+		// with the result returned to the operator on the prior call.
+		var ch chainhash.Hash
+		copy(ch[:], priorHash[:])
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"createauthorizedemission already authored for coin type %d "+
+				"nonce %d at %s (tx %s, raw=%s) — pass forcenonce=true to "+
+				"override only if the prior tx is known not to have confirmed",
+			cmd.CoinType, nonce, time.Unix(priorTs, 0).UTC().Format(time.RFC3339),
+			ch.String(), priorHashStr)
 	}
 
 	// Create authorization structure (without signature initially)
@@ -2792,6 +3330,21 @@ func (s *Server) createAuthorizedEmission(ctx context.Context, icmd any) (any, e
 
 	// Calculate transaction hash
 	txHash := tx.TxHash()
+
+	// Persist the (CoinType, Nonce, txHash) record so a duplicate call
+	// (same coin type and nonce) is refused before signing again. Errors
+	// here are logged but do not fail the call: the signed tx is already
+	// in the operator's hands, and refusing to return it because the local
+	// guard could not be persisted would be a worse outcome (operator
+	// loses the tx; cannot retry without forcenonce). The node's own
+	// nonce check remains the authoritative replay protection.
+	var hashBytes [32]byte
+	copy(hashBytes[:], txHash[:])
+	if storeErr := w.StoreEmissionAuthRecord(ctx, cmd.CoinType, nonce, hashBytes, time.Now().Unix()); storeErr != nil {
+		log.Warnf("createauthorizedemission: failed to persist local "+
+			"one-shot guard for coin type %d nonce %d (tx %s): %v",
+			cmd.CoinType, nonce, txHash.String(), storeErr)
+	}
 
 	return &types.CreateAuthorizedEmissionResult{
 		Transaction:     hex.EncodeToString(txBuf.Bytes()),
@@ -2865,6 +3418,19 @@ func (s *Server) getMultisigOutInfo(ctx context.Context, icmd any) (any, error) 
 		}
 	}
 
+	// Render the output value as a single decimal coin string regardless
+	// of coin type so the wire shape is uniform.  VAR uses int64 atoms with
+	// 1e8 atoms/coin; SKA uses big.Int atoms with the configured per-coin
+	// scale (default 1e18).
+	var amount string
+	if p2shOutput.CoinType.IsSKA() {
+		amount = p2shOutput.SKAOutputAmount.ToDecimalString(getAtomsPerCoin(w.ChainParams(), p2shOutput.CoinType))
+	} else {
+		amount = cointype.AtomsToDecimalString(
+			big.NewInt(int64(p2shOutput.OutputAmount)),
+			big.NewInt(cointype.AtomsPerVAR),
+		)
+	}
 	result := &types.GetMultisigOutInfoResult{
 		Address:      p2shOutput.P2SHAddress.String(),
 		RedeemScript: hex.EncodeToString(p2shOutput.RedeemScript),
@@ -2872,7 +3438,8 @@ func (s *Server) getMultisigOutInfo(ctx context.Context, icmd any) (any, error) 
 		N:            p2shOutput.N,
 		Pubkeys:      pubkeys,
 		TxHash:       p2shOutput.OutPoint.Hash.String(),
-		Amount:       p2shOutput.OutputAmount.ToCoin(),
+		Amount:       amount,
+		CoinType:     uint8(p2shOutput.CoinType),
 	}
 	if !p2shOutput.ContainingBlock.None() {
 		result.BlockHeight = uint32(p2shOutput.ContainingBlock.Height)
@@ -3012,30 +3579,41 @@ func (s *Server) getReceivedByAddress(ctx context.Context, icmd any) (any, error
 	if err != nil {
 		return nil, err
 	}
-	// Use coin type filter, defaulting to VAR (0) if not specified
-	// Default to VAR if no coin type specified
+	// Default to VAR if no coin type specified.
 	filterCoinType := cointype.CoinTypeVAR
 	if cmd.CoinType != nil {
 		filterCoinType = cointype.CoinType(*cmd.CoinType)
-		// Validate coin type
-		if !filterCoinType.IsValid() {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
-				"invalid coin type %d: must be between 0 (VAR) and 255 (SKA)", *cmd.CoinType)
+		if err := validateCoinTypeConfigured(w.ChainParams(), filterCoinType); err != nil {
+			return nil, err
 		}
 	}
 
 	// Get the correct AtomsPerCoin for this coin type
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), filterCoinType)
 
-	total, err := w.TotalReceivedForAddr(ctx, addr, int32(*cmd.MinConf), filterCoinType)
-	if err != nil {
-		if errors.Is(err, errors.NotExist) {
-			return nil, errAddressNotInWallet
+	var totalAtoms *big.Int
+	if filterCoinType.IsSKA() {
+		skaTotal, err := w.TotalReceivedSKAForAddr(ctx, addr, int32(*cmd.MinConf), filterCoinType)
+		if err != nil {
+			if errors.Is(err, errors.NotExist) {
+				return nil, errAddressNotInWallet
+			}
+			return nil, err
 		}
-		return nil, err
+		totalAtoms = skaTotal.BigInt()
+	} else {
+		varTotal, err := w.TotalReceivedForAddr(ctx, addr, int32(*cmd.MinConf))
+		if err != nil {
+			if errors.Is(err, errors.NotExist) {
+				return nil, errAddressNotInWallet
+			}
+			return nil, err
+		}
+		totalAtoms = big.NewInt(int64(varTotal))
 	}
 
-	return atomsToCoins(int64(total), atomsPerCoin), nil
+	// Both VAR and SKA return decimal coin strings — unified API contract.
+	return cointype.AtomsToDecimalString(totalAtoms, atomsPerCoin), nil
 }
 
 // getMasterPubkey handles a getmasterpubkey request by returning the wallet
@@ -3247,14 +3825,15 @@ func (s *Server) getTransaction(ctx context.Context, icmd any) (any, error) {
 			tipHeight))
 	}
 
-	// Determine coin type from transaction outputs
-	var txCoinType cointype.CoinType
-	for _, output := range txd.MsgTx.TxOut {
-		if output.CoinType.IsSKA() {
-			txCoinType = output.CoinType
-			break
-		}
+	// Defense-in-depth: consensus rejects mixed-coin-type transactions, but a
+	// malformed tx that reached the wallet's txStore via SPV rescan or
+	// addtransaction RPC must not silently mis-report balance. Refuse to
+	// aggregate a mixed-coin-type tx and surface an internal error instead.
+	if err := txrules.ValidateCoinTypeUniformity(txd.MsgTx.TxOut); err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+			"stored transaction %s has mixed coin types: %v", cmd.Txid, err)
 	}
+	txCoinType := txrules.GetCoinTypeFromOutputs(txd.MsgTx.TxOut)
 	isSKA := txCoinType.IsSKA()
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), txCoinType)
 
@@ -3264,7 +3843,7 @@ func (s *Server) getTransaction(ctx context.Context, icmd any) (any, error) {
 		skaDebitTotal  cointype.SKAAmount
 		skaCreditTotal cointype.SKAAmount
 		fee            dcrutil.Amount
-		negFeeF64      float64
+		negFeeStr      string
 	)
 
 	// For SKA transactions, use a direct calculation approach:
@@ -3327,7 +3906,8 @@ func (s *Server) getTransaction(ctx context.Context, icmd any) (any, error) {
 		skaNet := skaCreditTotal.Sub(skaDebitTotal)
 		ret.Amount = skaNet.ToDecimalString(atomsPerCoin)
 	} else {
-		// VAR transaction handling (unchanged)
+		// VAR transaction: emit decimal coin strings to match the unified
+		// API contract.
 		for _, deb := range txd.Debits {
 			debitTotal += deb.Amount
 		}
@@ -3341,10 +3921,10 @@ func (s *Server) getTransaction(ctx context.Context, icmd any) (any, error) {
 				outputTotal += dcrutil.Amount(output.Value)
 			}
 			fee = debitTotal - outputTotal
-			negFeeF64 = (-fee).ToCoin()
+			negFeeStr = varAtomsToDecimalString(-fee)
 		}
-		ret.Amount = (creditTotal - debitTotal).ToCoin()
-		ret.Fee = negFeeF64
+		ret.Amount = varAtomsToDecimalString(creditTotal - debitTotal)
+		ret.Fee = negFeeStr
 	}
 
 	details, err := w.ListTransactionDetails(ctx, txHash)
@@ -3409,6 +3989,17 @@ func (s *Server) getTxOut(ctx context.Context, icmd any) (any, error) {
 	}
 	if utxo == nil {
 		return nil, nil // output is spent or does not exist.
+	}
+
+	// gettxout's response shape (dcrdtypes.GetTxOutResult) only carries the
+	// VAR-scale int64 Value field, so an SKA UTXO would be reported as
+	// `value: 0` with no way for the caller to distinguish "spent" from
+	// "SKA UTXO." Refuse with an actionable error pointing at listunspent,
+	// which already exposes per-coin-type SKA fields.
+	if utxo.CoinType.IsSKA() {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"gettxout in SPV mode does not expose SKA fields; use listunspent for coin type %d outputs",
+			utxo.CoinType)
 	}
 
 	// Disassemble script into single line printable format.  The
@@ -3519,18 +4110,26 @@ func (s *Server) getWalletFee(ctx context.Context, icmd any) (any, error) {
 		return nil, rpcError(dcrjson.ErrRPCInternal.Code, err)
 	}
 
-	// Get atoms per coin for this coin type
-	var atomsPerCoin *big.Int
-	if ct == cointype.CoinTypeVAR {
-		atomsPerCoin = big.NewInt(int64(cointype.AtomsPerVAR))
-	} else {
-		atomsPerCoin = cointype.GetAtomsPerSKACoin()
-	}
+	atomsPerCoin := atomsPerCoinForCoinType(w.ChainParams(), ct)
 
 	return &types.GetWalletFeeResult{
 		Fee:    fee.ToDecimalString(atomsPerCoin),
 		Source: source,
 	}, nil
+}
+
+// atomsPerCoinForCoinType returns the atoms-per-coin scale for ct on the
+// active chain, falling back to the global SKA default when the SKA coin
+// has no per-coin AtomsPerCoin configured. Used by the RPC fee handlers
+// that render or parse fee values in decimal-coin units.
+func atomsPerCoinForCoinType(params *chaincfg.Params, ct cointype.CoinType) *big.Int {
+	if ct == cointype.CoinTypeVAR {
+		return big.NewInt(int64(cointype.AtomsPerVAR))
+	}
+	if cfg, ok := params.SKACoins[ct]; ok && cfg != nil && cfg.AtomsPerCoin != nil {
+		return cfg.AtomsPerCoin
+	}
+	return cointype.GetAtomsPerSKACoin()
 }
 
 // getVoteFeeConsolidationAddress handles the getvotefeeconsolidationaddress command.
@@ -3756,7 +4355,7 @@ func (s *Server) listReceivedByAccount(ctx context.Context, icmd any) (any, erro
 	for _, result := range results {
 		jsonResults = append(jsonResults, types.ListReceivedByAccountResult{
 			Account:       result.AccountName,
-			Amount:        result.TotalReceived.ToCoin(),
+			Amount:        cointype.AtomsToDecimalString(big.NewInt(int64(result.TotalReceived)), big.NewInt(cointype.AtomsPerVAR)),
 			Confirmations: uint64(result.LastConfirmation),
 		})
 	}
@@ -3854,7 +4453,7 @@ func (s *Server) listReceivedByAddress(ctx context.Context, icmd any) (any, erro
 	for address, addrData := range allAddrData {
 		ret[idx] = types.ListReceivedByAddressResult{
 			Address:       address,
-			Amount:        addrData.amount.ToCoin(),
+			Amount:        cointype.AtomsToDecimalString(big.NewInt(int64(addrData.amount)), big.NewInt(cointype.AtomsPerVAR)),
 			Confirmations: uint64(addrData.confirmations),
 			TxIDs:         addrData.tx,
 		}
@@ -4007,7 +4606,7 @@ func (s *Server) listUnspent(ctx context.Context, icmd any) (any, error) {
 	// Validate coin type if specified
 	if cmd.CoinType != nil {
 		coinType := cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(coinType); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 			return nil, err
 		}
 	}
@@ -4030,28 +4629,20 @@ func (s *Server) listUnspent(ctx context.Context, icmd any) (any, error) {
 		account = *cmd.Account
 	}
 
-	result, err := w.ListUnspent(ctx, int32(*cmd.MinConf), int32(*cmd.MaxConf), addresses, account)
+	// Push the coin-type filter into wallet.ListUnspent so it reads only the
+	// requested per-coin-type bucket — no Go-side post-filter.
+	var coinTypeFilter *cointype.CoinType
+	if cmd.CoinType != nil {
+		ct := cointype.CoinType(*cmd.CoinType)
+		coinTypeFilter = &ct
+	}
+	result, err := w.ListUnspent(ctx, int32(*cmd.MinConf), int32(*cmd.MaxConf), addresses, account, coinTypeFilter)
 	if err != nil {
 		if errors.Is(err, errors.NotExist) {
 			return nil, errAddressNotInWallet
 		}
 		return nil, err
 	}
-
-	// Filter by coin type if specified
-	if cmd.CoinType != nil {
-		requestedCoinType := *cmd.CoinType
-		filteredResult := make([]*types.ListUnspentResult, 0)
-
-		for _, unspent := range result {
-			if unspent.CoinType == requestedCoinType {
-				filteredResult = append(filteredResult, unspent)
-			}
-		}
-
-		return filteredResult, nil
-	}
-
 	return result, nil
 }
 
@@ -4301,71 +4892,12 @@ func (s *Server) processUnmanagedTicket(ctx context.Context, icmd any) (any, err
 
 }
 
-// makeOutputs creates a slice of transaction outputs from a pair of address
-// strings to amounts.  This is used to create the outputs to include in newly
-// created transactions from a JSON object describing the output destinations
-// and amounts.
-func makeOutputs(pairs map[string]dcrutil.Amount, chainParams *chaincfg.Params) ([]*wire.TxOut, error) {
-	outputs := make([]*wire.TxOut, 0, len(pairs))
-	for addrStr, amt := range pairs {
-		if amt < 0 {
-			return nil, errNeedPositiveAmount
-		}
-		addr, err := decodeAddress(addrStr, chainParams)
-		if err != nil {
-			return nil, err
-		}
-
-		vers, pkScript := addr.PaymentScript()
-
-		outputs = append(outputs, &wire.TxOut{
-			Value:    int64(amt),
-			PkScript: pkScript,
-			Version:  vers,
-		})
-	}
-	return outputs, nil
-}
-
-// makeOutputsWithCoinType creates transaction outputs with specified coin type for dual-coin support.
-func makeOutputsWithCoinType(pairs map[string]dcrutil.Amount, chainParams *chaincfg.Params, coinType cointype.CoinType) ([]*wire.TxOut, error) {
-	outputs := make([]*wire.TxOut, 0, len(pairs))
-	for addrStr, amt := range pairs {
-		if amt < 0 {
-			return nil, errNeedPositiveAmount
-		}
-		addr, err := decodeAddress(addrStr, chainParams)
-		if err != nil {
-			return nil, err
-		}
-
-		vers, pkScript := addr.PaymentScript()
-
-		txOut := &wire.TxOut{
-			PkScript: pkScript,
-			Version:  vers,
-			CoinType: coinType, // Dual-coin support: specify coin type
-		}
-
-		// For SKA, use SKAValue (big.Int); for VAR, use Value (int64)
-		if coinType.IsSKA() {
-			txOut.Value = 0 // SKA uses SKAValue, not Value
-			txOut.SKAValue = big.NewInt(int64(amt))
-		} else {
-			txOut.Value = int64(amt)
-		}
-
-		outputs = append(outputs, txOut)
-	}
-	return outputs, nil
-}
-
 // makeOutputsWithCoinTypeBig creates transaction outputs with specified coin type using big.Int amounts.
 // This is essential for SKA transactions where amounts can exceed int64.
 func makeOutputsWithCoinTypeBig(pairs map[string]*big.Int, chainParams *chaincfg.Params, coinType cointype.CoinType) ([]*wire.TxOut, error) {
 	outputs := make([]*wire.TxOut, 0, len(pairs))
 	for addrStr, amt := range pairs {
-		if amt == nil || amt.Sign() < 0 {
+		if amt == nil || amt.Sign() <= 0 {
 			return nil, errNeedPositiveAmount
 		}
 		addr, err := decodeAddress(addrStr, chainParams)
@@ -4381,90 +4913,23 @@ func makeOutputsWithCoinTypeBig(pairs map[string]*big.Int, chainParams *chaincfg
 			CoinType: coinType,
 		}
 
-		// For SKA, use SKAValue (big.Int); for VAR, use Value (int64)
+		// For SKA, use SKAValue (big.Int); for VAR, use Value (int64) with
+		// an explicit overflow guard — silently truncating an oversize
+		// big.Int via Int64() would author a transaction whose VAR output
+		// is some negative or wraparound value.
 		if coinType.IsSKA() {
 			txOut.Value = 0 // SKA uses SKAValue, not Value
 			txOut.SKAValue = new(big.Int).Set(amt)
 		} else {
+			if !amt.IsInt64() {
+				return nil, fmt.Errorf("VAR amount %s exceeds int64 capacity", amt.String())
+			}
 			txOut.Value = amt.Int64()
 		}
 
 		outputs = append(outputs, txOut)
 	}
 	return outputs, nil
-}
-
-// sendPairs creates and sends payment transactions.
-// It returns the transaction hash in string format upon success
-// All errors are returned in dcrjson.RPCError format
-func (s *Server) sendPairs(ctx context.Context, w *wallet.Wallet, amounts map[string]dcrutil.Amount, account uint32, minconf int32) (string, error) {
-	changeAccount := account
-	if s.cfg.MixingEnabled && s.cfg.MixAccount != "" && s.cfg.MixChangeAccount != "" {
-		mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
-		if err != nil {
-			return "", err
-		}
-		if account == mixAccount {
-			changeAccount, err = w.AccountNumber(ctx, s.cfg.MixChangeAccount)
-			if err != nil {
-				return "", err
-			}
-		}
-	}
-
-	outputs, err := makeOutputs(amounts, w.ChainParams())
-	if err != nil {
-		return "", err
-	}
-	txSha, err := w.SendOutputs(ctx, outputs, account, changeAccount, minconf)
-	if err != nil {
-		if errors.Is(err, errors.Locked) {
-			return "", errWalletUnlockNeeded
-		}
-		if errors.Is(err, errors.InsufficientBalance) {
-			return "", rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
-		}
-		return "", err
-	}
-
-	return txSha.String(), nil
-}
-
-// sendPairsWithCoinType creates and sends payment transactions with coin type support.
-// It extends sendPairs to handle dual-coin transactions (VAR and SKA).
-func (s *Server) sendPairsWithCoinType(ctx context.Context, w *wallet.Wallet, amounts map[string]dcrutil.Amount, account uint32, minconf int32, coinType cointype.CoinType) (string, error) {
-	changeAccount := account
-	if s.cfg.MixingEnabled && s.cfg.MixAccount != "" && s.cfg.MixChangeAccount != "" {
-		mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
-		if err != nil {
-			return "", err
-		}
-		if account == mixAccount {
-			changeAccount, err = w.AccountNumber(ctx, s.cfg.MixChangeAccount)
-			if err != nil {
-				return "", err
-			}
-		}
-	}
-
-	outputs, err := makeOutputsWithCoinType(amounts, w.ChainParams(), coinType)
-	if err != nil {
-		return "", err
-	}
-
-	// Use existing SendOutputs method (coin type is embedded in outputs)
-	txSha, err := w.SendOutputs(ctx, outputs, account, changeAccount, minconf)
-	if err != nil {
-		if errors.Is(err, errors.Locked) {
-			return "", errWalletUnlockNeeded
-		}
-		if errors.Is(err, errors.InsufficientBalance) {
-			return "", rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
-		}
-		return "", err
-	}
-
-	return txSha.String(), nil
 }
 
 // sendPairsWithCoinTypeBig creates and sends payment transactions with coin type support using big.Int amounts.
@@ -4528,6 +4993,7 @@ func (s *Server) sendAmountToTreasury(ctx context.Context, w *wallet.Wallet, amo
 			Value:    int64(amount),
 			PkScript: []byte{txscript.OP_TADD},
 			Version:  wire.DefaultPkScriptVersion,
+			CoinType: cointype.CoinTypeVAR,
 		},
 	}
 	txSha, err := w.SendOutputsToTreasury(ctx, outputs, account,
@@ -4577,7 +5043,9 @@ func (s *Server) sendOutputsFromTreasury(ctx context.Context, w *wallet.Wallet, 
 	}
 	msgTx := wire.NewMsgTx()
 	msgTx.Version = wire.TxVersionTreasury
-	msgTx.AddTxOut(wire.NewTxOut(0, opretScript))
+	opretOut := wire.NewTxOut(0, opretScript)
+	opretOut.CoinType = cointype.CoinTypeVAR // treasury OP_RETURN is VAR
+	msgTx.AddTxOut(opretOut)
 
 	// Calculate expiry.
 	msgTx.Expiry = blockchain.CalcTSpendExpiry(int64(tipHeight+1),
@@ -4609,6 +5077,7 @@ func (s *Server) sendOutputsFromTreasury(ctx context.Context, w *wallet.Wallet, 
 			Value:    int64(amt),
 			Version:  vers,
 			PkScript: script,
+			CoinType: cointype.CoinTypeVAR,
 		}
 		if txrules.IsDustOutput(txOut, w.RelayFee()) {
 			return "", rpcErrorf(dcrjson.ErrRPCInvalidParameter,
@@ -4964,7 +5433,7 @@ func (s *Server) redeemMultiSigOut(ctx context.Context, icmd any) (any, error) {
 	var requestedCT *cointype.CoinType
 	if cmd.CoinType != nil {
 		c := cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(c); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), c); err != nil {
 			return nil, err
 		}
 		requestedCT = &c
@@ -5020,9 +5489,11 @@ func (s *Server) redeemMultiSigOut(ctx context.Context, icmd any) (any, error) {
 	var txIn *wire.TxIn
 	if ct.IsSKA() {
 		// SKA inputs carry their atom value in SKAValueIn (big.Int); Value
-		// stays 0 in the V13 wire format.
+		// stays 0 in the V13 wire format. Defensive-copy so the wire-level
+		// tx owns its own *big.Int — matches the convention at
+		// multisig.go:120, methods.go:5286, methods.go:7888.
 		txIn = wire.NewTxIn(&op, 0, nil)
-		txIn.SKAValueIn = p2shOutput.SKAOutputAmount.BigInt()
+		txIn.SKAValueIn = new(big.Int).Set(p2shOutput.SKAOutputAmount.BigInt())
 	} else {
 		txIn = wire.NewTxIn(&op, int64(p2shOutput.OutputAmount), nil)
 	}
@@ -5089,7 +5560,7 @@ func (s *Server) redeemMultiSigOuts(ctx context.Context, icmd any) (any, error) 
 	// silently to VAR.
 	if cmd.CoinType != nil {
 		c := cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(c); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), c); err != nil {
 			return nil, err
 		}
 	}
@@ -5109,31 +5580,92 @@ func (s *Server) redeemMultiSigOuts(ctx context.Context, icmd any) (any, error) 
 		return nil, err
 	}
 
-	// Resolve the per-call iteration cap and whether the response should
-	// indicate that more outputs remain to be redeemed.
-	max, truncated := resolveRedeemMultiSigOutsCap(cmd.Number, len(msos))
+	// Resolve the per-call iteration cap. Whether more outputs remain after
+	// coin-type filtering is determined by the collect function below.
+	max := resolveRedeemMultiSigOutsCap(cmd.Number)
 
-	rmsoResults := make([]types.RedeemMultiSigOutResult, 0, max)
-	for i, mso := range msos {
-		if uint32(i) >= max {
+	rmsoResults, truncated := redeemMultiSigOutsCollect(ctx, msos, max, cmd.ToAddress, cmd.CoinType,
+		func(ctx context.Context, req *types.RedeemMultiSigOutCmd) (types.RedeemMultiSigOutResult, error) {
+			res, err := s.redeemMultiSigOut(ctx, req)
+			if err != nil {
+				return types.RedeemMultiSigOutResult{}, err
+			}
+			return res.(types.RedeemMultiSigOutResult), nil
+		})
+
+	return types.RedeemMultiSigOutsResult{Results: rmsoResults, Truncated: truncated}, nil
+}
+
+// redeemMultiSigOutsCollect iterates the cap-bounded multisig credits and
+// invokes the per-output redeemer. Per-output failures are recorded on the
+// result with Complete=false and the error in Errors[] rather than aborting
+// the batch. This is the testable core of redeemMultiSigOuts.
+//
+// Each per-output request is built with the credit's own CoinType
+// (mso.CoinType), not the outer cmd.CoinType. Routing every credit through
+// the caller-supplied hint dropped SKA credits onto the VAR fee/output path
+// when cmd.CoinType was nil and produced malformed transactions.
+//
+// The outer coinType parameter is repurposed as an optional filter: when
+// non-nil, credits whose mso.CoinType does not match are skipped (these
+// belong to a different coin type than the caller asked about).
+//
+// The returned truncated flag is true only when the cap is reached and at
+// least one further matching credit (post-filter) remains unprocessed. This
+// matters in mixed-coin-type wallets: a pre-filter "len(msos) > max" would
+// overstate truncation when most credits are filtered out, causing
+// pagination clients to loop forever.
+func redeemMultiSigOutsCollect(
+	ctx context.Context,
+	msos []*udb.MultisigCredit,
+	max uint32,
+	toAddress *string,
+	coinType *uint8,
+	redeem func(context.Context, *types.RedeemMultiSigOutCmd) (types.RedeemMultiSigOutResult, error),
+) ([]types.RedeemMultiSigOutResult, bool) {
+	results := make([]types.RedeemMultiSigOutResult, 0, max)
+	emitted := uint32(0)
+	truncated := false
+	for _, mso := range msos {
+		ct := uint8(mso.CoinType)
+		if coinType != nil && *coinType != ct {
+			continue
+		}
+		if emitted >= max {
+			// Cap was reached and at least one more matching credit
+			// remains: signal pagination to the client.
+			truncated = true
 			break
 		}
-
-		rmsoRequest := &types.RedeemMultiSigOutCmd{
+		// Bind &ct per-iteration: a single shared address would alias
+		// across every request and the redeemer sees the wrong type for
+		// all but the last credit.
+		ctPerCredit := ct
+		req := &types.RedeemMultiSigOutCmd{
 			Hash:     mso.OutPoint.Hash.String(),
 			Index:    mso.OutPoint.Index,
 			Tree:     mso.OutPoint.Tree,
-			Address:  cmd.ToAddress,
-			CoinType: cmd.CoinType,
+			Address:  toAddress,
+			CoinType: &ctPerCredit,
 		}
-		redeemResult, err := s.redeemMultiSigOut(ctx, rmsoRequest)
+		emitted++
+		res, err := redeem(ctx, req)
 		if err != nil {
-			return nil, err
+			// Per-output failure: record and continue. Earlier successes are
+			// preserved; later outputs still get attempted.
+			results = append(results, types.RedeemMultiSigOutResult{
+				Complete: false,
+				Errors: []types.SignRawTransactionError{{
+					TxID:  mso.OutPoint.Hash.String(),
+					Vout:  mso.OutPoint.Index,
+					Error: err.Error(),
+				}},
+			})
+			continue
 		}
-		rmsoResults = append(rmsoResults, redeemResult.(types.RedeemMultiSigOutResult))
+		results = append(results, res)
 	}
-
-	return types.RedeemMultiSigOutsResult{Results: rmsoResults, Truncated: truncated}, nil
+	return results, truncated
 }
 
 // rescanWallet initiates a rescan of the block chain for wallet data, blocking
@@ -5156,9 +5688,12 @@ func (s *Server) rescanWallet(ctx context.Context, icmd any) (any, error) {
 
 // spendOutputsInputSource creates an input source from a wallet and a list of
 // outputs to be spent.  Only the provided outputs will be returned by the
-// source, without any other input selection.
+// source, without any other input selection. Every previous output must
+// match expectedCoinType, and SKA inputs accumulate into detail.SKAAmount
+// (big.Int) while VAR inputs accumulate into detail.Amount (int64) — the
+// dual-coin txauthor.NewUnsignedTransaction reads from the matching field.
 func spendOutputsInputSource(ctx context.Context, w *wallet.Wallet,
-	account string, inputs []*wire.TxIn) (txauthor.InputSource, error) {
+	account string, inputs []*wire.TxIn, expectedCoinType cointype.CoinType) (txauthor.InputSource, error) {
 
 	params := w.ChainParams()
 
@@ -5166,12 +5701,25 @@ func spendOutputsInputSource(ctx context.Context, w *wallet.Wallet,
 	detail.Inputs = inputs
 	detail.Scripts = make([][]byte, len(inputs))
 	detail.RedeemScriptSizes = make([]int, len(inputs))
+	skaTotal := cointype.Zero()
 	for i, in := range inputs {
 		prevOut, err := w.FetchOutput(ctx, &in.PreviousOutPoint)
 		if err != nil {
 			return nil, err
 		}
-		detail.Amount += dcrutil.Amount(prevOut.Value)
+		if prevOut.CoinType != expectedCoinType {
+			return nil, errors.E(errors.Invalid, errors.Errorf(
+				"input %v coin type %d does not match expected coin type %d",
+				&in.PreviousOutPoint, prevOut.CoinType, expectedCoinType))
+		}
+		if expectedCoinType.IsSKA() {
+			if prevOut.SKAValue != nil {
+				in.SKAValueIn = new(big.Int).Set(prevOut.SKAValue)
+				skaTotal = skaTotal.Add(cointype.NewSKAAmount(prevOut.SKAValue))
+			}
+		} else {
+			detail.Amount += dcrutil.Amount(prevOut.Value)
+		}
 		detail.Scripts[i] = prevOut.PkScript
 		st, addrs := stdscript.ExtractAddrs(prevOut.Version,
 			prevOut.PkScript, params)
@@ -5197,6 +5745,7 @@ func spendOutputsInputSource(ctx context.Context, w *wallet.Wallet,
 		}
 		detail.RedeemScriptSizes[i] = redeemScriptSize
 	}
+	detail.SKAAmount = skaTotal
 
 	fn := func(target dcrutil.Amount, targetSKA cointype.SKAAmount) (*txauthor.InputDetail, error) {
 		return detail, nil
@@ -5231,7 +5780,9 @@ func (a *accountChangeSource) ScriptSize() int {
 
 // spendOutputs creates, signs and publishes a transaction that spends the
 // specified outputs belonging to an account, pays a list of address/amount
-// pairs, with any change returned to the specified account.
+// pairs, with any change returned to the specified account. When CoinType
+// is supplied (or non-zero), inputs and outputs are validated to match —
+// SKA outputs use big.Int amounts via SKAValue, VAR outputs use int64.
 func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.SpendOutputsCmd)
 	w, ok := s.walletLoader.LoadedWallet()
@@ -5243,7 +5794,17 @@ func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 		return nil, err
 	}
 
+	coinType := cointype.CoinTypeVAR
+	if cmd.CoinType != nil {
+		coinType = cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
+			return nil, err
+		}
+	}
+	isSKA := coinType.IsSKA()
+
 	params := w.ChainParams()
+	atomsPerCoin := getAtomsPerCoin(params, coinType)
 
 	account, err := w.AccountNumber(ctx, cmd.Account)
 	if err != nil {
@@ -5264,12 +5825,36 @@ func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		amount, err := dcrutil.NewAmount(output.Amount)
-		if err != nil {
-			return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
-		}
 		scriptVersion, script := addr.PaymentScript()
-		txOut := wire.NewTxOut(int64(amount), script)
+		var txOut *wire.TxOut
+		if isSKA {
+			atomsBig, err := coinsToAtomsBig(output.Amount, atomsPerCoin)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid SKA amount: %v", err)
+			}
+			if atomsBig.Sign() <= 0 {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
+			}
+			txOut = wire.NewTxOut(0, script)
+			txOut.CoinType = coinType
+			txOut.SKAValue = atomsBig
+		} else {
+			// VAR via coinsToAtomsBig + guarded int64 conversion to preserve
+			// precision and surface oversize amounts as errors.
+			atomsBig, err := coinsToAtomsBig(output.Amount, atomsPerCoin)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid VAR amount: %v", err)
+			}
+			if atomsBig.Sign() <= 0 {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
+			}
+			if !atomsBig.IsInt64() {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"VAR amount %s exceeds int64 capacity", atomsBig.String())
+			}
+			txOut = wire.NewTxOut(atomsBig.Int64(), script)
+			txOut.CoinType = cointype.CoinTypeVAR
+		}
 		txOut.Version = scriptVersion
 		outputs = append(outputs, txOut)
 	}
@@ -5277,7 +5862,7 @@ func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 	rand.ShuffleSlice(outputs)
 
 	inputSource, err := spendOutputsInputSource(ctx, w, cmd.Account,
-		inputs)
+		inputs, coinType)
 	if err != nil {
 		return nil, err
 	}
@@ -5294,12 +5879,16 @@ func (s *Server) spendOutputs(ctx context.Context, icmd any) (any, error) {
 	}
 	defer secretsSource.Close()
 
-	// Convert VAR relay fee to SKAAmount for NewUnsignedTransaction
-	relayFeeSKA := cointype.SKAAmountFromInt64(int64(w.RelayFee()))
-	atx, err := txauthor.NewUnsignedTransaction(outputs, relayFeeSKA,
+	relayFee := w.RelayFeeForCoinType(ctx, coinType)
+	atx, err := txauthor.NewUnsignedTransaction(outputs, relayFee,
 		inputSource, changeSource, params.MaxTxSize)
 	if err != nil {
 		return nil, err
+	}
+	// Tag the change output (if any) with the transaction's coin type so the
+	// dual-coin validation in PublishTransaction sees a uniform tx.
+	if atx.ChangeIndex >= 0 {
+		atx.Tx.TxOut[atx.ChangeIndex].CoinType = coinType
 	}
 	atx.RandomizeChangePosition()
 	err = atx.AddAllInputScripts(secretsSource)
@@ -5342,7 +5931,7 @@ func (s *Server) ticketInfo(ctx context.Context, icmd any) (any, error) {
 			out := tmptx.TxOut[0]
 			info := types.TicketInfoResult{
 				Hash:        t.Ticket.Hash.String(),
-				Cost:        dcrutil.Amount(out.Value).ToCoin(),
+				Cost:        cointype.AtomsToDecimalString(big.NewInt(out.Value), big.NewInt(cointype.AtomsPerVAR)),
 				BlockHeight: -1,
 				Status:      status.String(),
 			}
@@ -5411,7 +6000,7 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 	var coinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR for backward compatibility
 	if cmd.CoinType != nil {
 		coinType = cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(coinType); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 			return nil, err
 		}
 	}
@@ -5436,31 +6025,22 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative minconf")
 	}
 
-	// Convert coins to atoms using the correct AtomsPerCoin for this coin type
+	// Convert coins to atoms via coinsToAtomsBig for both VAR and SKA. The
+	// big.Int path preserves SKA precision (1e18 atoms-per-coin) and avoids
+	// VAR float64 round-trip loss above ~9e7 VAR. Overflow into the int64
+	// wire field is checked at the chokepoint in makeOutputsWithCoinTypeBig.
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), coinType)
-
-	// For SKA transactions (coinType > 0), use big.Int to avoid int64 overflow
-	if coinType.IsSKA() {
-		amtBig, err := coinsToAtomsBig(cmd.Amount, atomsPerCoin)
-		if err != nil {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
-		}
-		pairsBig := map[string]*big.Int{
-			cmd.ToAddress: amtBig,
-		}
-		return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType)
-	}
-
-	// For VAR (coinType == 0), parse string to float64 and use standard int64 path
-	amtFloat, err := strconv.ParseFloat(cmd.Amount, 64)
+	amtBig, err := coinsToAtomsBig(cmd.Amount, atomsPerCoin)
 	if err != nil {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
 	}
-	amt := dcrutil.Amount(coinsToAtoms(amtFloat, atomsPerCoin))
-	pairs := map[string]dcrutil.Amount{
-		cmd.ToAddress: amt,
+	if amtBig.Sign() <= 0 {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
 	}
-	return s.sendPairsWithCoinType(ctx, w, pairs, account, minConf, coinType)
+	pairsBig := map[string]*big.Int{
+		cmd.ToAddress: amtBig,
+	}
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType)
 }
 
 // sendMany handles a sendmany RPC request by creating a new transaction
@@ -5480,7 +6060,7 @@ func (s *Server) sendMany(ctx context.Context, icmd any) (any, error) {
 	var coinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR for backward compatibility
 	if cmd.CoinType != nil {
 		coinType = cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(coinType); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 			return nil, err
 		}
 	}
@@ -5502,33 +6082,21 @@ func (s *Server) sendMany(ctx context.Context, icmd any) (any, error) {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative minconf")
 	}
 
-	// Get the correct AtomsPerCoin for this coin type
+	// Parse via coinsToAtomsBig for both VAR and SKA — see sendFrom for the
+	// rationale. Single big.Int path eliminates float64 precision loss.
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), coinType)
-
-	// For SKA transactions (coinType > 0), use big.Int to avoid int64 overflow
-	if coinType.IsSKA() {
-		pairsBig := make(map[string]*big.Int, len(cmd.Amounts))
-		for k, v := range cmd.Amounts {
-			amtBig, err := coinsToAtomsBig(v, atomsPerCoin)
-			if err != nil {
-				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount for %s: %v", k, err)
-			}
-			pairsBig[k] = amtBig
-		}
-		return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType)
-	}
-
-	// For VAR (coinType == 0), parse string amounts to float64 and use standard int64 path
-	pairs := make(map[string]dcrutil.Amount, len(cmd.Amounts))
+	pairsBig := make(map[string]*big.Int, len(cmd.Amounts))
 	for k, v := range cmd.Amounts {
-		amtFloat, err := strconv.ParseFloat(v, 64)
+		amtBig, err := coinsToAtomsBig(v, atomsPerCoin)
 		if err != nil {
 			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount for %s: %v", k, err)
 		}
-		amt := dcrutil.Amount(coinsToAtoms(amtFloat, atomsPerCoin))
-		pairs[k] = amt
+		if amtBig.Sign() <= 0 {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount for %s must be positive", k)
+		}
+		pairsBig[k] = amtBig
 	}
-	return s.sendPairsWithCoinType(ctx, w, pairs, account, minConf, coinType)
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType)
 }
 
 // sendToAddress handles a sendtoaddress RPC request by creating a new
@@ -5547,7 +6115,7 @@ func (s *Server) sendToAddress(ctx context.Context, icmd any) (any, error) {
 	var coinType cointype.CoinType = cointype.CoinTypeVAR // Default to VAR for backward compatibility
 	if cmd.CoinType != nil {
 		coinType = cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(coinType); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 			return nil, err
 		}
 	}
@@ -5566,30 +6134,20 @@ func (s *Server) sendToAddress(ctx context.Context, icmd any) (any, error) {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative amount")
 	}
 
-	// For SKA transactions (coinType > 0), use big.Int to avoid int64 overflow
-	if coinType.IsSKA() {
-		amtBig, err := coinsToAtomsBig(cmd.Amount, atomsPerCoin)
-		if err != nil {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
-		}
-		pairsBig := map[string]*big.Int{
-			cmd.Address: amtBig,
-		}
-		// sendtoaddress always spends from the default account, this matches bitcoind
-		return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, udb.DefaultAccountNum, 1, coinType)
-	}
-
-	// For VAR (coinType == 0), parse string to float64 and use standard int64 path
-	amtFloat, err := strconv.ParseFloat(cmd.Amount, 64)
+	// Single big.Int path for both VAR and SKA — see sendFrom for the
+	// rationale.
+	amtBig, err := coinsToAtomsBig(cmd.Amount, atomsPerCoin)
 	if err != nil {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
 	}
-	amt := dcrutil.Amount(coinsToAtoms(amtFloat, atomsPerCoin))
-	pairs := map[string]dcrutil.Amount{
-		cmd.Address: amt,
+	if amtBig.Sign() <= 0 {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
+	}
+	pairsBig := map[string]*big.Int{
+		cmd.Address: amtBig,
 	}
 	// sendtoaddress always spends from the default account, this matches bitcoind
-	return s.sendPairsWithCoinType(ctx, w, pairs, udb.DefaultAccountNum, 1, coinType)
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, udb.DefaultAccountNum, 1, coinType)
 }
 
 // sendToMultiSig handles a sendtomultisig RPC request by creating a new
@@ -5612,7 +6170,7 @@ func (s *Server) sendToMultiSig(ctx context.Context, icmd any) (any, error) {
 	ct := cointype.CoinTypeVAR
 	if cmd.CoinType != nil {
 		ct = cointype.CoinType(*cmd.CoinType)
-		if err := validateCoinType(ct); err != nil {
+		if err := validateCoinTypeConfigured(w.ChainParams(), ct); err != nil {
 			return nil, err
 		}
 	}
@@ -5629,30 +6187,27 @@ func (s *Server) sendToMultiSig(ctx context.Context, icmd any) (any, error) {
 	nrequired := int8(*cmd.NRequired)
 	minconf := int32(*cmd.MinConf)
 
-	// Parse amount with full SKA precision (big.Int end-to-end for SKA;
-	// float64 → int64 atoms for VAR as elsewhere). coinsToAtomsBig already
-	// rejects negatives and over-precise fractional parts.
+	// Parse amount via coinsToAtomsBig for both VAR and SKA — preserves SKA
+	// precision (1e18 atoms-per-coin) and avoids VAR float64 round-trip loss.
+	// Overflow into the int64 VAR field is checked at the conversion site.
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), ct)
+	amtBig, err := coinsToAtomsBig(strings.TrimSpace(cmd.Amount), atomsPerCoin)
+	if err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
+	}
+	if amtBig.Sign() <= 0 {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
+	}
 	var varAmount dcrutil.Amount
 	skaAmount := cointype.Zero()
 	if ct.IsSKA() {
-		amtBig, err := coinsToAtomsBig(strings.TrimSpace(cmd.Amount), atomsPerCoin)
-		if err != nil {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
-		}
-		if amtBig.Sign() <= 0 {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
-		}
 		skaAmount = cointype.NewSKAAmount(amtBig)
 	} else {
-		amtFloat, err := strconv.ParseFloat(strings.TrimSpace(cmd.Amount), 64)
-		if err != nil {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid amount: %v", err)
+		if !amtBig.IsInt64() {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"VAR amount %s exceeds int64 capacity", amtBig.String())
 		}
-		varAmount = dcrutil.Amount(coinsToAtoms(amtFloat, atomsPerCoin))
-		if varAmount <= 0 {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
-		}
+		varAmount = dcrutil.Amount(amtBig.Int64())
 	}
 
 	pubKeys, err := walletPubKeys(ctx, w, cmd.Pubkeys)
@@ -5696,6 +6251,32 @@ func (s *Server) sendRawTransaction(ctx context.Context, icmd any) (any, error) 
 	err = msgtx.Deserialize(hex.NewDecoder(strings.NewReader(cmd.HexTx)))
 	if err != nil {
 		return nil, rpcError(dcrjson.ErrRPCDeserialization, err)
+	}
+
+	// Defense in depth: refuse mixed-coin-type raw transactions before
+	// broadcasting. Consensus rejects them, but the wallet's high-fee
+	// dispatch below routes on outputs[0] only and would otherwise call
+	// the wrong fee evaluator on the trailing outputs.
+	if len(msgtx.TxOut) > 1 {
+		firstCT := msgtx.TxOut[0].CoinType
+		for i, out := range msgtx.TxOut[1:] {
+			if out.CoinType != firstCT {
+				return nil, rpcErrorf(dcrjson.ErrRPCDeserialization,
+					"mixed coin types in raw transaction: output 0 is %d, output %d is %d",
+					firstCT, i+1, out.CoinType)
+			}
+		}
+	}
+	// Reject outputs whose CoinType and SKAValue presence disagree. A
+	// maliciously crafted tx with CoinType=0 on every output but SKAValue
+	// set on later outputs would otherwise pass the same-coin-type loop
+	// above and dispatch via the VAR fee evaluator.
+	for i, out := range msgtx.TxOut {
+		if (out.SKAValue != nil) != out.CoinType.IsSKA() {
+			return nil, rpcErrorf(dcrjson.ErrRPCDeserialization,
+				"output %d coin type %d and SKAValue presence (%v) are inconsistent",
+				i, out.CoinType, out.SKAValue != nil)
+		}
 	}
 
 	if !*cmd.AllowHighFees {
@@ -5773,7 +6354,7 @@ func (s *Server) sendToBurn(ctx context.Context, icmd any) (any, error) {
 
 	// Validate coin type - must be SKA (1-255), not VAR (0)
 	coinType := cointype.CoinType(cmd.CoinType)
-	if err := validateCoinType(coinType); err != nil {
+	if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 		return nil, err
 	}
 	if !coinType.IsSKA() {
@@ -5784,8 +6365,11 @@ func (s *Server) sendToBurn(ctx context.Context, icmd any) (any, error) {
 	// Get chain params for AtomsPerCoin
 	params := w.ChainParams()
 
-	// Parse and validate amount - must be positive
-	if cmd.Amount == "" || strings.HasPrefix(cmd.Amount, "-") || cmd.Amount == "0" {
+	// Parse and validate amount - must be positive. The empty / leading-'-'
+	// rejections produce friendlier errors than the downstream parse error;
+	// the post-parse Sign() <= 0 check below is the single source of truth
+	// for "must be strictly positive" (catches "0", "0.0", "+0", "00", etc.).
+	if cmd.Amount == "" || strings.HasPrefix(cmd.Amount, "-") {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
 	}
 
@@ -5799,76 +6383,61 @@ func (s *Server) sendToBurn(ctx context.Context, icmd any) (any, error) {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "amount must be positive")
 	}
 
-	// Temporarily unlock wallet with provided passphrase
-	passphrase := []byte(cmd.Passphrase)
-	defer func() {
-		for i := range passphrase {
-			passphrase[i] = 0
-		}
-	}()
-
-	// If the wallet was locked before this call, re-lock on exit. This
-	// keeps sendtoburn's passphrase scoped to just this call (matching what
-	// the parameter name suggests) instead of leaving the wallet unlocked
-	// for the remaining walletpassphrase timeout.
-	wasLocked := w.Locked()
-	err = w.Unlock(ctx, passphrase, nil)
-	if err != nil {
-		return nil, rpcError(dcrjson.ErrRPCWalletUnlockNeeded, err)
-	}
-	if wasLocked {
-		defer w.Lock()
-	}
-
-	// Create the burn script for this coin type
-	burnScript, err := params.CreateSKABurnScript(coinType)
-	if err != nil {
-		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
-	}
-
-	// Create the burn output with coin type and burn script
-	// SKA outputs use SKAValue (big.Int) instead of Value (int64)
-	outputs := []*wire.TxOut{
-		{
-			Value:    0, // SKA outputs must have Value=0
-			SKAValue: skaAtoms,
-			CoinType: coinType,
-			Version:  wire.DefaultPkScriptVersion,
-			PkScript: burnScript,
-		},
-	}
-
-	// Send the transaction - burning always spends from default account
-	account := uint32(udb.DefaultAccountNum)
-	changeAccount := account
-	minConf := int32(1)
-
-	// Handle mixing account change routing if enabled
-	if s.cfg.MixingEnabled {
-		mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
+	// Temporarily unlock the wallet for this single call (per-call capability
+	// gate). The ambient walletpassphrase unlock window is intentionally NOT
+	// used; without this gate any other authenticated client during a
+	// walletpassphrase window could initiate a burn.
+	return withWalletUnlocked(ctx, w, cmd.Passphrase, func() (any, error) {
+		// Create the burn script for this coin type
+		burnScript, err := params.CreateSKABurnScript(coinType)
 		if err != nil {
-			return nil, err
+			return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
 		}
-		if account == mixAccount {
-			changeAccount, err = w.AccountNumber(ctx, s.cfg.MixChangeAccount)
+
+		// Create the burn output with coin type and burn script
+		// SKA outputs use SKAValue (big.Int) instead of Value (int64)
+		outputs := []*wire.TxOut{
+			{
+				Value:    0, // SKA outputs must have Value=0
+				SKAValue: skaAtoms,
+				CoinType: coinType,
+				Version:  wire.DefaultPkScriptVersion,
+				PkScript: burnScript,
+			},
+		}
+
+		// Send the transaction - burning always spends from default account
+		account := uint32(udb.DefaultAccountNum)
+		changeAccount := account
+		minConf := int32(1)
+
+		// Handle mixing account change routing if enabled
+		if s.cfg.MixingEnabled {
+			mixAccount, err := w.AccountNumber(ctx, s.cfg.MixAccount)
 			if err != nil {
 				return nil, err
 			}
+			if account == mixAccount {
+				changeAccount, err = w.AccountNumber(ctx, s.cfg.MixChangeAccount)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
-	}
 
-	txHash, err := w.SendOutputs(ctx, outputs, account, changeAccount, minConf)
-	if err != nil {
-		if errors.Is(err, errors.Locked) {
-			return nil, errWalletUnlockNeeded
+		txHash, err := w.SendOutputs(ctx, outputs, account, changeAccount, minConf)
+		if err != nil {
+			if errors.Is(err, errors.Locked) {
+				return nil, errWalletUnlockNeeded
+			}
+			if errors.Is(err, errors.InsufficientBalance) {
+				return nil, rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
+			}
+			return nil, err
 		}
-		if errors.Is(err, errors.InsufficientBalance) {
-			return nil, rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
-		}
-		return nil, err
-	}
 
-	return txHash.String(), nil
+		return txHash.String(), nil
+	})
 }
 
 // setTxFee sets the transaction fee per kilobyte added to transactions.
@@ -5885,15 +6454,20 @@ func (s *Server) setTxFee(ctx context.Context, icmd any) (any, error) {
 		ct = cointype.CoinType(*cmd.CoinType)
 	}
 
-	// Get atoms per coin for this coin type
-	var atomsPerCoin *big.Int
-	if ct == cointype.CoinTypeVAR {
-		atomsPerCoin = big.NewInt(int64(cointype.AtomsPerVAR))
-	} else {
-		atomsPerCoin = cointype.GetAtomsPerSKACoin()
+	// Reject coin types that are in range but not configured for this network
+	// before any state read. Without this, an unconfigured-but-in-range coin
+	// type would silently fall through to SetManualFee, which used to fan out
+	// the override across every active SKA coin.
+	if err := validateCoinTypeConfigured(w.ChainParams(), ct); err != nil {
+		return nil, err
 	}
 
-	// Parse amount from interface{} (can be float64 or string)
+	atomsPerCoin := atomsPerCoinForCoinType(w.ChainParams(), ct)
+
+	// SetTxFeeCmd.Amount is a JSON string (see types.SetTxFeeCmd) — the type
+	// system rejects JSON numbers, which is critical for SKA where 1e18
+	// atoms-per-coin makes float64 round-trip lossy past ~16 significant
+	// digits. Pass through coinsToAtomsBig for big.Int decimal parsing.
 	feeAtoms, err := coinsToAtomsBig(cmd.Amount, atomsPerCoin)
 	if err != nil {
 		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
@@ -5913,7 +6487,9 @@ func (s *Server) setTxFee(ctx context.Context, icmd any) (any, error) {
 
 	// Set manual fee override for the specified coin type
 	relayFee := cointype.NewSKAAmount(feeAtoms)
-	w.SetManualFee(ct, relayFee)
+	if err := w.SetManualFee(ct, relayFee); err != nil {
+		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
+	}
 
 	// A boolean true result is returned upon success.
 	return true, nil
@@ -6057,6 +6633,34 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 		return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
 	}
 
+	// Defense in depth: refuse mixed-coin-type transactions before signing.
+	// Mirrors sendRawTransaction. populateSKAValueIn below derives the tx
+	// coin type from outputs[0]; without this guard a malformed tx with
+	// inconsistent output coin types would be signed and produce a
+	// confusing downstream error when broadcast.
+	if len(tx.TxOut) > 1 {
+		firstCT := tx.TxOut[0].CoinType
+		for i, out := range tx.TxOut[1:] {
+			if out.CoinType != firstCT {
+				return nil, rpcErrorf(dcrjson.ErrRPCDeserialization,
+					"mixed coin types in raw transaction: output 0 is %d, output %d is %d",
+					firstCT, i+1, out.CoinType)
+			}
+		}
+	}
+	// Reject outputs whose CoinType and SKAValue presence disagree. A
+	// maliciously crafted tx with CoinType=0 on every output but SKAValue
+	// set on later outputs would otherwise slip through populateSKAValueIn
+	// (which would resolve txCoinType to VAR and early-return) and reach
+	// the signer with wire-format-violating outputs.
+	for i, out := range tx.TxOut {
+		if (out.SKAValue != nil) != out.CoinType.IsSKA() {
+			return nil, rpcErrorf(dcrjson.ErrRPCDeserialization,
+				"output %d coin type %d and SKAValue presence (%v) are inconsistent",
+				i, out.CoinType, out.SKAValue != nil)
+		}
+	}
+
 	var hashType txscript.SigHashType
 	switch *cmd.Flags {
 	case "ALL":
@@ -6083,6 +6687,14 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 	// make sure that they match the blockchain if present.
 	inputs := make(map[wire.OutPoint][]byte)
 	scripts := make(map[string][]byte)
+	// callerSKA collects caller-asserted SKAValueIn decimal-coin strings keyed
+	// by outpoint. Populated only when the RawTxInput.SKAValueIn JSON field is
+	// present. Parsed against the SKA coin's atomsPerCoin in the population
+	// pass below (we cannot parse here because we do not yet know the tx's SKA
+	// coin type). Used downstream to fill in tx.TxIn.SKAValueIn for SKA inputs
+	// that arrived with SKAValueIn=nil (e.g. a third-party tool built the
+	// wire.MsgTx from primitives without the V13 wire-format extension fields).
+	callerSKA := make(map[wire.OutPoint]string)
 	var cmdInputs []types.RawTxInput
 	if cmd.Inputs != nil {
 		cmdInputs = *cmd.Inputs
@@ -6122,11 +6734,24 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 			}
 			scripts[addr.String()] = redeemScript
 		}
-		inputs[wire.OutPoint{
+		op := wire.OutPoint{
 			Hash:  *inputSha,
 			Tree:  rti.Tree,
 			Index: rti.Vout,
-		}] = script
+		}
+		inputs[op] = script
+		if rti.SKAValueIn != nil {
+			// Defer atoms-per-coin resolution until we know the tx coin type;
+			// at this point we don't yet have the prevout's CoinType. Stash
+			// the raw decimal string keyed by outpoint and parse downstream.
+			s := *rti.SKAValueIn
+			if s == "" {
+				return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+					"skaValueIn for input %s:%d must not be empty",
+					rti.Txid, rti.Vout)
+			}
+			callerSKA[op] = s
+		}
 	}
 
 	// Now we go and look for any inputs that we were not provided by
@@ -6228,6 +6853,15 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 			return nil, rpcError(dcrjson.ErrRPCDecodeHexString, err)
 		}
 		inputs[outPoint] = script
+	}
+
+	// Populate SKAValueIn for SKA inputs that arrived without it. See
+	// populateSKAValueIn for the contract.
+	if err := populateSKAValueIn(ctx, tx, w.ChainParams(), callerSKA,
+		func(ctx context.Context, op wire.OutPoint) (*udb.Credit, error) {
+			return w.UnspentOutput(ctx, op, true)
+		}); err != nil {
+		return nil, err
 	}
 
 	// All args collected. Now we can sign all the inputs that we can.
@@ -6384,14 +7018,28 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
+	// Coin type defaults to VAR; SKA accounts opt in via cointype.
+	sweepCoinType := cointype.CoinTypeVAR
+	if cmd.CoinType != nil {
+		sweepCoinType = cointype.CoinType(*cmd.CoinType)
+		if err := validateCoinTypeConfigured(w.ChainParams(), sweepCoinType); err != nil {
+			return nil, err
+		}
+	}
+
 	// use provided fee per Kb if specified
-	feePerKb := w.RelayFee()
+	feePerKbOverride := cointype.Zero()
 	if cmd.FeePerKb != nil {
-		var err error
-		feePerKb, err = dcrutil.NewAmount(*cmd.FeePerKb)
+		atomsPerCoin := getAtomsPerCoin(w.ChainParams(), sweepCoinType)
+		atomsBig, err := coinsToAtomsBig(*cmd.FeePerKb, atomsPerCoin)
 		if err != nil {
 			return nil, rpcError(dcrjson.ErrRPCInvalidParameter, err)
 		}
+		if atomsBig.Sign() < 0 {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"feePerKb must be non-negative")
+		}
+		feePerKbOverride = cointype.NewSKAAmount(atomsBig)
 	}
 
 	// use provided required confirmations if specified
@@ -6415,8 +7063,8 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	tx, err := w.NewUnsignedTransaction(ctx, nil, feePerKb, account,
-		requiredConfs, wallet.OutputSelectionAlgorithmAll, changeSource, nil)
+	tx, err := w.NewUnsignedSweepTransactionForCoinType(ctx, sweepCoinType,
+		feePerKbOverride, account, requiredConfs, changeSource)
 	if err != nil {
 		if errors.Is(err, errors.InsufficientBalance) {
 			return nil, rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
@@ -6431,14 +7079,64 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 		return nil, err
 	}
 
+	// Report aggregated input/output amounts as full-precision base-10
+	// decimal coin strings.  Float64 cannot carry SKA atoms (1e18 atoms/coin)
+	// without losing precision, so this is the only safe surface for both
+	// VAR and SKA.
+	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), sweepCoinType)
+	var totalInStr, totalOutStr string
+	if sweepCoinType.IsSKA() {
+		totalInStr = cointype.AtomsToDecimalString(tx.SKATotalInput.BigInt(), atomsPerCoin)
+		skaTotalOut, err := sumSKAOutputValues(tx.Tx.TxOut)
+		if err != nil {
+			return nil, err
+		}
+		totalOutStr = cointype.AtomsToDecimalString(skaTotalOut, atomsPerCoin)
+	} else {
+		totalInStr = cointype.AtomsToDecimalString(big.NewInt(int64(tx.TotalInput)), atomsPerCoin)
+		totalOutStr = cointype.AtomsToDecimalString(big.NewInt(int64(sumOutputValues(tx.Tx.TxOut))), atomsPerCoin)
+	}
 	res := &types.SweepAccountResult{
 		UnsignedTransaction:       b.String(),
-		TotalPreviousOutputAmount: tx.TotalInput.ToCoin(),
-		TotalOutputAmount:         sumOutputValues(tx.Tx.TxOut).ToCoin(),
+		TotalPreviousOutputAmount: totalInStr,
+		TotalOutputAmount:         totalOutStr,
 		EstimatedSignedSize:       uint32(tx.EstimatedSignedSerializeSize),
 	}
 
 	return res, nil
+}
+
+// sumSKAOutputValues sums SKAValue across all outputs. SKA outputs missing
+// SKAValue are surfaced loudly: validateAuthoredCoinTypes rejects mixed-coin
+// txs upstream for most paths, but sendrawtransaction bypasses that check, so
+// silently dropping a malformed SKA output here would let a downstream sweep
+// summary under-report. Returns an error in that case rather than swallowing.
+func sumSKAOutputValues(outputs []*wire.TxOut) (*big.Int, error) {
+	total := new(big.Int)
+	for i, txOut := range outputs {
+		if txOut.CoinType.IsSKA() && txOut.SKAValue == nil {
+			return nil, fmt.Errorf("SKA output %d has nil SKAValue", i)
+		}
+		if txOut.SKAValue != nil {
+			total.Add(total, txOut.SKAValue)
+		}
+	}
+	return total, nil
+}
+
+// atomsToFloat converts a big.Int atom count to a float64 coin value via the
+// given atomsPerCoin scale. Precision is lossy past ~15 decimal digits;
+// callers needing exact values must use the decimal-string variant.
+func atomsToFloat(atoms, atomsPerCoin *big.Int) float64 {
+	if atoms == nil || atomsPerCoin == nil || atomsPerCoin.Sign() == 0 {
+		return 0
+	}
+	atomsF, _ := new(big.Float).SetInt(atoms).Float64()
+	scaleF, _ := new(big.Float).SetInt(atomsPerCoin).Float64()
+	if scaleF == 0 {
+		return 0
+	}
+	return atomsF / scaleF
 }
 
 // validateAddress handles the validateaddress command.
@@ -6489,7 +7187,10 @@ func (s *Server) validateAddress(ctx context.Context, icmd any) (any, error) {
 
 	switch ka := ka.(type) {
 	case wallet.PubKeyHashAddress:
-		pubKey := ka.PubKey()
+		pubKey, err := ka.PubKey()
+		if err != nil {
+			return nil, err
+		}
 		result.PubKey = hex.EncodeToString(pubKey)
 		pubKeyAddr, err := stdaddr.NewAddressPubKeyEcdsaSecp256k1V0Raw(pubKey, w.ChainParams())
 		if err != nil {
@@ -6525,17 +7226,6 @@ func (s *Server) validateAddress(ctx context.Context, icmd any) (any, error) {
 	}
 
 	return result, nil
-}
-
-// validatePreDCP0005CF handles the validatepredcp0005cf command.
-func (s *Server) validatePreDCP0005CF(ctx context.Context, icmd any) (any, error) {
-	w, ok := s.walletLoader.LoadedWallet()
-	if !ok {
-		return nil, errUnloadedWallet
-	}
-
-	err := w.ValidatePreDCP0005CFilters(ctx)
-	return err == nil, err
 }
 
 // verifyMessage handles the verifymessage command by verifying the provided
@@ -6664,7 +7354,7 @@ func (s *Server) walletInfo(ctx context.Context, icmd any) (any, error) {
 		SPV:              spvMode,
 		Unlocked:         unlocked,
 		CoinType:         coinType,
-		TxFee:            fi.ToCoin(),
+		TxFee:            varAtomsToDecimalString(fi),
 		VoteBits:         voteBits.Bits,
 		VoteBitsExtended: hex.EncodeToString(voteBits.ExtendedBits),
 		VoteVersion:      voteVersion,
@@ -6706,7 +7396,9 @@ func (s *Server) walletLock(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
-	w.Lock()
+	if err := w.Lock(); err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWallet, "wallet lock failed: %v", err)
+	}
 	return nil, nil
 }
 
@@ -7012,19 +7704,18 @@ func (s *Server) getcoinjoinsbyacct(ctx context.Context, icmd any) (any, error) 
 // (SKA decimal) per the GetCoinBalanceResult schema. Stake-only fields are
 // fixed to "0" for SKA since SKA does not participate in PoS.
 type coinBalanceAmounts struct {
-	ImmatureCoinbaseRewards interface{}
-	ImmatureStakeGeneration interface{}
-	LockedByTickets         interface{}
-	Spendable               interface{}
-	Total                   interface{}
-	Unconfirmed             interface{}
-	VotingAuthority         interface{}
+	ImmatureCoinbaseRewards string
+	ImmatureStakeGeneration string
+	LockedByTickets         string
+	Spendable               string
+	Total                   string
+	Unconfirmed             string
+	VotingAuthority         string
 }
 
 // renderCoinBalanceAmounts formats a CoinBalance for getcoinbalance output.
-// For SKA coins, the SKA big.Int fields are emitted as decimal strings via
-// SKAAmount.ToDecimalString to preserve precision beyond int64. For VAR, the
-// existing atomsToCoins float64 path is used.
+// Both VAR and SKA emit decimal coin strings via AtomsToDecimalString /
+// SKAAmount.ToDecimalString — unified wire shape, preserves SKA precision.
 func renderCoinBalanceAmounts(cb wallet.CoinBalance, isSKA bool, atomsPerCoin *big.Int) coinBalanceAmounts {
 	if isSKA {
 		return coinBalanceAmounts{
@@ -7038,13 +7729,13 @@ func renderCoinBalanceAmounts(cb wallet.CoinBalance, isSKA bool, atomsPerCoin *b
 		}
 	}
 	return coinBalanceAmounts{
-		ImmatureCoinbaseRewards: atomsToCoins(int64(cb.ImmatureCoinbaseRewards), atomsPerCoin),
-		ImmatureStakeGeneration: atomsToCoins(int64(cb.ImmatureStakeGeneration), atomsPerCoin),
-		LockedByTickets:         atomsToCoins(int64(cb.LockedByTickets), atomsPerCoin),
-		Spendable:               atomsToCoins(int64(cb.Spendable), atomsPerCoin),
-		Total:                   atomsToCoins(int64(cb.Total), atomsPerCoin),
-		Unconfirmed:             atomsToCoins(int64(cb.Unconfirmed), atomsPerCoin),
-		VotingAuthority:         atomsToCoins(int64(cb.VotingAuthority), atomsPerCoin),
+		ImmatureCoinbaseRewards: atomsToDecimalString(int64(cb.ImmatureCoinbaseRewards), atomsPerCoin),
+		ImmatureStakeGeneration: atomsToDecimalString(int64(cb.ImmatureStakeGeneration), atomsPerCoin),
+		LockedByTickets:         atomsToDecimalString(int64(cb.LockedByTickets), atomsPerCoin),
+		Spendable:               atomsToDecimalString(int64(cb.Spendable), atomsPerCoin),
+		Total:                   atomsToDecimalString(int64(cb.Total), atomsPerCoin),
+		Unconfirmed:             atomsToDecimalString(int64(cb.Unconfirmed), atomsPerCoin),
+		VotingAuthority:         atomsToDecimalString(int64(cb.VotingAuthority), atomsPerCoin),
 	}
 }
 
@@ -7066,8 +7757,8 @@ func (s *Server) getCoinBalance(ctx context.Context, icmd any) (any, error) {
 		}
 	}
 
-	// Validate coin type range
-	if err := validateCoinType(coinType); err != nil {
+	// Validate coin type range and presence in chain params
+	if err := validateCoinTypeConfigured(w.ChainParams(), coinType); err != nil {
 		return nil, err
 	}
 
@@ -7225,15 +7916,15 @@ func (s *Server) listCoinTypes(ctx context.Context, icmd any) (any, error) {
 		if coinType == cointype.CoinTypeVAR {
 			name = "VAR"
 		} else {
-			name = fmt.Sprintf("SKA-%d", coinType)
+			name = fmt.Sprintf("SKA%d", coinType)
 		}
 
-		// Use SKA big.Int fields for SKA coins (string for precision), int64 fields for VAR (float64)
-		var balanceValue interface{}
+		// Both VAR and SKA emit decimal coin strings — unified API contract.
+		var balanceValue string
 		if coinType.IsSKA() {
 			balanceValue = balance.SKASpendable.ToDecimalString(atomsPerCoin)
 		} else {
-			balanceValue = atomsToCoins(int64(balance.Spendable), atomsPerCoin)
+			balanceValue = atomsToDecimalString(int64(balance.Spendable), atomsPerCoin)
 		}
 
 		info := types.CoinTypeInfo{
@@ -7248,26 +7939,89 @@ func (s *Server) listCoinTypes(ctx context.Context, icmd any) (any, error) {
 	return result, nil
 }
 
+// auditKeyName redacts a caller-supplied emission-key name for audit logs.
+// Operator docs forbid embedding secrets or PII in key names, but the audit
+// log is permanent and operator discipline is fallible — return a SHA-256/8
+// hex digest plus the length so logs correlate without echoing the raw name.
+// The pubkey hex logged alongside is the canonical identifier; the digest is
+// for operator-side cross-referencing only.
+func auditKeyName(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return fmt.Sprintf("%s(len=%d)", hex.EncodeToString(sum[:8]), len(name))
+}
+
+// auditFallbackCounter is the monotonic-counter source used when crypto/rand
+// fails. A literal "unknown" sentinel would correlate every fallback line to
+// the same token; a counter at least guarantees per-event uniqueness within
+// a process, distinguishable from real random IDs by the "fallback-" prefix.
+var auditFallbackCounter atomic.Uint64
+
+// auditRequestID returns an 8-byte hex correlation ID for one emission audit
+// event. The wsrpc layer does not inject a request ID into the context, so we
+// mint one at audit-log time. Operators cross-reference the value against the
+// access log by timestamp + ID to recover "which RPC client retrieved this
+// emission key" forensically. crypto/rand is used so an attacker cannot
+// fabricate a matching ID after the fact.
+func auditRequestID() string {
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		// crypto/rand failure is exceptional; fall back to a per-process
+		// monotonic counter so an operator forensically reconstructing
+		// emission key access does not see correlated lines that are not
+		// in fact the same request. The "fallback-" prefix marks these
+		// lines as non-random so they are distinguishable in the log.
+		return fmt.Sprintf("fallback-%016x", auditFallbackCounter.Add(1))
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // getEmissionKeyForCoinType retrieves a stored emission key by name and validates
 // it matches the governance-approved public key for the specified coin type.
 func getEmissionKeyForCoinType(w *wallet.Wallet, ctx context.Context, coinType cointype.CoinType, keyName string) (*secp256k1.PrivateKey, error) {
-	// Retrieve emission key by name from wallet database
-	privateKey, err := retrieveEmissionKeyByName(w, ctx, keyName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve emission key %s: %v", keyName, err)
+	const op errors.Op = "rpc.getEmissionKeyForCoinType"
+
+	// Defensive precondition: emission keys are decrypted under the master
+	// key, so the wallet must be unlocked. Every caller today routes through
+	// withWalletPassphraseGate, but a future caller that forgets the gate
+	// would surface a misleading "key not found" error from the underlying
+	// store. Fail loudly here instead.
+	if w.Locked() {
+		return nil, errors.E(op, errors.Locked, errors.Errorf(
+			"wallet must be unlocked to retrieve emission key %s", keyName))
 	}
 
-	// Validate that this key matches the governance-approved public key for this coin type
+	privateKey, err := retrieveEmissionKeyByName(w, ctx, keyName)
+	if err != nil {
+		// Preserve the underlying error class (Passphrase, Crypto, NotExist,
+		// ...) so operators see the real cause of an emission key fetch
+		// failure instead of a misleading "not found".
+		return nil, errors.E(op, err)
+	}
+
 	chainParams := w.ChainParams()
 	authorizedKey := chainParams.GetSKAEmissionKey(coinType)
 	if authorizedKey == nil {
-		return nil, fmt.Errorf("no emission key configured for coin type %d in governance settings", coinType)
+		return nil, errors.E(op, errors.Invalid, errors.Errorf(
+			"no emission key configured for coin type %d in governance settings", coinType))
 	}
 
 	publicKey := privateKey.PubKey()
 	if !bytes.Equal(publicKey.SerializeCompressed(), authorizedKey.SerializeCompressed()) {
-		return nil, fmt.Errorf("stored key %s does not match governance-approved public key for coin type %d", keyName, coinType)
+		return nil, errors.E(op, errors.Invalid, errors.Errorf(
+			"stored key %s does not match governance-approved public key for coin type %d", keyName, coinType))
 	}
+
+	// Audit log: emission keys are the highest-privilege secret in the
+	// wallet, so every successful retrieval is recorded with public material
+	// only (redacted key-name digest, pubkey hex, coin type, request ID).
+	// Never log the private key bytes. The keyName is hashed via auditKeyName
+	// so an operator who ignored the docs and put a secret in the name does
+	// not leak it into permanent logs; the pubkey hex is the canonical
+	// identifier. The reqID is a per-event correlation token so operators
+	// can tie this line to an entry in the wsrpc access log when forensically
+	// reconstructing "who retrieved this key, when".
+	log.Infof("emission key retrieved: reqID=%s keyNameDigest=%s pubkey=%x coinType=%d",
+		auditRequestID(), auditKeyName(keyName), publicKey.SerializeCompressed(), coinType)
 
 	return privateKey, nil
 }
@@ -7398,6 +8152,14 @@ func createUnsignedSKAEmissionTransaction(auth *chaincfg.SKAEmissionAuth,
 		return nil, fmt.Errorf("emission height %d is outside emission window [%d, %d] for coin type %d",
 			auth.Height, emissionStart, emissionEnd, auth.CoinType)
 	}
+	// Expiry is a uint32 on the wire; refuse to construct a transaction whose
+	// emission-window end would silently wrap. Current chain params fit
+	// comfortably, but a future misconfiguration of EmissionHeight or
+	// EmissionWindow must fail loudly rather than truncate.
+	if emissionEnd < 0 || emissionEnd > math.MaxUint32 {
+		return nil, fmt.Errorf("emission window end %d cannot be represented as a 32-bit Expiry for coin type %d — chain params misconfigured",
+			emissionEnd, auth.CoinType)
+	}
 
 	// Note: Signature verification is not done here since we're creating an unsigned transaction.
 	// The signature will be added after the transaction is created.
@@ -7441,11 +8203,17 @@ func createUnsignedSKAEmissionTransaction(auth *chaincfg.SKAEmissionAuth,
 		// Create script for the address
 		_, pkScript := addr.PaymentScript()
 
-		// Add SKA output with specific coin type
-		// SKA coins use SKAValue (big.Int) for amounts
+		// Add SKA output with specific coin type. Defensive-copy the
+		// caller's *big.Int into the wire tx so a later mutation by the
+		// caller cannot retroactively change the emission output amount —
+		// matches the pattern used for txIn.SKAValueIn elsewhere.
+		var skaValue *big.Int
+		if amounts[i] != nil {
+			skaValue = new(big.Int).Set(amounts[i])
+		}
 		tx.TxOut = append(tx.TxOut, &wire.TxOut{
 			Value:    0,             // Not used for SKA
-			SKAValue: amounts[i],    // SKA uses big.Int for amounts
+			SKAValue: skaValue,      // SKA uses big.Int for amounts
 			CoinType: auth.CoinType, // Use authorized coin type
 			Version:  0,
 			PkScript: pkScript,
@@ -7493,7 +8261,15 @@ func createEmissionAuthScript(auth *chaincfg.SKAEmissionAuth) ([]byte, error) {
 	pubKeyBytes := auth.EmissionKey.SerializeCompressed()
 	script.Write(pubKeyBytes)
 
-	// Signature length and signature
+	// Signature length and signature. Bound length explicitly: secp256k1 ECDSA-DER
+	// signatures are at most ~72 bytes today, but a future caller passing a Schnorr
+	// or aggregated form whose serialized size exceeded 255 bytes would otherwise
+	// have len(...) silently truncated by the uint8 cast and produce a malformed
+	// script that consensus would reject during emission. Mirrors the amountBytes
+	// check above.
+	if len(auth.Signature) > 255 {
+		return nil, fmt.Errorf("signature too large: %d bytes (max 255)", len(auth.Signature))
+	}
 	script.WriteByte(uint8(len(auth.Signature)))
 	script.Write(auth.Signature)
 
@@ -7502,6 +8278,12 @@ func createEmissionAuthScript(auth *chaincfg.SKAEmissionAuth) ([]byte, error) {
 
 // generateEmissionKey handles a generateemissionkey request by creating a new private key
 // for SKA emission authorization (primary flow - key exists before governance).
+//
+// Capability gate: cmd.WalletPassphrase is required. The wallet is unlocked
+// for the duration of this single call and re-locked on return; the ambient
+// walletpassphrase unlock window is intentionally NOT used. This prevents a
+// concurrent authenticated RPC client from minting emission keys during an
+// operator's open unlock window.
 func (s *Server) generateEmissionKey(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.GenerateEmissionKeyCmd)
 	w, ok := s.walletLoader.LoadedWallet()
@@ -7521,54 +8303,73 @@ func (s *Server) generateEmissionKey(ctx context.Context, icmd any) (any, error)
 			"key name cannot be empty")
 	}
 
-	// Check if wallet is unlocked (must be unlocked via walletpassphrase command)
-	if w.Locked() {
-		return nil, rpcErrorf(dcrjson.ErrRPCWalletUnlockNeeded,
-			"wallet must be unlocked with walletpassphrase command before generating emission keys")
+	// Require an explicit wallet passphrase. Falling back to the ambient
+	// walletpassphrase unlock window would preserve the very gap this
+	// per-call gate is closing.
+	if cmd.WalletPassphrase == "" {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"walletpassphrase is required")
 	}
 
-	// Generate new private key for emission
-	privateKey, err := secp256k1.GeneratePrivateKey()
-	if err != nil {
-		return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
-			"failed to generate private key: %v", err)
-	}
-
-	publicKey := privateKey.PubKey()
-
-	// Store the emission key in wallet database (coin-type agnostic)
-	err = storeGeneratedEmissionKey(w, ctx, cmd.KeyName, privateKey)
-	if err != nil {
-		return nil, rpcErrorf(dcrjson.ErrRPCWallet,
-			"failed to store emission key: %v", err)
-	}
-
-	// The canonical backup is the wallet DB itself (stored under CKTEmission,
-	// scrypt-protected by the wallet's master passphrase). The encrypted backup
-	// blob is only returned when the caller explicitly opts in, since it
-	// otherwise appears in RPC logs, proxies, and debug traces.
-	result := &types.GenerateEmissionKeyResult{
-		Success:   true,
-		KeyName:   cmd.KeyName,
-		PublicKey: hex.EncodeToString(publicKey.SerializeCompressed()),
-	}
-	if cmd.CoinType != nil {
-		result.CoinType = *cmd.CoinType
-	}
-	if cmd.ReturnEncryptedBackup != nil && *cmd.ReturnEncryptedBackup {
-		encryptedPrivateKey, err := encryptPrivateKeyWithPassphrase(privateKey, cmd.Passphrase)
+	return withWalletUnlocked(ctx, w, cmd.WalletPassphrase, func() (any, error) {
+		// Generate new private key for emission
+		privateKey, err := secp256k1.GeneratePrivateKey()
 		if err != nil {
 			return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
-				"failed to encrypt private key: %v", err)
+				"failed to generate private key: %v", err)
 		}
-		result.EncryptedPrivateKey = encryptedPrivateKey
-	}
 
-	return result, nil
+		publicKey := privateKey.PubKey()
+
+		// Store the emission key in wallet database (coin-type agnostic)
+		err = storeGeneratedEmissionKey(w, ctx, cmd.KeyName, privateKey)
+		if err != nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+				"failed to store emission key: %v", err)
+		}
+
+		// Audit log: emission keys are the highest-privilege secret in the
+		// wallet, so every store/retrieve is recorded with public material
+		// only (redacted key-name digest, pubkey hex, optional coin type).
+		// Never log the private key bytes or the raw key name; see
+		// auditKeyName for the digest contract.
+		log.Infof("generateemissionkey: stored emission key keyNameDigest=%s pubkey=%x coinType=%s",
+			auditKeyName(cmd.KeyName), publicKey.SerializeCompressed(), formatOptionalCoinType(cmd.CoinType))
+
+		// The canonical backup is the wallet DB itself (stored under CKTEmission,
+		// scrypt-protected by the wallet's master passphrase). The encrypted backup
+		// blob is only returned when the caller explicitly opts in, since it
+		// otherwise appears in RPC logs, proxies, and debug traces.
+		result := &types.GenerateEmissionKeyResult{
+			Success:   true,
+			KeyName:   cmd.KeyName,
+			PublicKey: hex.EncodeToString(publicKey.SerializeCompressed()),
+		}
+		if cmd.CoinType != nil {
+			result.CoinType = *cmd.CoinType
+		}
+		if cmd.ReturnEncryptedBackup != nil && *cmd.ReturnEncryptedBackup {
+			if err := requireBackupPassphrase(cmd.Passphrase); err != nil {
+				return nil, err
+			}
+			encryptedPrivateKey, err := encryptPrivateKeyWithPassphrase(privateKey, cmd.Passphrase)
+			if err != nil {
+				return nil, rpcErrorf(dcrjson.ErrRPCInternal.Code,
+					"failed to encrypt private key: %v", err)
+			}
+			result.EncryptedPrivateKey = encryptedPrivateKey
+		}
+
+		return result, nil
+	})
 }
 
 // importEmissionKey handles an importemissionkey request by storing a private key
 // used for SKA emission authorization in the wallet database (emergency/recovery only).
+//
+// Capability gate: cmd.WalletPassphrase is required. The wallet is unlocked
+// for the duration of this single call and re-locked on return; the ambient
+// walletpassphrase unlock window is intentionally NOT used. See generateEmissionKey.
 func (s *Server) importEmissionKey(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.ImportEmissionKeyCmd)
 	w, ok := s.walletLoader.LoadedWallet()
@@ -7588,69 +8389,74 @@ func (s *Server) importEmissionKey(ctx context.Context, icmd any) (any, error) {
 			"key name cannot be empty")
 	}
 
+	// Require an explicit wallet passphrase. Falling back to the ambient
+	// walletpassphrase unlock window would preserve the very gap this
+	// per-call gate is closing.
+	if cmd.WalletPassphrase == "" {
+		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"walletpassphrase is required")
+	}
+
 	// Parse private key - handle both encrypted and plain hex formats
 	var privateKey *secp256k1.PrivateKey
 	var err error
 
 	if strings.HasPrefix(cmd.PrivateKey, "aes256gcm:") {
 		// Encrypted format - decrypt with provided passphrase
+		if err := requireBackupPassphrase(cmd.Passphrase); err != nil {
+			return nil, err
+		}
 		privateKey, err = decryptPrivateKeyWithPassphrase(cmd.PrivateKey, cmd.Passphrase)
 		if err != nil {
 			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
 				"failed to decrypt private key: %v", err)
 		}
 	} else {
-		// Plain hex format - backward compatibility
-		privateKeyBytes, err := hex.DecodeString(cmd.PrivateKey)
-		if err != nil {
+		// Plain hex format - backward compatibility.
+		privateKeyBytes, decodeErr := hex.DecodeString(cmd.PrivateKey)
+		// Wipe the decoded bytes on return so the raw key material does not
+		// linger on the heap. zeroBytes is nil-safe so this also covers the
+		// hex-decode error path.
+		defer zeroBytes(privateKeyBytes)
+		if decodeErr != nil {
 			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
-				"invalid private key hex: %v", err)
+				"invalid private key hex: %v", decodeErr)
 		}
 		// secp256k1.PrivKeyFromBytes silently truncates >32 bytes and
-		// mod-reduces; require exactly 32 bytes and reject post-reduction
-		// zero so callers can't import an invalid/colliding key.
-		if len(privateKeyBytes) != 32 {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
-				"private key must be exactly 32 bytes (got %d)", len(privateKeyBytes))
-		}
-		privateKey = secp256k1.PrivKeyFromBytes(privateKeyBytes)
-		if privateKey.Key.IsZero() {
-			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
-				"private key is zero or out of range")
+		// mod-reduces; parseSecp256k1Private rejects both non-32-byte
+		// inputs and post-reduction zero scalars.
+		var parseErr error
+		privateKey, parseErr = parseSecp256k1Private(privateKeyBytes)
+		if parseErr != nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "%v", parseErr)
 		}
 	}
 
 	publicKey := privateKey.PubKey()
 
-	// Note: Governance validation is deferred to createauthorizedemission
-	// This allows flexible key management - users can import any keys
-	// and validation happens only when attempting to create emission transactions
+	return withWalletUnlocked(ctx, w, cmd.WalletPassphrase, func() (any, error) {
+		// Store the imported emission key in wallet database. Storage is
+		// cointype-agnostic; governance validation is deferred to
+		// createauthorizedemission.
+		if err := storeGeneratedEmissionKey(w, ctx, cmd.KeyName, privateKey); err != nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+				"failed to store emission key: %v", err)
+		}
 
-	// Check if wallet is unlocked (must be unlocked via walletpassphrase command)
-	if w.Locked() {
-		return nil, rpcErrorf(dcrjson.ErrRPCWalletUnlockNeeded,
-			"wallet must be unlocked with walletpassphrase command before importing emission keys")
-	}
+		// Audit log: see generateEmissionKey for rationale. Public material only.
+		log.Infof("importemissionkey: stored emission key keyNameDigest=%s pubkey=%x coinType=%s",
+			auditKeyName(cmd.KeyName), publicKey.SerializeCompressed(), formatOptionalCoinType(cmd.CoinType))
 
-	// Store the imported emission key in wallet database
-	// Note: Storage is cointype-agnostic, validation happens at emission time
-	err = storeGeneratedEmissionKey(w, ctx, cmd.KeyName, privateKey) // Use same storage as generated keys
-	if err != nil {
-		return nil, rpcErrorf(dcrjson.ErrRPCWallet,
-			"failed to store emission key: %v", err)
-	}
-
-	// Prepare result with optional cointype
-	result := &types.ImportEmissionKeyResult{
-		Success:   true,
-		KeyName:   cmd.KeyName,
-		PublicKey: hex.EncodeToString(publicKey.SerializeCompressed()),
-	}
-	if cmd.CoinType != nil {
-		result.CoinType = *cmd.CoinType
-	}
-
-	return result, nil
+		result := &types.ImportEmissionKeyResult{
+			Success:   true,
+			KeyName:   cmd.KeyName,
+			PublicKey: hex.EncodeToString(publicKey.SerializeCompressed()),
+		}
+		if cmd.CoinType != nil {
+			result.CoinType = *cmd.CoinType
+		}
+		return result, nil
+	})
 }
 
 // storeGeneratedEmissionKey stores a newly generated emission private key in the wallet database.
@@ -7667,15 +8473,42 @@ func retrieveEmissionKeyByName(w *wallet.Wallet, ctx context.Context, keyName st
 	return w.RetrieveEmissionKey(ctx, keyName)
 }
 
+// formatOptionalCoinType renders a *uint8 coin type for audit log lines.
+// Returns "<unset>" when the caller did not specify a coin type so the log
+// line stays unambiguous about the absence vs. coin type 0.
+func formatOptionalCoinType(ct *uint8) string {
+	if ct == nil {
+		return "<unset>"
+	}
+	return strconv.FormatUint(uint64(*ct), 10)
+}
+
 // Emission-key backup KDF parameters. Match wallet/internal/snacl defaults.
 const (
-	emissionKDFVersion = "v2"
+	emissionKDFVersion = "v3"
 	emissionKDFSaltLen = 16
 	emissionKDFN       = 1 << 15
 	emissionKDFR       = 8
 	emissionKDFP       = 1
 	emissionKDFKeyLen  = 32
+
+	// numV3BlobParts is the colon-delimited part count of a v3 backup blob:
+	// "aes256gcm:v3:salt:N:r:p:nonce:ciphertext" → 8 parts.
+	// A future v4 format must update both this constant and the prefix-strip
+	// in decryptPrivateKeyWithPassphrase.
+	numV3BlobParts = 8
 )
+
+// emissionBackupAAD builds the AES-GCM additional-authenticated-data string
+// that binds the scrypt KDF parameters (salt, N, r, p) into the v3 ciphertext.
+// Without this binding, an attacker who can modify the blob in transit could
+// swap the salt or KDF cost parameters; with the binding any tampering is
+// detected at gcm.Open time. The format must be reconstructed identically on
+// encrypt and decrypt — do not change without bumping emissionKDFVersion.
+func emissionBackupAAD(version string, salt []byte, n, r, p int) []byte {
+	return []byte(fmt.Sprintf("%s:%s:%d:%d:%d",
+		version, hex.EncodeToString(salt), n, r, p))
+}
 
 // zeroBytes overwrites the given slice with zeros.
 func zeroBytes(b []byte) {
@@ -7684,19 +8517,104 @@ func zeroBytes(b []byte) {
 	}
 }
 
+// withWalletUnlocked runs fn with the wallet temporarily unlocked using the
+// supplied passphrase. The cleartext []byte copy is wiped on return; if the
+// wallet was locked before the call, it is re-locked on return (even on panic).
+// The ambient walletpassphrase unlock window is NOT relied on. This is the
+// per-call capability gate used by emission and burn RPCs so that a compromised
+// authenticated client which races against an open walletpassphrase window
+// cannot mint coins.
+//
+// On Unlock failure the underlying error is intentionally not wrapped (matching
+// the createauthorizedemission/sendtoburn convention) to avoid leaking internal
+// DB/cipher strings to clients.
+//
+// Caveat: only the local []byte copy is wiped here. The caller-supplied Go
+// `string` (typically allocated by the dcrjson parser when parsing the RPC
+// request body) is immutable and remains in heap memory until the garbage
+// collector reclaims it. Operators should treat the wallet master passphrase
+// as exposed to the host's process memory for as long as the request lifetime
+// + GC delay, and not reuse it across services. See SECURITY.md.
+func withWalletUnlocked(ctx context.Context, w *wallet.Wallet, passphrase string, fn func() (any, error)) (any, error) {
+	return withWalletPassphraseGate(ctx, w, passphrase, fn)
+}
+
+// walletPassphraseGate is the subset of *wallet.Wallet that withWalletUnlocked
+// touches. Extracting it lets unit tests exercise the relock semantics without
+// standing up a real wallet fixture.
+type walletPassphraseGate interface {
+	Locked() bool
+	Unlock(ctx context.Context, passphrase []byte, timeout <-chan time.Time) error
+	Lock() error
+}
+
+// withWalletPassphraseGate runs fn after unlocking gate with passphrase, then
+// always relocks before returning. The relock is unconditional: any ambient
+// `walletpassphrase` window held by another caller is terminated when this
+// function returns. That is the per-call capability gate's whole purpose —
+// without it, a privileged bystander could ride out an emission/burn call's
+// unlock window and reuse it for unrelated authenticated RPCs (sendtoaddress,
+// signrawtransaction, etc.).
+//
+// Operators issuing emission/burn against an already-unlocked wallet must
+// re-issue `walletpassphrase` afterward to restore ambient access.
+//
+// If fn returns an error and the relock also fails, fn's error wins (it is the
+// more useful diagnostic for the caller). Either failure is logged.
+func withWalletPassphraseGate(ctx context.Context, gate walletPassphraseGate, passphrase string, fn func() (any, error)) (any, error) {
+	pp := []byte(passphrase)
+	defer zeroBytes(pp)
+
+	if err := gate.Unlock(ctx, pp, nil); err != nil {
+		return nil, rpcErrorf(dcrjson.ErrRPCWalletPassphraseIncorrect, "incorrect passphrase")
+	}
+
+	result, fnErr := fn()
+	if lockErr := gate.Lock(); lockErr != nil {
+		log.Errorf("post-capability-gate relock failed: %v", lockErr)
+		if fnErr == nil {
+			return nil, rpcErrorf(dcrjson.ErrRPCWallet, "wallet relock failed: %v", lockErr)
+		}
+	}
+	return result, fnErr
+}
+
+// minBackupPassphraseLen is the minimum length required for an emission-key
+// backup passphrase. A leaked encrypted backup is a permanent capability for
+// the lifetime of the SKA coin, so a weak passphrase (or empty string) would
+// reduce the AES-256-GCM blob to a trivially-decryptable artifact.
+const minBackupPassphraseLen = 12
+
+// requireBackupPassphrase enforces the minimum passphrase length for emission-key
+// backup encrypt/decrypt paths. The passphrase value itself is never echoed in
+// the returned error.
+func requireBackupPassphrase(passphrase string) error {
+	if len(passphrase) < minBackupPassphraseLen {
+		return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+			"passphrase must be at least %d characters for emission-key backup",
+			minBackupPassphraseLen)
+	}
+	return nil
+}
+
 // encryptPrivateKeyWithPassphrase encrypts an emission private key for user-held
 // backup with a passphrase. Uses scrypt(N=2^15,r=8,p=1) to derive a 32-byte
 // AES-256-GCM key from the passphrase with a fresh random 16-byte salt, then
-// AES-256-GCM with a random 12-byte nonce.
+// AES-256-GCM with a random 12-byte nonce. The KDF parameters (salt, N, r, p)
+// are bound into the ciphertext via AES-GCM additional-authenticated-data, so
+// any in-transit tampering with those fields is detected on decrypt.
 //
-// Blob format: "aes256gcm:v2:<hex-salt>:<N>:<r>:<p>:<hex-nonce>:<hex-ciphertext>"
+// Blob format: "aes256gcm:v3:<hex-salt>:<N>:<r>:<p>:<hex-nonce>:<hex-ciphertext>"
 func encryptPrivateKeyWithPassphrase(privateKey *secp256k1.PrivateKey, passphrase string) (string, error) {
+	pp := []byte(passphrase)
+	defer zeroBytes(pp)
+
 	salt := make([]byte, emissionKDFSaltLen)
 	if _, err := cryptorand.Read(salt); err != nil {
 		return "", fmt.Errorf("failed to generate salt: %v", err)
 	}
 
-	key, err := scrypt.Key([]byte(passphrase), salt, emissionKDFN, emissionKDFR, emissionKDFP, emissionKDFKeyLen)
+	key, err := scrypt.Key(pp, salt, emissionKDFN, emissionKDFR, emissionKDFP, emissionKDFKeyLen)
 	if err != nil {
 		return "", fmt.Errorf("scrypt key derivation failed: %v", err)
 	}
@@ -7718,7 +8636,8 @@ func encryptPrivateKeyWithPassphrase(privateKey *secp256k1.PrivateKey, passphras
 
 	privateKeyBytes := privateKey.Serialize()
 	defer zeroBytes(privateKeyBytes)
-	ciphertext := gcm.Seal(nil, nonce, privateKeyBytes, nil)
+	aad := emissionBackupAAD(emissionKDFVersion, salt, emissionKDFN, emissionKDFR, emissionKDFP)
+	ciphertext := gcm.Seal(nil, nonce, privateKeyBytes, aad)
 
 	return fmt.Sprintf("aes256gcm:%s:%s:%d:%d:%d:%s:%s",
 		emissionKDFVersion,
@@ -7729,11 +8648,34 @@ func encryptPrivateKeyWithPassphrase(privateKey *secp256k1.PrivateKey, passphras
 	), nil
 }
 
-// decryptPrivateKeyWithPassphrase decrypts a v2 emission-key backup blob produced
-// by encryptPrivateKeyWithPassphrase. Legacy v1 blobs ("aes256gcm:<iv>:<ct>")
-// used an insecure sha256(passphrase) KDF with no salt and are rejected; users
-// with v1 backups must re-export from the canonical wallet DB.
+// parseSecp256k1Private validates raw private-key bytes and returns the
+// resulting *secp256k1.PrivateKey. secp256k1.PrivKeyFromBytes silently
+// truncates inputs longer than 32 bytes and mod-reduces, so callers must
+// reject non-32-byte input upfront; a post-reduction zero scalar is also
+// invalid (would produce signatures that the consensus validator rejects).
+// Used by both the plain-hex import path and the AES-GCM-v3 backup
+// decryption path. The caller owns the input slice and is expected to
+// zero it after this returns.
+func parseSecp256k1Private(b []byte) (*secp256k1.PrivateKey, error) {
+	if len(b) != 32 {
+		return nil, fmt.Errorf("private key must be exactly 32 bytes (got %d)", len(b))
+	}
+	priv := secp256k1.PrivKeyFromBytes(b)
+	if priv.Key.IsZero() {
+		return nil, fmt.Errorf("private key is zero or out of range")
+	}
+	return priv, nil
+}
+
+// decryptPrivateKeyWithPassphrase decrypts a v3 emission-key backup blob produced
+// by encryptPrivateKeyWithPassphrase. Legacy v1 blobs ("aes256gcm:<iv>:<ct>",
+// sha256(passphrase) KDF, no salt) and v2 blobs (scrypt+AES-GCM but no AAD on
+// KDF params) are rejected; users with older backups must re-export from the
+// canonical wallet DB via generateemissionkey.
 func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k1.PrivateKey, error) {
+	pp := []byte(passphrase)
+	defer zeroBytes(pp)
+
 	if !strings.HasPrefix(encryptedKey, "aes256gcm:") {
 		return nil, fmt.Errorf("invalid encrypted key format, expected aes256gcm: prefix")
 	}
@@ -7744,13 +8686,27 @@ func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k
 		return nil, fmt.Errorf("emission-key backup format v1 is insecure (no KDF, no salt) " +
 			"and is no longer supported; re-export from the canonical wallet DB via generateemissionkey")
 	}
-	if len(parts) != 8 || parts[1] != emissionKDFVersion {
-		return nil, fmt.Errorf("invalid encrypted key format, expected aes256gcm:v2:salt:N:r:p:nonce:ciphertext")
+	// Reject v2 (KDF params not bound via AEAD additional-data) with a clear,
+	// actionable error. v2 blobs would silently fail on the AAD mismatch
+	// otherwise; the explicit error tells operators what to do.
+	if len(parts) >= 2 && parts[1] == "v2" {
+		return nil, fmt.Errorf("emission-key backup format v2 (no AAD on KDF params) " +
+			"is no longer supported; re-export from the canonical wallet DB via generateemissionkey")
+	}
+	if len(parts) != numV3BlobParts || parts[1] != emissionKDFVersion {
+		return nil, fmt.Errorf("invalid encrypted key format, expected aes256gcm:%s:salt:N:r:p:nonce:ciphertext",
+			emissionKDFVersion)
 	}
 
 	salt, err := hex.DecodeString(parts[2])
 	if err != nil || len(salt) == 0 {
 		return nil, fmt.Errorf("invalid salt hex: %v", err)
+	}
+	// Cap salt at 64 bytes for parity with the N/r/p bounds. Legitimate
+	// salt is emissionKDFSaltLen (16) bytes; a malicious blob with a
+	// multi-MB salt is parsed before scrypt copies it, so reject early.
+	if len(salt) > 64 {
+		return nil, fmt.Errorf("invalid salt: %d bytes exceeds 64-byte cap", len(salt))
 	}
 	n, err := strconv.Atoi(parts[3])
 	// Reject N values that are not a power of 2, ≤1, or > 1<<20.
@@ -7780,8 +8736,15 @@ func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k
 	if err != nil {
 		return nil, fmt.Errorf("invalid ciphertext hex: %v", err)
 	}
+	// Cap ciphertext at 256 bytes for parity with the salt/N/r/p caps. Real
+	// ciphertext is 32 plaintext + 16 GCM tag = 48 bytes; 256 leaves headroom
+	// while denying a multi-MB blob from forcing a multi-MB allocation
+	// before scrypt+gcm.Open authenticate the bytes.
+	if len(ciphertext) > 256 {
+		return nil, fmt.Errorf("invalid ciphertext: %d bytes exceeds 256-byte cap", len(ciphertext))
+	}
 
-	key, err := scrypt.Key([]byte(passphrase), salt, n, r, p, emissionKDFKeyLen)
+	key, err := scrypt.Key(pp, salt, n, r, p, emissionKDFKeyLen)
 	if err != nil {
 		return nil, fmt.Errorf("scrypt key derivation failed: %v", err)
 	}
@@ -7799,9 +8762,10 @@ func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k
 		return nil, fmt.Errorf("invalid nonce size: got %d, want %d", len(nonce), gcm.NonceSize())
 	}
 
-	privateKeyBytes, err := gcm.Open(nil, nonce, ciphertext, nil)
+	aad := emissionBackupAAD(emissionKDFVersion, salt, n, r, p)
+	privateKeyBytes, err := gcm.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt private key (wrong passphrase?): %v", err)
+		return nil, fmt.Errorf("failed to decrypt private key (wrong passphrase or tampered blob?): %v", err)
 	}
 	// Safe to zero on defer: PrivKeyFromBytes calls ModNScalar.SetByteSlice,
 	// which copies the bytes into the scalar's internal limbs before
@@ -7809,5 +8773,12 @@ func decryptPrivateKeyWithPassphrase(encryptedKey, passphrase string) (*secp256k
 	// key's state.
 	defer zeroBytes(privateKeyBytes)
 
-	return secp256k1.PrivKeyFromBytes(privateKeyBytes), nil
+	// Mirror the plain-hex import validation via parseSecp256k1Private: a
+	// malicious blob that authenticated against a tampered KDF could
+	// otherwise yield a non-32-byte plaintext or the zero scalar.
+	privateKey, err := parseSecp256k1Private(privateKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decrypted %v", err)
+	}
+	return privateKey, nil
 }

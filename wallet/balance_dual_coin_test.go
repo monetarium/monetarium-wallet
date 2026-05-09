@@ -28,7 +28,7 @@ func TestCoinBalanceStructure(t *testing.T) {
 			},
 		},
 		{
-			name:     "SKA-1 coin balance",
+			name:     "SKA1 coin balance",
 			coinType: cointype.CoinType(1),
 			balances: map[string]dcrutil.Amount{
 				"spendable": 5e7,
@@ -36,7 +36,7 @@ func TestCoinBalanceStructure(t *testing.T) {
 			},
 		},
 		{
-			name:     "SKA-255 coin balance",
+			name:     "SKA255 coin balance",
 			coinType: cointype.CoinType(255),
 			balances: map[string]dcrutil.Amount{
 				"spendable": 2e6,
@@ -89,7 +89,7 @@ func TestBalancesStructureMultiCoin(t *testing.T) {
 		Total:     1e8,
 	}
 
-	// Add SKA-1 balance
+	// Add SKA1 balance
 	balance.CoinTypeBalances[cointype.CoinType(1)] = udb.CoinBalance{
 		CoinType:  cointype.CoinType(1),
 		Spendable: 5e7,
@@ -111,9 +111,9 @@ func TestBalancesStructureMultiCoin(t *testing.T) {
 
 	ska1Balance, exists := balance.CoinTypeBalances[cointype.CoinType(1)]
 	if !exists {
-		t.Error("SKA-1 balance missing from CoinTypeBalances")
+		t.Error("SKA1 balance missing from CoinTypeBalances")
 	} else if ska1Balance.Total != 5e7 {
-		t.Errorf("SKA-1 coin balance total: got %v, want %v", ska1Balance.Total, 5e7)
+		t.Errorf("SKA1 coin balance total: got %v, want %v", ska1Balance.Total, 5e7)
 	}
 
 	// Verify coin type count
@@ -221,9 +221,14 @@ func TestMultiCoinBalanceMapFlattening(t *testing.T) {
 				account0.TotalBalance, 1e8)
 		}
 
-		if len(account0.CoinTypeBalances) != 2 {
-			t.Errorf("Account 0: expected 2 coin types, got %d",
+		// CoinTypeBalances is VAR-only by design. SKA balances are
+		// reported through SKACoinTypeBalances (big.Int).
+		if len(account0.CoinTypeBalances) != 1 {
+			t.Errorf("Account 0: expected 1 VAR entry in CoinTypeBalances, got %d",
 				len(account0.CoinTypeBalances))
+		}
+		if got := account0.CoinTypeBalances[cointype.CoinTypeVAR]; got != 1e8 {
+			t.Errorf("Account 0 VAR coin balance: got %v, want %v", got, dcrutil.Amount(1e8))
 		}
 	}
 }
@@ -262,11 +267,11 @@ func TestCoinTypeIsolationInBalances(t *testing.T) {
 	}
 
 	if ska1Balance.Total != 5e7 {
-		t.Errorf("SKA-1 total should be isolated: got %v, want %v", ska1Balance.Total, 5e7)
+		t.Errorf("SKA1 total should be isolated: got %v, want %v", ska1Balance.Total, 5e7)
 	}
 
 	if ska255Balance.Total != 1e6 {
-		t.Errorf("SKA-255 total should be isolated: got %v, want %v", ska255Balance.Total, 1e6)
+		t.Errorf("SKA255 total should be isolated: got %v, want %v", ska255Balance.Total, 1e6)
 	}
 
 	// Verify coin types are correctly set
@@ -276,7 +281,7 @@ func TestCoinTypeIsolationInBalances(t *testing.T) {
 	}
 
 	if ska1Balance.CoinType != cointype.CoinType(1) {
-		t.Errorf("SKA-1 coin type mismatch: got %v, want %v",
+		t.Errorf("SKA1 coin type mismatch: got %v, want %v",
 			ska1Balance.CoinType, cointype.CoinType(1))
 	}
 }

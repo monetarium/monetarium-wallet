@@ -18,6 +18,7 @@ import (
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	blockchain "github.com/monetarium/monetarium-node/blockchain/standalone"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/crypto/rand"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
@@ -256,6 +257,12 @@ func (w *Wallet) ChainSwitch(ctx context.Context, forest *SidechainForest, chain
 				delete(w.recentlyPublished, txHash)
 			}
 		}
+		// Also evict entries whose tx has expired or aged out without
+		// confirming.  Without this sweep an unconfirmed tx that's
+		// dropped from the network's mempool would sit in the map
+		// forever (a long-running ticket-buying wallet would
+		// accumulate them indefinitely).
+		w.sweepRecentlyPublishedLocked(chainTipChanges.NewHeight)
 		w.recentlyPublishedMu.Unlock()
 	}
 
@@ -850,7 +857,9 @@ func (w *Wallet) VoteOnOwnedTickets(ctx context.Context, winningTicketHashes []*
 						ticketHash, err)
 				} else {
 					// Success.
-					vote.AddTxOut(wire.NewTxOut(0, tspendVoteScript))
+					tspendOut := wire.NewTxOut(0, tspendVoteScript)
+					tspendOut.CoinType = cointype.CoinTypeVAR // votes are VAR-only
+					vote.AddTxOut(tspendOut)
 					vote.Version = 3
 				}
 			}
@@ -894,7 +903,7 @@ func (w *Wallet) VoteOnOwnedTickets(ctx context.Context, winningTicketHashes []*
 	}
 	w.recentlyPublishedMu.Lock()
 	for i := range voteRecords {
-		w.recentlyPublished[voteRecords[i].Hash] = struct{}{}
+		w.markRecentlyPublishedLocked(voteRecords[i].Hash, blockHeight, votes[i].Expiry)
 
 		log.Infof("Voting on block %v (height %v) using ticket %v "+
 			"(vote hash: %v bits: %v)", blockHash, blockHeight,

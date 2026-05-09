@@ -6,6 +6,7 @@ package txrules_test
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/chaincfg"
@@ -13,6 +14,7 @@ import (
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/wire"
 
+	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 )
 
@@ -31,7 +33,7 @@ func buildSKATxWithOverpaidFee(t *testing.T, coinType cointype.CoinType) (*wire.
 		t.Fatalf("MinRelayTxFee not configured for coin type %d", coinType)
 	}
 
-	// Mainnet SKA-1 has MinRelayTxFee=4e18 atoms/KB and
+	// Mainnet SKA1 has MinRelayTxFee=4e18 atoms/KB and
 	// MaxFeeMultiplier=2500, so the ceiling is ~1e22 atoms per KB.
 	// Overpay by 100× that ceiling to make the assertion unambiguous
 	// regardless of the exact tx size.
@@ -53,25 +55,18 @@ func buildSKATxWithOverpaidFee(t *testing.T, coinType cointype.CoinType) (*wire.
 	return tx, params
 }
 
-// TestTxPaysHighFeesVARSilentlyPassesSKATx documents the bug that motivated
-// the sendrawtransaction dispatch fix: TxPaysHighFees (the VAR-only variant)
-// sums int64 ValueIn fields, which are ~always 0 for SKA inputs. It therefore
-// reports "no high fee" even for a tx that overpays by 12 orders of
-// magnitude — which is exactly why sendrawtransaction must dispatch to
-// TxPaysHighFeesSKA for SKA transactions instead.
-func TestTxPaysHighFeesVARSilentlyPassesSKATx(t *testing.T) {
+// TestTxPaysHighFeesVARRejectsSKATx asserts the runtime guard added to
+// TxPaysHighFees: when the tx contains any SKA output, the function must
+// return an Invalid error rather than silently sum the int64 ValueIn fields
+// (which are ~always 0 for SKA inputs) and produce a meaningless answer.
+// Callers must dispatch to TxPaysHighFeesSKA for SKA transactions instead.
+func TestTxPaysHighFeesVARRejectsSKATx(t *testing.T) {
 	tx, _ := buildSKATxWithOverpaidFee(t, cointype.CoinType(1))
 
-	highFees, err := txrules.TxPaysHighFees(tx)
-	if err != nil {
-		t.Fatalf("TxPaysHighFees: %v", err)
+	_, err := txrules.TxPaysHighFees(tx)
+	if err == nil {
+		t.Fatal("TxPaysHighFees must return an error for SKA outputs (VAR-only guard)")
 	}
-	if highFees {
-		t.Fatalf("TxPaysHighFees unexpectedly flagged SKA tx — test premise wrong?")
-	}
-	// Assertion: SKA-overpaying tx sails through the VAR-only check.
-	// This is the bug. The handler must never rely on TxPaysHighFees for
-	// SKA transactions.
 }
 
 // TestTxPaysHighFeesSKAFlagsOverpaid exercises the correct dispatch: the
@@ -198,5 +193,35 @@ func TestTxPaysHighFeesSKAExemptsEmissionTx(t *testing.T) {
 	}
 	if highFees {
 		t.Fatal("TxPaysHighFeesSKA must report false for emission txs (zero-fee by protocol)")
+	}
+}
+
+// TestPaysHighFeesReturnsBugOnSKA locks in the runtime guard on PaysHighFees.
+// The VAR-only function previously returned a silent `false` when handed an
+// SKA output — a value that, in any caller reaching the function with the
+// wrong dispatch, would silently bypass the high-fee gate. The fix replaces
+// that silent default with an errors.Bug return so any future caller that
+// forgets to dispatch on coin type fails loudly without crashing the
+// long-running daemon. All current call sites (createtx.go, methods.go,
+// rpcserver/server.go) already branch on coin type before calling, so this
+// error path is unreachable in practice.
+func TestPaysHighFeesReturnsBugOnSKA(t *testing.T) {
+	tx, _ := buildSKATxWithOverpaidFee(t, cointype.CoinType(1))
+
+	highFees, err := txrules.PaysHighFees(0, tx)
+	if err == nil {
+		t.Fatal("PaysHighFees must return an error for SKA outputs (VAR-only guard)")
+	}
+	if highFees {
+		t.Fatal("PaysHighFees must return false alongside the error")
+	}
+	if !errors.Is(err, errors.Bug) {
+		t.Fatalf("expected errors.Bug kind, got %v", err)
+	}
+	// Sanity-check the message points users at the right function; avoid
+	// asserting the exact phrasing.
+	msg := err.Error()
+	if !strings.Contains(msg, "SKA") || !strings.Contains(msg, "PaysHighFeesSKA") {
+		t.Fatalf("error message must point at PaysHighFeesSKA; got %q", msg)
 	}
 }

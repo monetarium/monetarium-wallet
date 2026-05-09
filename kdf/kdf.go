@@ -30,7 +30,11 @@ type Argon2idParams struct {
 func NewArgon2idParams(rand io.Reader) (*Argon2idParams, error) {
 	ncpu := min(runtime.NumCPU(), 256)
 	p := &Argon2idParams{
-		Time:    1,
+		// Time=3 follows the OWASP minimum for argon2id; combined with the
+		// 256 MiB memory parameter the KDF stays well above 100ms on
+		// commodity hardware (acceptable wallet-unlock UX) while raising
+		// brute-force cost ~3x vs the previous Time=1.
+		Time:    3,
 		Memory:  256 * 1024, // 256 MiB
 		Threads: uint8(ncpu),
 	}

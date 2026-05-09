@@ -1417,7 +1417,6 @@ func (s *Syncer) handleBlockAnnouncements(ctx context.Context, rp *p2p.RemotePee
 	newBlocks := make([]*wallet.BlockNode, 0, len(headers))
 	var bestChain []*wallet.BlockNode
 	var matchingTxs map[chainhash.Hash][]*wire.MsgTx
-	cnet := s.wallet.ChainParams().Net
 	err = func() error {
 		defer s.sidechainMu.Unlock()
 		s.sidechainMu.Lock()
@@ -1520,7 +1519,7 @@ func (s *Syncer) handleBlockAnnouncements(ctx context.Context, rp *p2p.RemotePee
 		for i, cf := range filters {
 			filter, proofIndex, proof := cf.Filter, cf.ProofIndex, cf.Proof
 
-			err = validate.CFilterV2HeaderCommitment(cnet,
+			err = validate.CFilterV2HeaderCommitment(
 				bestChain[i].Header, filter, proofIndex, proof)
 			if err != nil {
 				return err

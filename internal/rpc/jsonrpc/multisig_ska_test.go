@@ -83,9 +83,9 @@ func TestValidateCoinTypeForMultisig(t *testing.T) {
 		wantErr  bool
 	}{
 		{"VAR (0)", cointype.CoinTypeVAR, false},
-		{"SKA-1", cointype.CoinType(1), false},
-		{"SKA-2", cointype.CoinType(2), false},
-		{"SKA-255", cointype.CoinType(255), false},
+		{"SKA1", cointype.CoinType(1), false},
+		{"SKA2", cointype.CoinType(2), false},
+		{"SKA255", cointype.CoinType(255), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -132,8 +132,8 @@ func TestMultisigOutputCoinType(t *testing.T) {
 		coinType cointype.CoinType
 	}{
 		{"VAR output", cointype.CoinTypeVAR},
-		{"SKA-1 output", cointype.CoinType(1)},
-		{"SKA-2 output", cointype.CoinType(2)},
+		{"SKA1 output", cointype.CoinType(1)},
+		{"SKA2 output", cointype.CoinType(2)},
 	}
 
 	for _, tt := range tests {
@@ -311,8 +311,8 @@ func TestMultisigSKAOutputSerialization(t *testing.T) {
 		wantCoinType cointype.CoinType
 	}{
 		{"VAR multisig output", cointype.CoinTypeVAR, 500000, cointype.CoinTypeVAR},
-		{"SKA-1 multisig output", cointype.CoinType(1), 500000, cointype.CoinType(1)},
-		{"SKA-2 multisig output", cointype.CoinType(2), 1000000, cointype.CoinType(2)},
+		{"SKA1 multisig output", cointype.CoinType(1), 500000, cointype.CoinType(1)},
+		{"SKA2 multisig output", cointype.CoinType(2), 1000000, cointype.CoinType(2)},
 	}
 
 	for _, tt := range tests {
@@ -364,8 +364,8 @@ func TestRedeemMultiSigOutCoinTypePropagation(t *testing.T) {
 		wantCoinType *uint8
 	}{
 		{"nil cointype defaults to VAR", nil, nil},
-		{"SKA-1 propagates", uint8Ptr(1), uint8Ptr(1)},
-		{"SKA-2 propagates", uint8Ptr(2), uint8Ptr(2)},
+		{"SKA1 propagates", uint8Ptr(1), uint8Ptr(1)},
+		{"SKA2 propagates", uint8Ptr(2), uint8Ptr(2)},
 	}
 
 	for _, tt := range tests {
@@ -484,44 +484,35 @@ func TestPrevOutScriptLookup_Regression(t *testing.T) {
 	}
 }
 
-// TestResolveRedeemMultiSigOutsCap verifies the per-call cap and truncation
-// signal computed by redeemMultiSigOuts. The cap protects the RPC server
-// from an authenticated operator triggering an unbounded number of
-// redemption signings in a single call.
+// TestResolveRedeemMultiSigOutsCap verifies the per-call iteration cap
+// computed by redeemMultiSigOuts. The cap protects the RPC server from an
+// authenticated operator triggering an unbounded number of redemption
+// signings in a single call. Truncation is computed by
+// redeemMultiSigOutsCollect after coin-type filtering and is exercised by
+// dedicated tests in redeemmultisigouts_test.go.
 func TestResolveRedeemMultiSigOutsCap(t *testing.T) {
 	intPtr := func(v int) *int { return &v }
 	defaultCap := int(redeemMultiSigOutsMax)
 	tests := []struct {
-		name          string
-		number        *int
-		available     int
-		wantLimit     uint32
-		wantTruncated bool
+		name      string
+		number    *int
+		wantLimit uint32
 	}{
-		{"default cap, fewer outputs available", nil, 100, redeemMultiSigOutsMax, false},
-		{"default cap, exactly at cap", nil, defaultCap, redeemMultiSigOutsMax, false},
-		{"default cap, more than cap available", nil, 1000, redeemMultiSigOutsMax, true},
-		{"caller below cap honored", intPtr(50), 1000, 50, true},
-		{"caller below cap, fewer available", intPtr(50), 10, 50, false},
-		{"caller above cap clamped", intPtr(1000), 1000, redeemMultiSigOutsMax, true},
-		{"caller equal to cap", intPtr(defaultCap), 1000, redeemMultiSigOutsMax, true},
-		{"zero available", nil, 0, redeemMultiSigOutsMax, false},
-		{"negative caller value treated as default", intPtr(-1), 1000, redeemMultiSigOutsMax, true},
+		{"default cap when nil", nil, redeemMultiSigOutsMax},
+		{"caller below cap honored", intPtr(50), 50},
+		{"caller above cap clamped", intPtr(1000), redeemMultiSigOutsMax},
+		{"caller equal to cap", intPtr(defaultCap), redeemMultiSigOutsMax},
+		{"negative caller value treated as default", intPtr(-1), redeemMultiSigOutsMax},
 		// Number=0 must use the default cap, not clamp to zero (regression
-		// guard — previously a Number=0 call returned an empty result with
-		// truncated=true when any output existed).
-		{"caller zero treated as default, fewer available", intPtr(0), 10, redeemMultiSigOutsMax, false},
-		{"caller zero treated as default, more available", intPtr(0), 1000, redeemMultiSigOutsMax, true},
+		// guard — previously a Number=0 call returned an empty result).
+		{"caller zero treated as default", intPtr(0), redeemMultiSigOutsMax},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotLimit, gotTruncated := resolveRedeemMultiSigOutsCap(tt.number, tt.available)
+			gotLimit := resolveRedeemMultiSigOutsCap(tt.number)
 			if gotLimit != tt.wantLimit {
 				t.Errorf("limit: got %d, want %d", gotLimit, tt.wantLimit)
-			}
-			if gotTruncated != tt.wantTruncated {
-				t.Errorf("truncated: got %v, want %v", gotTruncated, tt.wantTruncated)
 			}
 		})
 	}

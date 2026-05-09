@@ -8,6 +8,7 @@ package wallet
 import (
 	"bytes"
 	"context"
+	"math/big"
 	"sync"
 
 	"github.com/monetarium/monetarium-wallet/errors"
@@ -89,7 +90,7 @@ func lookupInputAccount(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails,
 
 func lookupOutputChain(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails,
 	cred udb.CreditRecord) (account uint32, internal bool, address stdaddr.Address,
-	amount int64, outputScript []byte) {
+	amount int64, skaAmount *big.Int, outputScript []byte) {
 
 	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
 
@@ -107,7 +108,14 @@ func lookupOutputChain(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails,
 	account = ma.Account()
 	internal = ma.Internal()
 	address = ma.Address()
-	amount = output.Value
+	if output.CoinType.IsSKA() {
+		if output.SKAValue != nil {
+			skaAmount = new(big.Int).Set(output.SKAValue)
+		}
+		amount = 0
+	} else {
+		amount = output.Value
+	}
 	outputScript = output.PkScript
 	return
 }
@@ -123,8 +131,47 @@ func makeTxSummary(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails) Tran
 		}
 		serializedTx = buf.Bytes()
 	}
+
+	// Identify the transaction's coin type from its outputs. Wallet-built
+	// transactions are always single-coin-type (consensus rejects mixed),
+	// so the first output is authoritative. Empty TxOut list defaults to VAR.
+	var txCoinType cointype.CoinType
+	if len(details.MsgTx.TxOut) > 0 {
+		txCoinType = details.MsgTx.TxOut[0].CoinType
+	}
+
+	// Compute fee. For VAR: int64 atoms (legacy contract) — only when every
+	// input is a debit (the wallet's debit record is the only source of
+	// input atoms). For SKA: big.Int atoms via SKAValueIn / SKAValue —
+	// SKAValueIn is bound on the wire so the value is authoritative and the
+	// wallet does not need to own every input; the gate is "every input has
+	// a non-nil SKAValueIn", which lets us report fees on partially-owned
+	// SKA txs (e.g. coinjoin counterparty inputs).
 	var fee dcrutil.Amount
-	if len(details.Debits) == len(details.MsgTx.TxIn) {
+	var skaFee *big.Int
+	if txCoinType.IsSKA() {
+		in := new(big.Int)
+		haveAllInputs := true
+		for _, txIn := range details.MsgTx.TxIn {
+			if txIn.SKAValueIn == nil {
+				haveAllInputs = false
+				break
+			}
+			in.Add(in, txIn.SKAValueIn)
+		}
+		if haveAllInputs {
+			out := new(big.Int)
+			for _, txOut := range details.MsgTx.TxOut {
+				if txOut.SKAValue != nil {
+					out.Add(out, txOut.SKAValue)
+				}
+			}
+			diff := new(big.Int).Sub(in, out)
+			if diff.Sign() >= 0 {
+				skaFee = diff
+			}
+		}
+	} else if len(details.Debits) == len(details.MsgTx.TxIn) {
 		for _, deb := range details.Debits {
 			fee += deb.Amount
 		}
@@ -132,34 +179,44 @@ func makeTxSummary(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails) Tran
 			fee -= dcrutil.Amount(txOut.Value)
 		}
 	}
+
 	var inputs []TransactionSummaryInput
 	if len(details.Debits) != 0 {
 		inputs = make([]TransactionSummaryInput, len(details.Debits))
 		for i, d := range details.Debits {
+			var prevSKA *big.Int
+			if v := details.MsgTx.TxIn[d.Index].SKAValueIn; v != nil {
+				prevSKA = new(big.Int).Set(v)
+			}
 			inputs[i] = TransactionSummaryInput{
-				Index:           d.Index,
-				PreviousAccount: lookupInputAccount(dbtx, w, details, d),
-				PreviousAmount:  d.Amount,
+				Index:             d.Index,
+				PreviousAccount:   lookupInputAccount(dbtx, w, details, d),
+				PreviousAmount:    d.Amount,
+				PreviousSKAAmount: prevSKA,
 			}
 		}
 	}
-	outputs := make([]TransactionSummaryOutput, 0, len(details.MsgTx.TxOut))
-	for i := range details.MsgTx.TxOut {
-		credIndex := len(outputs)
-		mine := len(details.Credits) > credIndex && details.Credits[credIndex].Index == uint32(i)
-		if !mine {
+	// Iterate Credits directly and look up the corresponding TxOut by the
+	// credit's recorded Index. Walking MsgTx.TxOut in lockstep with a
+	// running outputs-collected counter conflates "next credit to consider"
+	// with "outputs collected so far" and silently drops wallet outputs the
+	// moment credits are non-contiguous (e.g. wallet owns outputs 0 and 3
+	// of a 4-output tx).
+	outputs := make([]TransactionSummaryOutput, 0, len(details.Credits))
+	for _, credit := range details.Credits {
+		if int(credit.Index) >= len(details.MsgTx.TxOut) {
 			continue
 		}
-		acct, internal, address, amount, outputScript := lookupOutputChain(dbtx, w, details, details.Credits[credIndex])
-		output := TransactionSummaryOutput{
-			Index:        uint32(i),
+		acct, internal, address, amount, skaAmount, outputScript := lookupOutputChain(dbtx, w, details, credit)
+		outputs = append(outputs, TransactionSummaryOutput{
+			Index:        credit.Index,
 			Account:      acct,
 			Internal:     internal,
 			Amount:       dcrutil.Amount(amount),
+			SKAAmount:    skaAmount,
 			Address:      address,
 			OutputScript: outputScript,
-		}
-		outputs = append(outputs, output)
+		})
 	}
 
 	var transactionType = TxTransactionType(&details.MsgTx)
@@ -176,45 +233,32 @@ func makeTxSummary(dbtx walletdb.ReadTx, w *Wallet, details *udb.TxDetails) Tran
 		MyInputs:    inputs,
 		MyOutputs:   outputs,
 		Fee:         fee,
+		SKAFee:      skaFee,
 		Timestamp:   receiveTime.Unix(),
 		Type:        transactionType,
 	}
 }
 
+// totalBalances populates m with VAR-only balances per account. SKA balances
+// are intentionally excluded — VAR atoms (1e8/coin, int64) and SKA atoms
+// (1e18/coin, big.Int) cannot be summed into a single int64 without overflow
+// or unit confusion. Use totalSKABalances for per-coin SKA totals and surface
+// them via AccountBalance.SKACoinTypeBalances.
 func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]dcrutil.Amount) error {
 	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
-	// Get unspent outputs for active coin types
-	var unspent []*udb.Credit
 
-	// Get VAR outputs (always active)
 	outputs, err := w.txStore.UnspentOutputs(dbtx, cointype.CoinTypeVAR)
 	if err != nil {
 		return err
 	}
-	unspent = append(unspent, outputs...)
-
-	// Get outputs for active SKA coin types only
-	if w.chainParams != nil && w.chainParams.SKACoins != nil {
-		for coinType, config := range w.chainParams.SKACoins {
-			if config.Active {
-				outputs, err := w.txStore.UnspentOutputs(dbtx, coinType)
-				if err != nil {
-					return err
-				}
-				unspent = append(unspent, outputs...)
-			}
-		}
-	}
-	for i := range unspent {
-		output := unspent[i]
+	for _, output := range outputs {
 		_, addrs := stdscript.ExtractAddrs(scriptVersionAssumed, output.PkScript, w.chainParams)
 		if len(addrs) == 0 {
 			continue
 		}
 		outputAcct, err := w.manager.AddrAccount(addrmgrNs, addrs[0])
 		if err == nil {
-			_, ok := m[outputAcct]
-			if ok {
+			if _, ok := m[outputAcct]; ok {
 				m[outputAcct] += output.Amount
 			}
 		}
@@ -222,35 +266,97 @@ func totalBalances(dbtx walletdb.ReadTx, w *Wallet, m map[uint32]dcrutil.Amount)
 	return nil
 }
 
+// totalSKABalances populates m with per-account, per-active-SKA-coin-type
+// balances using big.Int amounts to avoid int64 truncation. m must be
+// pre-seeded with the relevant accounts so that only requested accounts are
+// updated (matching the totalBalances contract).
+func totalSKABalances(dbtx walletdb.ReadTx, w *Wallet,
+	m map[uint32]map[cointype.CoinType]*big.Int) error {
+
+	if w.chainParams == nil || w.chainParams.SKACoins == nil {
+		return nil
+	}
+	addrmgrNs := dbtx.ReadBucket(waddrmgrNamespaceKey)
+	for ct, config := range w.chainParams.SKACoins {
+		if config == nil || !config.Active {
+			continue
+		}
+		outputs, err := w.txStore.UnspentOutputs(dbtx, ct)
+		if err != nil {
+			return err
+		}
+		for _, output := range outputs {
+			_, addrs := stdscript.ExtractAddrs(scriptVersionAssumed, output.PkScript, w.chainParams)
+			if len(addrs) == 0 {
+				continue
+			}
+			acct, err := w.manager.AddrAccount(addrmgrNs, addrs[0])
+			if err != nil {
+				continue
+			}
+			perCoin, ok := m[acct]
+			if !ok {
+				continue
+			}
+			cur, ok := perCoin[ct]
+			if !ok {
+				cur = new(big.Int)
+				perCoin[ct] = cur
+			}
+			cur.Add(cur, output.SKAAmount.BigInt())
+		}
+	}
+	return nil
+}
+
 func flattenBalanceMap(m map[uint32]dcrutil.Amount) []AccountBalance {
-	s := make([]AccountBalance, 0, len(m))
-	for k, v := range m {
-		s = append(s, AccountBalance{
-			Account:      k,
-			TotalBalance: v,
-			// Initialize empty CoinTypeBalances map for backward compatibility
-			CoinTypeBalances: make(map[cointype.CoinType]dcrutil.Amount),
-		})
+	return flattenBalanceMapWithSKA(m, nil)
+}
+
+// flattenBalanceMapWithSKA produces AccountBalance entries combining VAR
+// totals (varM) with optional per-account SKA-by-coin-type totals (skaM).
+// Pass nil for skaM to omit SKA balances entirely.
+func flattenBalanceMapWithSKA(varM map[uint32]dcrutil.Amount,
+	skaM map[uint32]map[cointype.CoinType]*big.Int) []AccountBalance {
+
+	s := make([]AccountBalance, 0, len(varM))
+	for acct, vbal := range varM {
+		ab := AccountBalance{
+			Account:             acct,
+			TotalBalance:        vbal,
+			CoinTypeBalances:    map[cointype.CoinType]dcrutil.Amount{cointype.CoinTypeVAR: vbal},
+			SKACoinTypeBalances: make(map[cointype.CoinType]*big.Int),
+		}
+		if perCoin, ok := skaM[acct]; ok {
+			for ct, amt := range perCoin {
+				if amt != nil {
+					ab.SKACoinTypeBalances[ct] = new(big.Int).Set(amt)
+				}
+			}
+		}
+		s = append(s, ab)
 	}
 	return s
 }
 
-// flattenMultiCoinBalanceMap converts multi-coin balance map to AccountBalance slice
+// flattenMultiCoinBalanceMap converts multi-coin balance map to AccountBalance slice.
+// Note: this helper takes int64 amounts; SKA values that exceed int64 must be
+// surfaced through the SKACoinTypeBalances map populated by callers that have
+// the big.Int totals available.
 func flattenMultiCoinBalanceMap(accountCoinBalances map[uint32]map[cointype.CoinType]dcrutil.Amount) []AccountBalance {
 	s := make([]AccountBalance, 0, len(accountCoinBalances))
 
 	for account, coinBalances := range accountCoinBalances {
 		accountBalance := AccountBalance{
-			Account:          account,
-			CoinTypeBalances: make(map[cointype.CoinType]dcrutil.Amount),
+			Account:             account,
+			CoinTypeBalances:    make(map[cointype.CoinType]dcrutil.Amount),
+			SKACoinTypeBalances: make(map[cointype.CoinType]*big.Int),
 		}
 
-		// Calculate total balance and populate coin type balances
+		// Only VAR is safe to expose via the int64 CoinTypeBalances map.
 		for coinType, amount := range coinBalances {
-			accountBalance.CoinTypeBalances[coinType] = amount
-
-			// For backward compatibility, aggregate VAR balance as total
 			if coinType == cointype.CoinTypeVAR {
+				accountBalance.CoinTypeBalances[coinType] = amount
 				accountBalance.TotalBalance = amount
 			}
 		}
@@ -300,10 +406,18 @@ func (s *NotificationServer) notifyUnminedTransaction(dbtx walletdb.ReadTx, deta
 		log.Errorf("Cannot determine balances for relevant accounts: %v", err)
 		return
 	}
+	skaBals := make(map[uint32]map[cointype.CoinType]*big.Int, len(bals))
+	for acct := range bals {
+		skaBals[acct] = make(map[cointype.CoinType]*big.Int)
+	}
+	if err := totalSKABalances(dbtx, s.wallet, skaBals); err != nil {
+		log.Errorf("Cannot determine SKA balances for relevant accounts: %v", err)
+		return
+	}
 	n := &TransactionNotifications{
 		UnminedTransactions:      unminedTxs,
 		UnminedTransactionHashes: unminedHashes,
-		NewBalances:              flattenBalanceMap(bals),
+		NewBalances:              flattenBalanceMapWithSKA(bals, skaBals),
 	}
 	for _, c := range clients {
 		c <- n
@@ -375,6 +489,7 @@ func (s *NotificationServer) sendAttachedBlockNotification(ctx context.Context) 
 	var (
 		w             = s.wallet
 		bals          = make(map[uint32]dcrutil.Amount)
+		skaBals       = make(map[uint32]map[cointype.CoinType]*big.Int)
 		unminedHashes []*chainhash.Hash
 	)
 	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
@@ -387,8 +502,13 @@ func (s *NotificationServer) sendAttachedBlockNotification(ctx context.Context) 
 		for _, b := range currentTxNtfn.AttachedBlocks {
 			relevantAccounts(bals, b.Transactions)
 		}
-		return totalBalances(dbtx, w, bals)
-
+		if err := totalBalances(dbtx, w, bals); err != nil {
+			return err
+		}
+		for acct := range bals {
+			skaBals[acct] = make(map[cointype.CoinType]*big.Int)
+		}
+		return totalSKABalances(dbtx, w, skaBals)
 	})
 	if err != nil {
 		log.Errorf("Failed to construct attached blocks notification: %v", err)
@@ -396,7 +516,7 @@ func (s *NotificationServer) sendAttachedBlockNotification(ctx context.Context) 
 	}
 
 	currentTxNtfn.UnminedTransactionHashes = unminedHashes
-	currentTxNtfn.NewBalances = flattenBalanceMap(bals)
+	currentTxNtfn.NewBalances = flattenBalanceMapWithSKA(bals, skaBals)
 
 	s.mu.Lock()
 	for _, c := range s.transactions {
@@ -440,12 +560,18 @@ type Block struct {
 
 // TransactionSummary contains a transaction relevant to the wallet and marks
 // which inputs and outputs were relevant.
+//
+// Fee is the VAR transaction fee in atoms. For SKA transactions Fee is zero
+// and the actual fee is in SKAFee (big.Int atoms). SKAFee is nil for VAR
+// transactions and for SKA transactions where the fee could not be computed
+// (e.g. the wallet does not have all input amounts cached).
 type TransactionSummary struct {
 	Hash        *chainhash.Hash
 	Transaction []byte
 	MyInputs    []TransactionSummaryInput
 	MyOutputs   []TransactionSummaryOutput
 	Fee         dcrutil.Amount
+	SKAFee      *big.Int
 	Timestamp   int64
 	Type        TransactionType
 }
@@ -503,20 +629,28 @@ func TxTransactionType(tx *wire.MsgTx) TransactionType {
 // wallet.  The Index field marks the transaction input index of the transaction
 // (not included here).  The PreviousAccount and PreviousAmount fields describe
 // how much this input debits from a wallet account.
+//
+// PreviousAmount is VAR atoms (zero for SKA inputs). PreviousSKAAmount is the
+// big.Int SKA atoms (nil for VAR inputs).
 type TransactionSummaryInput struct {
-	Index           uint32
-	PreviousAccount uint32
-	PreviousAmount  dcrutil.Amount
+	Index             uint32
+	PreviousAccount   uint32
+	PreviousAmount    dcrutil.Amount
+	PreviousSKAAmount *big.Int
 }
 
 // TransactionSummaryOutput describes wallet properties of a transaction output
 // controlled by the wallet.  The Index field marks the transaction output index
 // of the transaction (not included here).
+//
+// Amount is VAR atoms (zero for SKA outputs). SKAAmount is the big.Int SKA
+// atoms (nil for VAR outputs).
 type TransactionSummaryOutput struct {
 	Index        uint32
 	Account      uint32
 	Internal     bool
 	Amount       dcrutil.Amount
+	SKAAmount    *big.Int
 	Address      stdaddr.Address
 	OutputScript []byte
 }
@@ -542,16 +676,23 @@ type TransactionSummaryOutput struct {
 //	  TotalBalance: 500000000, // 5 VAR (legacy field)
 //	  CoinTypeBalances: map[cointype.CoinType]dcrutil.Amount{
 //	    0: 500000000,   // 5 VAR
-//	    1: 1000000000,  // 10 SKA-1
-//	    2: 250000000,   // 2.5 SKA-2
+//	    1: 1000000000,  // 10 SKA1
+//	    2: 250000000,   // 2.5 SKA2
 //	  }
 //	}
 type AccountBalance struct {
 	Account      uint32
 	TotalBalance dcrutil.Amount // VAR total balance (for backward compatibility)
 
-	// Multi-coin support: breakdown by coin type
+	// Multi-coin support: VAR-only breakdown for legacy subscribers.
+	// SKA balances are NOT placed here — VAR atoms (1e8/coin, int64) and SKA
+	// atoms (1e18/coin, big.Int) are not safely commensurable in int64. Use
+	// SKACoinTypeBalances to read SKA totals.
 	CoinTypeBalances map[cointype.CoinType]dcrutil.Amount
+
+	// SKACoinTypeBalances holds per-active-SKA-coin-type totals as big.Int
+	// to avoid int64 truncation at SKA scales (1 SKA = 1e18 atoms).
+	SKACoinTypeBalances map[cointype.CoinType]*big.Int
 }
 
 // TransactionNotificationsClient receives TransactionNotifications from the

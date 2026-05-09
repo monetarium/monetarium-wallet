@@ -83,13 +83,13 @@ func TestSSFeeTransactionType(t *testing.T) {
 		wantIsSSFee bool
 	}{
 		{
-			name:        "valid SSFee SKA-1",
+			name:        "valid SSFee SKA1",
 			tx:          createMockSSFeeTx(cointype.CoinType(1), 3, 1000),
 			wantType:    TransactionTypeSSFee,
 			wantIsSSFee: true,
 		},
 		{
-			name:        "valid SSFee SKA-2",
+			name:        "valid SSFee SKA2",
 			tx:          createMockSSFeeTx(cointype.CoinType(2), 4, 2000), // Max 4 reward outputs
 			wantType:    TransactionTypeSSFee,
 			wantIsSSFee: true,
@@ -232,7 +232,7 @@ func TestSSFeeOutputSpendability(t *testing.T) {
 		description       string
 	}{
 		{
-			name:              "Mature SSFee SKA-1 output",
+			name:              "Mature SSFee SKA1 output",
 			output:            createSSFeeOutput(cointype.CoinType(1), 1000, 100),
 			txType:            stake.TxTypeSSFee,
 			tipHeight:         100 + maturity,
@@ -240,7 +240,7 @@ func TestSSFeeOutputSpendability(t *testing.T) {
 			description:       "Mature SSFee outputs should be spendable",
 		},
 		{
-			name:              "Immature SSFee SKA-1 output",
+			name:              "Immature SSFee SKA1 output",
 			output:            createSSFeeOutput(cointype.CoinType(1), 1000, 100),
 			txType:            stake.TxTypeSSFee,
 			tipHeight:         100 + maturity - 1,
@@ -248,7 +248,7 @@ func TestSSFeeOutputSpendability(t *testing.T) {
 			description:       "Immature SSFee outputs should not be spendable",
 		},
 		{
-			name:              "Mature SSFee SKA-2 output",
+			name:              "Mature SSFee SKA2 output",
 			output:            createSSFeeOutput(cointype.CoinType(2), 2000, 200),
 			txType:            stake.TxTypeSSFee,
 			tipHeight:         200 + maturity + 10,
@@ -284,9 +284,9 @@ func TestSSFeeMultipleCoinTypes(t *testing.T) {
 
 	// Create multiple SSFee transactions with different coin types
 	ssFeeTxs := []*wire.MsgTx{
-		createMockSSFeeTx(cointype.CoinType(1), 3, 1000), // SKA-1
-		createMockSSFeeTx(cointype.CoinType(2), 3, 2000), // SKA-2
-		createMockSSFeeTx(cointype.CoinType(3), 3, 3000), // SKA-3
+		createMockSSFeeTx(cointype.CoinType(1), 3, 1000), // SKA1
+		createMockSSFeeTx(cointype.CoinType(2), 3, 2000), // SKA2
+		createMockSSFeeTx(cointype.CoinType(3), 3, 3000), // SKA3
 	}
 
 	for i, tx := range ssFeeTxs {
@@ -331,7 +331,7 @@ func TestSSFeeInUnspentOutputs(t *testing.T) {
 		shouldBeIncluded bool
 	}{
 		{
-			name:             "Mature SSFee SKA-1 output with no filter",
+			name:             "Mature SSFee SKA1 output with no filter",
 			outputHeight:     100,
 			outputCoinType:   cointype.CoinType(1),
 			outputValue:      10000,
@@ -341,7 +341,7 @@ func TestSSFeeInUnspentOutputs(t *testing.T) {
 			shouldBeIncluded: true,
 		},
 		{
-			name:             "Immature SSFee SKA-1 output",
+			name:             "Immature SSFee SKA1 output",
 			outputHeight:     100,
 			outputCoinType:   cointype.CoinType(1),
 			outputValue:      10000,
@@ -351,7 +351,7 @@ func TestSSFeeInUnspentOutputs(t *testing.T) {
 			shouldBeIncluded: false,
 		},
 		{
-			name:             "Mature SSFee SKA-1 output with SKA-1 filter",
+			name:             "Mature SSFee SKA1 output with SKA1 filter",
 			outputHeight:     100,
 			outputCoinType:   cointype.CoinType(1),
 			outputValue:      10000,
@@ -361,7 +361,7 @@ func TestSSFeeInUnspentOutputs(t *testing.T) {
 			shouldBeIncluded: true,
 		},
 		{
-			name:             "Mature SSFee SKA-1 output with SKA-2 filter",
+			name:             "Mature SSFee SKA1 output with SKA2 filter",
 			outputHeight:     100,
 			outputCoinType:   cointype.CoinType(1),
 			outputValue:      10000,
@@ -431,13 +431,13 @@ func TestSSFeeValidation(t *testing.T) {
 		reason    string
 	}{
 		{
-			name:      "Valid SSFee with SKA-1",
+			name:      "Valid SSFee with SKA1",
 			tx:        createMockSSFeeTx(cointype.CoinType(1), 3, 1000),
 			wantValid: true,
 			reason:    "Valid SSFee should pass validation",
 		},
 		{
-			name:      "Valid SSFee with SKA-2",
+			name:      "Valid SSFee with SKA2",
 			tx:        createMockSSFeeTx(cointype.CoinType(2), 4, 2000), // Max 4 reward outputs
 			wantValid: true,
 			reason:    "Valid SSFee with different coin type should pass",

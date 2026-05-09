@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/big"
 	"sort"
 	"time"
 
@@ -56,18 +57,22 @@ const (
 		txscript.ScriptVerifyCheckSequenceVerify |
 		txscript.ScriptVerifyTreasury
 
-	// multisigSKAFeePreSelectInputGuess is the input-count upper bound used
-	// when computing the SKA pre-selection fee budget in
-	// txToMultisigInternal. The post-selection real-fee recompute is the
-	// authoritative balance check, so over-estimating here is harmless
-	// (it just pulls more inputs than strictly needed); under-estimating
-	// produces a spurious InsufficientBalance for fragmented wallets that
-	// would otherwise have enough SKA to cover the real fee.
+	// multisigFeePreSelectInputGuess is the input-count upper bound used
+	// when computing the pre-selection fee budget in
+	// txToMultisigInternal (both VAR and SKA branches). The post-selection
+	// real-fee recompute is the authoritative balance check, so over-
+	// estimating here is harmless (it just pulls more inputs than strictly
+	// needed); under-estimating produces a spurious InsufficientBalance for
+	// fragmented wallets that would otherwise have enough to cover the real
+	// fee.
 	//
-	// 50 covers all but pathologically dust-fragmented SKA wallets at
-	// AtomsPerCoin=1e18: 50 P2SH inputs + 1 output + change is ~8.5 kB,
-	// budgeting ~3.4e19 atoms in fees against a ~4e18/kB relay fee.
-	multisigSKAFeePreSelectInputGuess = 50
+	// 200 covers all but pathologically dust-fragmented wallets while still
+	// fitting within standard tx size bounds. Raised from 50 because the
+	// previous limit produced spurious InsufficientBalance errors on wallets
+	// with >50 dust UTXOs. The proper fix is the iterative grow-on-shortfall
+	// pattern from txauthor.NewUnsignedTransaction; until that lands here,
+	// 200 leaves enough headroom for the realistic worst case.
+	multisigFeePreSelectInputGuess = 200
 )
 
 // Input provides transaction inputs referencing spendable outputs.
@@ -101,8 +106,46 @@ const (
 // When the changeSource is nil and change output should be added, an internal
 // change address is created for the account.  When the inputSource is nil,
 // the inputs will be selected by the wallet.
+//
+// relayFeePerKbOverride is an optional caller-supplied per-kB relay fee that
+// takes effect for this single transaction. When zero, the wallet falls back
+// to RelayFeeForCoinType for the inferred output coin type. The override is
+// expressed as cointype.SKAAmount so the same parameter carries either a VAR
+// fee (int64-shaped) or an SKA fee (big.Int) without truncation.
+//
+// The coin type is inferred from outputs[0].CoinType; with no outputs (sweep
+// semantics) the inferred coin type is VAR. Callers needing to sweep a
+// non-VAR account must use NewUnsignedSweepTransactionForCoinType.
 func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxOut,
-	relayFeePerKb dcrutil.Amount, account uint32, minConf int32,
+	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
+	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
+
+	txCoinType := cointype.CoinTypeVAR
+	if len(outputs) > 0 {
+		txCoinType = outputs[0].CoinType
+	}
+	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, outputs,
+		relayFeePerKbOverride, account, minConf, algo, changeSource, inputSource)
+}
+
+// NewUnsignedSweepTransactionForCoinType is the coin-type-aware sweep variant
+// of NewUnsignedTransaction. It accepts no outputs (the destination receives
+// the swept amount minus fees via changeSource) and requires the caller to
+// specify the coin type explicitly so SKA accounts can be swept.
+func (w *Wallet) NewUnsignedSweepTransactionForCoinType(ctx context.Context,
+	txCoinType cointype.CoinType, relayFeePerKbOverride cointype.SKAAmount,
+	account uint32, minConf int32, changeSource txauthor.ChangeSource) (*txauthor.AuthoredTx, error) {
+
+	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, nil,
+		relayFeePerKbOverride, account, minConf, OutputSelectionAlgorithmAll, changeSource, nil)
+}
+
+// newUnsignedTransactionWithCoinType is the shared implementation behind
+// NewUnsignedTransaction (output-driven coin type inference) and
+// NewUnsignedSweepTransactionForCoinType (explicit coin type for sweep).
+func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
+	txCoinType cointype.CoinType, outputs []*wire.TxOut,
+	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
 	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
 
 	const op errors.Op = "wallet.NewUnsignedTransaction"
@@ -125,13 +168,13 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 			}
 		}
 
-		// Determine coin type from outputs
-		var txCoinType cointype.CoinType = cointype.CoinTypeVAR
-		if len(outputs) > 0 {
-			txCoinType = outputs[0].CoinType
-		}
-
-		// Create coin-type-aware input source if nil
+		// Create coin-type-aware input source if nil. When the caller
+		// requests OutputSelectionAlgorithmAll (sweep semantics), wrap the
+		// default source so it always invokes the underlying store with the
+		// no-target sentinel (target=0, targetSKA=Zero), which drains every
+		// eligible UTXO regardless of the incremental target txauthor would
+		// otherwise pass on each iteration. Without this wrap the
+		// "all outputs" algorithm degenerates to "just enough to cover fee".
 		if inputSource == nil {
 			_, tipHeight := w.txStore.MainChainTip(dbtx)
 			ignoreInput := func(op *wire.OutPoint) bool {
@@ -140,7 +183,13 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 			}
 			inputSourceObj := w.txStore.MakeInputSourceWithCoinType(dbtx, account,
 				minConf, tipHeight, ignoreInput, txCoinType)
-			inputSource = inputSourceObj.SelectInputs
+			if algo == OutputSelectionAlgorithmAll {
+				inputSource = func(dcrutil.Amount, cointype.SKAAmount) (*txauthor.InputDetail, error) {
+					return inputSourceObj.SelectInputs(0, cointype.Zero())
+				}
+			} else {
+				inputSource = inputSourceObj.SelectInputs
+			}
 		}
 
 		if changeSource == nil {
@@ -152,8 +201,18 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 			}
 		}
 
-		// Calculate relay fee based on transaction coin type (SKAAmount for big.Int precision)
-		actualRelayFee := w.RelayFeeForCoinType(ctx, txCoinType)
+		// Honor caller's per-kB relay fee override when supplied; else
+		// resolve the wallet-configured fee for the inferred coin type.
+		var actualRelayFee cointype.SKAAmount
+		if !relayFeePerKbOverride.IsZero() {
+			actualRelayFee = relayFeePerKbOverride
+		} else {
+			actualRelayFee = w.RelayFeeForCoinType(ctx, txCoinType)
+		}
+		if txCoinType.IsSKA() && actualRelayFee.IsZero() {
+			return errors.E(errors.Invalid, fmt.Sprintf(
+				"no relay fee configured for coin type %d; cannot author transaction", txCoinType))
+		}
 
 		var err error
 		authoredTx, err = txauthor.NewUnsignedTransaction(outputs, actualRelayFee,
@@ -167,34 +226,10 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 			authoredTx.Tx.TxOut[authoredTx.ChangeIndex].CoinType = txCoinType
 		}
 
-		// Dual-coin validation: Ensure all outputs and inputs have the same coin type
-		if len(authoredTx.Tx.TxOut) > 0 {
-			expectedCoinType := authoredTx.Tx.TxOut[0].CoinType
-
-			// Validate all outputs have the same coin type
-			for i, txOut := range authoredTx.Tx.TxOut {
-				if txOut.CoinType != expectedCoinType {
-					return errors.E(errors.Invalid, fmt.Sprintf("output %d coin type %d does not match expected coin type %d",
-						i, txOut.CoinType, expectedCoinType))
-				}
-			}
-
-			// Validate each input has the same coin type as outputs
-			if len(authoredTx.Tx.TxIn) > 0 {
-				txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
-				for i, txIn := range authoredTx.Tx.TxIn {
-					// Look up the previous output being spent
-					prevCredit, err := w.txStore.UnspentOutput(txmgrNs, txIn.PreviousOutPoint, true)
-					if err != nil {
-						return errors.E(errors.Invalid, fmt.Sprintf("failed to lookup input %d previous output: %v", i, err))
-					}
-
-					if prevCredit.CoinType != expectedCoinType {
-						return errors.E(errors.Invalid, fmt.Sprintf("input %d coin type %d does not match output coin type %d",
-							i, prevCredit.CoinType, expectedCoinType))
-					}
-				}
-			}
+		// Dual-coin validation: ensure all outputs and inputs share the
+		// same coin type before returning the authored tx.
+		if err := w.validateAuthoredCoinTypes(dbtx, authoredTx.Tx); err != nil {
+			return err
 		}
 
 		return nil
@@ -217,6 +252,81 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 		}
 	}
 	return authoredTx, nil
+}
+
+// ErrExternalInputInAuthoredTx is the sentinel returned by
+// validateAuthoredCoinTypes when an input's previous output is not in this
+// wallet's UTXO set. It lets RPC handlers distinguish "operator passed an
+// externally-funded input to an authoring path that requires wallet-owned
+// inputs" from generic "Invalid" so callers (e.g. signrawtransaction) can
+// surface a more actionable error and route to the right validation path.
+var ErrExternalInputInAuthoredTx = errors.New("input previous output not found in wallet UTXO set; foreign inputs must use signrawtransaction")
+
+// validateAuthoredCoinTypes verifies that every output and every input of an
+// authored transaction shares the same coin type. The check is run under the
+// caller's dbtx so input UTXO lookups see a consistent snapshot. It is shared
+// between the public NewUnsignedTransaction and the internal authorTx
+// codepaths so a single source of truth gates mixed-coin transactions before
+// they reach the network.
+//
+// Precondition: every input's previous output must be present in this
+// wallet's own UTXO set; foreign inputs are rejected with
+// ErrExternalInputInAuthoredTx. Callers handling externally-supplied inputs
+// (e.g. signrawtransaction) must use a different validation path.
+func (w *Wallet) validateAuthoredCoinTypes(dbtx walletdb.ReadTx, tx *wire.MsgTx) error {
+	// txauthor never produces a tx with zero outputs, but failing loud here
+	// is more informative than silently passing the per-input coin-type
+	// check below. A degenerate inputs-only tx has no expected coin type
+	// and cannot be classified.
+	if len(tx.TxOut) == 0 {
+		return errors.E(errors.Invalid,
+			"validateAuthoredCoinTypes: transaction has no outputs")
+	}
+	expectedCoinType := tx.TxOut[0].CoinType
+	for i, txOut := range tx.TxOut {
+		if txOut.CoinType != expectedCoinType {
+			return errors.E(errors.Invalid,
+				fmt.Sprintf("output %d coin type %d does not match expected coin type %d",
+					i, txOut.CoinType, expectedCoinType))
+		}
+		// Defense-in-depth: SKA outputs must carry their atom value in
+		// SKAValue (big.Int) with Value=0; VAR outputs must have
+		// SKAValue=nil. A logically-mixed output (both fields set, or
+		// neither) would pass the per-output coin-type check above and
+		// reach the network where it would be rejected — failing here
+		// surfaces the bug at authoring time.
+		if txOut.CoinType.IsSKA() {
+			if txOut.Value != 0 {
+				return errors.E(errors.Invalid,
+					fmt.Sprintf("output %d is SKA but Value=%d (must be 0)",
+						i, txOut.Value))
+			}
+			if txOut.SKAValue == nil {
+				return errors.E(errors.Invalid,
+					fmt.Sprintf("output %d is SKA but SKAValue is nil", i))
+			}
+		} else if txOut.SKAValue != nil {
+			return errors.E(errors.Invalid,
+				fmt.Sprintf("output %d is VAR but SKAValue is non-nil", i))
+		}
+	}
+	if len(tx.TxIn) == 0 {
+		return nil
+	}
+	txmgrNs := dbtx.ReadBucket(wtxmgrNamespaceKey)
+	for i, txIn := range tx.TxIn {
+		prevCredit, err := w.txStore.UnspentOutput(txmgrNs, txIn.PreviousOutPoint, true)
+		if err != nil {
+			return errors.E(errors.Invalid,
+				fmt.Errorf("input %d: %w: %v", i, ErrExternalInputInAuthoredTx, err))
+		}
+		if prevCredit.CoinType != expectedCoinType {
+			return errors.E(errors.Invalid,
+				fmt.Sprintf("input %d coin type %d does not match output coin type %d",
+					i, prevCredit.CoinType, expectedCoinType))
+		}
+	}
+	return nil
 }
 
 // secretSource is an implementation of txauthor.SecretSource for the wallet's
@@ -375,12 +485,32 @@ func (w *Wallet) insertMultisigOutIntoTxMgr(dbtx walletdb.ReadWriteTx, msgTx *wi
 }
 
 // checkHighFees performs a high fee check if enabled and possible, returning an
-// error if the transaction pays high fees.
-func (w *Wallet) checkHighFees(totalInput dcrutil.Amount, tx *wire.MsgTx) error {
+// error if the transaction pays high fees. The check is coin-type aware:
+// SKA transactions are evaluated against PaysHighFeesSKA, which uses the chain
+// params' MinRelayTxFee × MaxFeeMultiplier × txSize threshold (relative to the
+// per-coin relay fee, not an absolute amount), so naturally-priced SKA fees
+// scale the cap up automatically. Pass cointype.Zero() for the unused total in
+// each branch.
+func (w *Wallet) checkHighFees(totalVARInput dcrutil.Amount, totalSKAInput cointype.SKAAmount, tx *wire.MsgTx) error {
 	if w.allowHighFees {
 		return nil
 	}
-	if txrules.PaysHighFees(totalInput, tx) {
+	coinType := txrules.GetCoinTypeFromOutputs(tx.TxOut)
+	if coinType.IsSKA() {
+		highFee, err := txrules.PaysHighFeesSKA(totalSKAInput.BigInt(), tx, w.chainParams)
+		if err != nil {
+			return errors.E(errors.Bug, err)
+		}
+		if highFee {
+			return errors.E(errors.Policy, "high SKA fee")
+		}
+		return nil
+	}
+	highFee, err := txrules.PaysHighFees(totalVARInput, tx)
+	if err != nil {
+		return errors.E(errors.Bug, err)
+	}
+	if highFee {
 		return errors.E(errors.Policy, "high fee")
 	}
 	return nil
@@ -495,10 +625,15 @@ func (w *Wallet) authorTx(ctx context.Context, op errors.Op, a *authorTx) error 
 			}
 		}
 
-		// Calculate relay fee based on transaction coin type (SKAAmount for big.Int precision)
+		// Honor the caller's per-tx fee; only fall back to the wallet's
+		// configured per-coin-type relay fee when the caller left it zero.
 		actualTxFee := a.txFee
-		if len(a.outputs) > 0 {
+		if actualTxFee.IsZero() && len(a.outputs) > 0 {
 			actualTxFee = w.RelayFeeForCoinType(ctx, a.outputs[0].CoinType)
+		}
+		if len(a.outputs) > 0 && a.outputs[0].CoinType.IsSKA() && actualTxFee.IsZero() {
+			return errors.E(errors.Invalid, fmt.Sprintf(
+				"no relay fee configured for coin type %d; cannot author transaction", a.outputs[0].CoinType))
 		}
 
 		var err error
@@ -549,8 +684,18 @@ func (w *Wallet) authorTx(ctx context.Context, op errors.Op, a *authorTx) error 
 			for _, done := range secrets.doneFuncs {
 				done()
 			}
+			if err != nil {
+				return err
+			}
 		}
-		return err
+
+		// Dual-coin validation under the same dbtx so the input lookups
+		// see a consistent UTXO snapshot. authorTx relies on the input
+		// source to filter by coin type, but verify here as defense in
+		// depth — a future regression in MakeInputSourceWithCoinType must
+		// not silently produce mixed-coin transactions that the node
+		// would reject.
+		return w.validateAuthoredCoinTypes(dbtx, atx.Tx)
 	})
 	if err != nil {
 		return errors.E(op, err)
@@ -559,12 +704,22 @@ func (w *Wallet) authorTx(ctx context.Context, op errors.Op, a *authorTx) error 
 	// Warn when spending UTXOs controlled by imported keys created change for
 	// the default account.
 	if atx.ChangeIndex >= 0 && a.account == udb.ImportedAddrAccount {
-		changeAmount := dcrutil.Amount(atx.Tx.TxOut[atx.ChangeIndex].GetValue())
-		log.Warnf("Spend from imported account produced change: moving"+
-			" %v from imported account into default account.", changeAmount)
+		changeOut := atx.Tx.TxOut[atx.ChangeIndex]
+		if changeOut.CoinType.IsSKA() {
+			var skaAmt cointype.SKAAmount
+			if changeOut.SKAValue != nil {
+				skaAmt = cointype.NewSKAAmount(changeOut.SKAValue)
+			}
+			log.Warnf("Spend from imported account produced SKA change: moving"+
+				" %v atoms from imported account into default account.", skaAmt.BigInt())
+		} else {
+			changeAmount := dcrutil.Amount(changeOut.Value)
+			log.Warnf("Spend from imported account produced change: moving"+
+				" %v from imported account into default account.", changeAmount)
+		}
 	}
 
-	err = w.checkHighFees(atx.TotalInput, atx.Tx)
+	err = w.checkHighFees(atx.TotalInput, atx.SKATotalInput, atx.Tx)
 	if err != nil {
 		return errors.E(op, err)
 	}
@@ -574,17 +729,6 @@ func (w *Wallet) authorTx(ctx context.Context, op errors.Op, a *authorTx) error 
 		err = validateMsgTx(op, atx.Tx, atx.PrevScripts)
 		if err != nil {
 			return errors.E(op, err)
-		}
-	}
-
-	// Validate all outputs have the same coin type
-	if len(atx.Tx.TxOut) > 0 {
-		expectedCoinType := atx.Tx.TxOut[0].CoinType
-		for i, txOut := range atx.Tx.TxOut {
-			if txOut.CoinType != expectedCoinType {
-				return errors.E(op, fmt.Sprintf("output %d coin type %d does not match expected coin type %d",
-					i, txOut.CoinType, expectedCoinType))
-			}
 		}
 	}
 
@@ -645,10 +789,17 @@ func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32,
 	defer w.lockedOutpointMu.Unlock()
 	w.lockedOutpointMu.Lock()
 
+	// Resolve the network backend up front so we fail fast on disconnect
+	// rather than after authoring the transaction.
+	n, err := w.NetworkBackend()
+	if err != nil {
+		return nil, nil, nil, errors.E(op, err)
+	}
+
 	var created *CreatedTx
 	var addr stdaddr.Address
 	var msScript []byte
-	err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+	err = walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
 		var err error
 		created, addr, msScript, err = w.txToMultisigInternal(ctx, op, dbtx,
 			account, amount, amountSKA, pubkeys, nRequired, minconf, coinType)
@@ -657,6 +808,27 @@ func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32,
 	if err != nil {
 		return nil, nil, nil, errors.E(op, err)
 	}
+
+	// Publish AFTER the DB tx commits.  If publish fails, abandon the
+	// locally-recorded tx so the wallet's view stays consistent with the
+	// network.  Mirrors compressWallet / publishAndWatch.
+	if err := n.PublishTransactions(ctx, created.MsgTx); err != nil {
+		hash := created.MsgTx.TxHash()
+		log.Errorf("Abandoning multisig transaction %v which failed to publish", &hash)
+		if abandonErr := w.AbandonTransaction(ctx, &hash); abandonErr != nil {
+			log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
+		}
+		return nil, nil, nil, errors.E(op, err)
+	}
+
+	// Request updates from dcrd for new transactions sent to this script
+	// hash address.  Match publishAndWatch's log-and-continue policy: a
+	// LoadTxFilter failure should not retroactively invalidate an
+	// already-published transaction.
+	if err := n.LoadTxFilter(ctx, false, []stdaddr.Address{addr}, nil); err != nil {
+		log.Errorf("Failed to watch multisig script address %v: %v", addr, err)
+	}
+
 	return created, addr, msScript, nil
 }
 
@@ -669,30 +841,8 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 		return nil, nil, nil, err
 	}
 
-	n, err := w.NetworkBackend()
-	if err != nil {
-		return txToMultisigError(err)
-	}
-
 	// Get current block's height and hash.
 	_, topHeight := w.txStore.MainChainTip(dbtx)
-
-	// VAR pre-selection fee budget. The SKA branch below derives its own
-	// pre-budget from the configured SKA relay fee — the int64 atoms here
-	// are ~12 orders of magnitude smaller than real SKA fees and are not
-	// usable for SKA. Both branches recompute the authoritative fee post-
-	// selection.
-	var feeEstForTx dcrutil.Amount
-	switch w.chainParams.Net {
-	case wire.MainNet:
-		feeEstForTx = 5e7
-	case 0x48e7a065: // testnet2
-		feeEstForTx = 5e7
-	case wire.TestNet3:
-		feeEstForTx = 5e7
-	default:
-		feeEstForTx = 3e4
-	}
 
 	// Instead of taking reward addresses by arg, just create them now and
 	// automatically find all eligible outputs from all current utxos.
@@ -700,18 +850,25 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 	const maxResults = 0
 	var amountRequired dcrutil.Amount
 	amountRequiredSKA := cointype.Zero()
+
+	// Pre-selection fee budget. Both branches estimate tx size assuming up
+	// to multisigFeePreSelectInputGuess inputs, one P2SH output, and a
+	// P2PKH change output, then multiply by the configured per-coin-type
+	// relay fee. The post-selection recompute at the balance-check is the
+	// authoritative fee; this only needs to be a safe upper bound so
+	// findEligibleOutputsAmount returns enough inputs to cover it.
+	//
+	// TODO(coin-aware-iterative-fee): the fixed multisigFeePreSelectInputGuess
+	// budget will spuriously fail with InsufficientBalance for wallets that
+	// hold more than that many dust UTXOs, even when the actual balance is
+	// sufficient. Replace with the iterative grow-on-shortfall pattern in
+	// txauthor.NewUnsignedTransaction (wallet/txauthor/author.go: target-fee
+	// loop). Deferred — current callers cap at small input counts.
+	estScriptSizes := make([]int, multisigFeePreSelectInputGuess)
+	for i := range estScriptSizes {
+		estScriptSizes[i] = txsizes.RedeemP2SHSigScriptSize
+	}
 	if coinType.IsSKA() {
-		// Pre-selection fee budget for SKA: estimate the tx size assuming
-		// up to multisigSKAFeePreSelectInputGuess inputs, one P2SH output,
-		// and a P2PKH change output, then multiply by the configured SKA
-		// relay fee. The post-selection recompute below at the balance-
-		// check is the authoritative fee; this only needs to be a safe
-		// upper bound so findEligibleOutputsAmount returns enough inputs
-		// to cover it.
-		estScriptSizes := make([]int, multisigSKAFeePreSelectInputGuess)
-		for i := range estScriptSizes {
-			estScriptSizes[i] = txsizes.RedeemP2SHSigScriptSize
-		}
 		estTxOuts := []*wire.TxOut{{
 			Value:    0,
 			SKAValue: amountSKA.BigInt(),
@@ -720,9 +877,20 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 		}}
 		preBudgetSize := txsizes.EstimateSerializeSizeSKA(estScriptSizes, estTxOuts, txsizes.P2PKHPkScriptSize)
 		relayFeeBig := w.RelayFeeForCoinType(ctx, coinType)
+		if relayFeeBig.IsZero() {
+			return txToMultisigError(errors.E(op, errors.Invalid, errors.Errorf(
+				"no relay fee configured for coin type %d; cannot author transaction", coinType)))
+		}
 		skaFeePreBudget := txrules.FeeForSerializeSizeSKA(relayFeeBig, preBudgetSize)
 		amountRequiredSKA = amountSKA.Add(skaFeePreBudget)
 	} else {
+		estTxOuts := []*wire.TxOut{{
+			Value:    int64(amount),
+			PkScript: make([]byte, txsizes.P2SHPkScriptSize),
+			CoinType: cointype.CoinTypeVAR,
+		}}
+		preBudgetSize := txsizes.EstimateSerializeSize(estScriptSizes, estTxOuts, txsizes.P2PKHPkScriptSize)
+		feeEstForTx := txrules.FeeForSerializeSize(w.RelayFee(), preBudgetSize)
 		amountRequired = amount + feeEstForTx
 	}
 	eligible, err := w.findEligibleOutputsAmount(dbtx, account, minconf,
@@ -752,9 +920,14 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 	totalSKAInput := cointype.Zero()
 	for _, e := range eligible {
 		txIn := wire.NewTxIn(&e.OutPoint, e.PrevOut.Value, nil)
-		// Set SKAValueIn for SKA inputs (needed for V13 wire format)
+		// Set SKAValueIn for SKA inputs (needed for V13 wire format).
+		// Defensive-copy the prev-out's SKAValue so the wire-level tx
+		// owns its own *big.Int — matches the convention at
+		// multisig.go:120, methods.go:5286, methods.go:7888 and
+		// guarantees later mutation of the prev-out value cannot
+		// silently corrupt the on-chain serialization.
 		if e.PrevOut.CoinType.IsSKA() && e.PrevOut.SKAValue != nil {
-			txIn.SKAValueIn = e.PrevOut.SKAValue
+			txIn.SKAValueIn = new(big.Int).Set(e.PrevOut.SKAValue)
 			totalSKAInput = totalSKAInput.Add(cointype.NewSKAAmount(e.PrevOut.SKAValue))
 		} else {
 			totalInput += dcrutil.Amount(e.PrevOut.Value)
@@ -809,12 +982,19 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 		// crossed the dust threshold.
 		feeSize = txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, txsizes.P2PKHPkScriptSize)
 		relayFeeBig := w.RelayFeeForCoinType(ctx, coinType)
+		if relayFeeBig.IsZero() {
+			return txToMultisigError(errors.E(op, errors.Invalid, errors.Errorf(
+				"no relay fee configured for coin type %d; cannot author transaction", coinType)))
+		}
 		skaFeeEstActual := txrules.FeeForSerializeSizeSKA(relayFeeBig, feeSize)
 
 		// Balance check
 		required := amountSKA.Add(skaFeeEstActual)
 		if totalSKAInput.Cmp(required) < 0 {
-			return txToMultisigError(errors.E(op, errors.InsufficientBalance))
+			return txToMultisigError(errors.E(op, errors.InsufficientBalance, errors.Errorf(
+				"SKA inputs %s < required %s atoms (target %s + estimated fee %s)",
+				totalSKAInput.String(), required.String(),
+				amountSKA.String(), skaFeeEstActual.String())))
 		}
 
 		// Add change if needed. Drop sub-dust change (forfeit to fees) to
@@ -853,14 +1033,24 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 		}
 		msgtx.AddTxOut(txOut)
 
-		// Add change if we need it.
-		changeSize := 0
-		if totalInput > amount+feeEstForTx {
-			changeSize = txsizes.P2PKHPkScriptSize
-		}
-		feeSize = txsizes.EstimateSerializeSize(scriptSizes, msgtx.TxOut, changeSize)
+		// Compute fee assuming a change output is present; if no change is
+		// produced below, the over-estimate is at most P2PKHPkScriptSize
+		// bytes of fee (matches the SKA branch above).
+		feeSize = txsizes.EstimateSerializeSize(scriptSizes, msgtx.TxOut, txsizes.P2PKHPkScriptSize)
 		relayFeeBigVar := w.RelayFeeForCoinType(ctx, coinType)
-		relayFeeInt64Var, _ := relayFeeBigVar.Int64()
+		relayFeeInt64Var, err := relayFeeBigVar.Int64()
+		if err != nil {
+			return txToMultisigError(errors.E(op, errors.Invalid,
+				"fee overflow: configured VAR relay fee rate produces a fee that exceeds int64"))
+		}
+		// Mirror the SKA branch's IsZero gate: a zero relay fee yields a
+		// zero on-tx fee that the node will reject. Surface a clear error
+		// here rather than letting an unbroadcastable tx ship to the
+		// caller.
+		if relayFeeInt64Var == 0 {
+			return txToMultisigError(errors.E(op, errors.Invalid, errors.Errorf(
+				"no relay fee configured for coin type %d; cannot author transaction", coinType)))
+		}
 		feeEst := txrules.FeeForSerializeSize(dcrutil.Amount(relayFeeInt64Var), feeSize)
 
 		if totalInput < amount+feeEst {
@@ -893,26 +1083,15 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 		return txToMultisigError(errors.E(op, err))
 	}
 
-	// checkHighFees uses int64, skip for SKA (fees are always reasonable for SKA)
-	if !coinType.IsSKA() {
-		err = w.checkHighFees(totalInput, msgtx)
-		if err != nil {
-			return txToMultisigError(errors.E(op, err))
-		}
-	}
-
-	err = n.PublishTransactions(ctx, msgtx)
+	err = w.checkHighFees(totalInput, totalSKAInput, msgtx)
 	if err != nil {
 		return txToMultisigError(errors.E(op, err))
 	}
 
-	// Request updates from dcrd for new transactions sent to this
-	// script hash address.
-	err = n.LoadTxFilter(ctx, false, []stdaddr.Address{scAddr}, nil)
-	if err != nil {
-		return txToMultisigError(errors.E(op, err))
-	}
-
+	// Record the tx in the wallet DB.  The actual network publish and
+	// LoadTxFilter call run in the outer txToMultisig wrapper, after this
+	// walletdb.Update commits — keeps the wallet from broadcasting a
+	// transaction it has no record of if the local insert later fails.
 	err = w.insertMultisigOutIntoTxMgr(dbtx, msgtx, 0)
 	if err != nil {
 		return txToMultisigError(errors.E(op, err))
@@ -960,31 +1139,70 @@ func creditScripts(credits []Input) [][]byte {
 
 // compressWallet compresses all the utxos in a wallet into a single change
 // address. For use when it becomes dusty.
+//
+// The DB-write phase (utxo selection, signing, and tx-record insertion) runs
+// inside walletdb.Update; the network publish runs *after* the bbolt write
+// transaction commits so a slow / hung peer cannot block other wallet writes
+// for the duration of the publish call.  This mirrors the
+// recordAuthoredTx + publishAndWatch split used by authorTx-built txs.
+//
+// Outpoint locking: compressWalletInternal records the consumed outpoints
+// in w.lockedOutpoints and returns the slice; this function is responsible
+// for releasing them — but only after publishAndWatch has run (which calls
+// AbandonTransaction on failure). Releasing the locks before publish would
+// admit a parallel selector to the same prevouts the moment lockedOutpointMu
+// is narrowed in a future refactor; correctness must not rely on the outer
+// mutex's current full-function scope.
 func (w *Wallet) compressWallet(ctx context.Context, op errors.Op, maxNumIns int, account uint32, changeAddr stdaddr.Address, coinType cointype.CoinType) (*chainhash.Hash, error) {
 	defer w.lockedOutpointMu.Unlock()
 	w.lockedOutpointMu.Lock()
-
-	var hash *chainhash.Hash
-	err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
-		var err error
-		hash, err = w.compressWalletInternal(ctx, op, dbtx, maxNumIns, account, changeAddr, coinType)
-		return err
-	})
-	if err != nil {
-		return nil, errors.E(op, err)
-	}
-	return hash, nil
-}
-
-func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx walletdb.ReadWriteTx, maxNumIns int, account uint32,
-	changeAddr stdaddr.Address, coinType cointype.CoinType) (*chainhash.Hash, error) {
-
-	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 	n, err := w.NetworkBackend()
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
+
+	var hash *chainhash.Hash
+	var msgtx *wire.MsgTx
+	var lockedOps []wire.OutPoint
+	err = walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		var err error
+		hash, msgtx, lockedOps, err = w.compressWalletInternal(ctx, op, dbtx, maxNumIns, account, changeAddr, coinType)
+		return err
+	})
+	// Whatever lockedOps the inner function reported as locked must be
+	// released exactly once — on the success path after publishAndWatch
+	// returns (success or AbandonTransaction), on the failure path right
+	// here. Defer covers both.
+	defer func() {
+		for i := range lockedOps {
+			delete(w.lockedOutpoints, outpoint{lockedOps[i].Hash, lockedOps[i].Index})
+		}
+	}()
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Publish AFTER the DB tx commits.  publishAndWatch handles
+	// AbandonTransaction on publish failure, leaving the wallet's view
+	// of the failed tx consistent with what the network sees.
+	if err := w.publishAndWatch(ctx, op, n, msgtx, nil); err != nil {
+		return nil, err
+	}
+	txHash := msgtx.TxHash()
+	log.Infof("Successfully consolidated funds in transaction %v", &txHash)
+	return hash, nil
+}
+
+// compressWalletInternal returns the slice of outpoints it locked in
+// w.lockedOutpoints; the caller (compressWallet) is responsible for
+// releasing them — but only AFTER the network publish (success or abandon)
+// has run. Releasing here, before publish, opens a double-spend window the
+// moment a future refactor narrows the outer lockedOutpointMu scope.
+func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx walletdb.ReadWriteTx, maxNumIns int, account uint32,
+	changeAddr stdaddr.Address, coinType cointype.CoinType) (*chainhash.Hash, *wire.MsgTx, []wire.OutPoint, error) {
+
+	addrmgrNs := dbtx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 	// Get current block's height
 	_, tipHeight := w.txStore.MainChainTip(dbtx)
@@ -992,22 +1210,29 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 	minconf := int32(1)
 	eligible, err := w.findEligibleOutputs(dbtx, account, minconf, tipHeight, coinType)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, nil, nil, errors.E(op, err)
 	}
+	// Filter outputs already locked by another in-flight operation. The
+	// outer caller holds lockedOutpointMu so the map is quiescent here, but
+	// counting before filtering would let an unlocked-caller regression
+	// admit a tx with too few real candidates.
+	filtered := eligible[:0]
+	for _, e := range eligible {
+		if _, locked := w.lockedOutpoints[outpoint{e.OutPoint.Hash, e.OutPoint.Index}]; locked {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	eligible = filtered
 	if len(eligible) <= 1 {
-		return nil, errors.E(op, "too few outputs to consolidate")
+		return nil, nil, nil, errors.E(op, "too few outputs to consolidate")
 	}
+	lockedOps := make([]wire.OutPoint, 0, len(eligible))
 	for i := range eligible {
 		op := eligible[i].OutPoint
 		w.lockedOutpoints[outpoint{op.Hash, op.Index}] = struct{}{}
+		lockedOps = append(lockedOps, op)
 	}
-
-	defer func() {
-		for i := range eligible {
-			op := &eligible[i].OutPoint
-			delete(w.lockedOutpoints, outpoint{op.Hash, op.Index})
-		}
-	}()
 
 	// Check if output address is default, and generate a new address if needed
 	if changeAddr == nil {
@@ -1015,7 +1240,7 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 		changeAddr, err = w.newChangeAddress(ctx, op, w.persistReturnedChild(ctx, dbtx),
 			accountName, account, gapPolicyIgnore)
 		if err != nil {
-			return nil, errors.E(op, err)
+			return nil, nil, lockedOps, errors.E(op, err)
 		}
 	}
 	vers, pkScript := changeAddr.PaymentScript()
@@ -1048,9 +1273,11 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 		}
 
 		txIn := wire.NewTxIn(&e.OutPoint, e.PrevOut.Value, nil)
-		// Set SKAValueIn for SKA inputs (needed for V13 wire format)
+		// Set SKAValueIn for SKA inputs (needed for V13 wire format).
+		// Defensive-copy the prev-out's SKAValue (see txToMultisigInternal
+		// for the rationale).
 		if e.PrevOut.CoinType.IsSKA() && e.PrevOut.SKAValue != nil {
-			txIn.SKAValueIn = e.PrevOut.SKAValue
+			txIn.SKAValueIn = new(big.Int).Set(e.PrevOut.SKAValue)
 			totalAddedSKA = totalAddedSKA.Add(cointype.NewSKAAmount(e.PrevOut.SKAValue))
 		} else {
 			totalAddedVAR += dcrutil.Amount(e.PrevOut.Value)
@@ -1061,72 +1288,93 @@ func (w *Wallet) compressWalletInternal(ctx context.Context, op errors.Op, dbtx 
 		count++
 	}
 
-	// Set output value based on coin type
+	// Set output value based on coin type. The dust/policy check is unified
+	// via txrules.CheckOutput (SKA-aware) so VAR and SKA see the same
+	// rejection semantics; the per-branch body below only computes the
+	// post-fee output value.
 	feeRateBig := w.RelayFeeForCoinType(ctx, coinType)
+	if coinType.IsSKA() && feeRateBig.IsZero() {
+		return nil, nil, lockedOps, errors.E(op, errors.Invalid, errors.Errorf(
+			"no relay fee configured for coin type %d; cannot author transaction", coinType))
+	}
 	if coinType.IsSKA() {
-		// SKA path: use big.Int arithmetic for full precision
+		// SKA path: use big.Int arithmetic for full precision.
 		szEst := txsizes.EstimateSerializeSizeSKA(scriptSizes, msgtx.TxOut, 0)
 		skaFee := txrules.FeeForSerializeSizeSKA(feeRateBig, szEst)
 		skaOutput := totalAddedSKA.Sub(skaFee)
-		if skaOutput.IsNegative() || skaOutput.IsZero() {
-			return nil, errors.E(op, errors.InsufficientBalance)
+		if skaOutput.IsNegative() {
+			return nil, nil, lockedOps, errors.E(op, errors.InsufficientBalance, errors.Errorf(
+				"SKA inputs total %s atoms but estimated fee is %s atoms",
+				totalAddedSKA.String(), skaFee.String()))
 		}
-		// Reject sub-dust consolidated outputs: there is no change to drop,
-		// the consolidated UTXO would be unspendable on the network.
-		if skaOutput.BigInt().Cmp(cointype.MinSKADustAmount) < 0 {
-			return nil, errors.E(op, errors.InsufficientBalance,
-				"consolidated SKA output below dust threshold after fees")
+		if skaOutput.IsZero() {
+			// Inputs cover the fee exactly — there's nothing left to
+			// consolidate.  This is a Policy condition (the operator has
+			// funds, just not above the fee), not InsufficientBalance.
+			return nil, nil, lockedOps, errors.E(op, errors.Policy, errors.Errorf(
+				"consolidation would produce zero output: SKA inputs total "+
+					"%s atoms equal estimated fee %s atoms",
+				totalAddedSKA.String(), skaFee.String()))
 		}
 		msgtx.TxOut[0].Value = 0
 		msgtx.TxOut[0].SKAValue = skaOutput.BigInt()
 	} else {
-		// VAR path: use int64 arithmetic
-		feeRateInt64, _ := feeRateBig.Int64()
+		// VAR path: use int64 arithmetic.
+		feeRateInt64, err := feeRateBig.Int64()
+		if err != nil {
+			return nil, nil, lockedOps, errors.E(op, errors.Invalid,
+				"fee overflow: configured VAR relay fee rate produces a fee that exceeds int64")
+		}
 		feeRate := dcrutil.Amount(feeRateInt64)
 		szEst := txsizes.EstimateSerializeSize(scriptSizes, msgtx.TxOut, 0)
 		feeEst := txrules.FeeForSerializeSize(feeRate, szEst)
-		msgtx.TxOut[0].Value = int64(totalAddedVAR - feeEst)
-		if txrules.IsDustOutput(msgtx.TxOut[0], feeRate) {
-			return nil, errors.E(op, errors.InsufficientBalance)
+		// Inputs do not cover the fee. The subtraction would underflow into
+		// a negative int64, which CheckOutput below would later flag — but
+		// the Policy-classed dust error it produces is misleading here:
+		// the operator's actual problem is "no funds above fee", not
+		// "below dust". Fail upfront with InsufficientBalance.
+		if totalAddedVAR < feeEst {
+			return nil, nil, lockedOps, errors.E(op, errors.InsufficientBalance, errors.Errorf(
+				"consolidation cannot cover fee: VAR inputs total %v, estimated fee %v",
+				totalAddedVAR, feeEst))
 		}
+		msgtx.TxOut[0].Value = int64(totalAddedVAR - feeEst)
+	}
+	if err := txrules.CheckOutput(msgtx.TxOut[0], feeRateBig); err != nil {
+		// CheckOutput returns errors.Policy with a clear message about
+		// dust thresholds. Preserve the Policy classification — operators
+		// who hit dust have funds, just not enough to clear the threshold;
+		// re-tagging as InsufficientBalance ("no funds") is misleading.
+		return nil, nil, lockedOps, errors.E(op, err)
 	}
 
 	err = w.signP2PKHMsgTx(msgtx, forSigning, addrmgrNs)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, nil, lockedOps, errors.E(op, err)
 	}
 	err = validateMsgTx(op, msgtx, creditScripts(forSigning))
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, nil, lockedOps, errors.E(op, err)
 	}
 
-	// checkHighFees uses int64, skip for SKA
-	if !coinType.IsSKA() {
-		err = w.checkHighFees(totalAddedVAR, msgtx)
-		if err != nil {
-			return nil, errors.E(op, err)
-		}
-	}
-
-	err = n.PublishTransactions(ctx, msgtx)
+	err = w.checkHighFees(totalAddedVAR, totalAddedSKA, msgtx)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, nil, lockedOps, errors.E(op, err)
 	}
 
-	// Insert the transaction and credits into the transaction manager.
+	// Record the tx in the wallet DB.  The actual network publish runs
+	// after this walletdb.Update commits — see compressWallet.
 	rec, err := w.insertIntoTxMgr(dbtx, msgtx)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, nil, lockedOps, errors.E(op, err)
 	}
 	err = w.insertCreditsIntoTxMgr(op, dbtx, msgtx, rec)
 	if err != nil {
-		return nil, err
+		return nil, nil, lockedOps, err
 	}
 
 	txHash := msgtx.TxHash()
-	log.Infof("Successfully consolidated funds in transaction %v", &txHash)
-
-	return &txHash, nil
+	return &txHash, msgtx, lockedOps, nil
 }
 
 // makeTicket creates a ticket from a split transaction output.
@@ -1204,7 +1452,11 @@ func makeTicket(params *chaincfg.Params, input *Input, addrVote stdaddr.StakeAdd
 	return mtx, nil
 }
 
-var p2pkhSizedScript = make([]byte, 25)
+// newP2PKHSizedScript returns a fresh 25-byte zero slice sized to a P2PKH
+// script. Each caller gets its own backing array so a downstream writer (e.g.
+// a future mix-client transformation) cannot corrupt sibling outputs through
+// shared state.
+func newP2PKHSizedScript() []byte { return make([]byte, 25) }
 
 func (w *Wallet) mixedSplit(ctx context.Context, req *PurchaseTicketsRequest, neededPerTicket dcrutil.Amount) (tx *wire.MsgTx, outIndexes []int, err error) {
 	// Use txauthor to perform input selection and change amount
@@ -1213,7 +1465,7 @@ func (w *Wallet) mixedSplit(ctx context.Context, req *PurchaseTicketsRequest, ne
 	const ticketCoinType = cointype.CoinTypeVAR
 	mixOut := make([]*wire.TxOut, req.Count)
 	for i := 0; i < req.Count; i++ {
-		mixOut[i] = &wire.TxOut{Value: int64(neededPerTicket), Version: 0, PkScript: p2pkhSizedScript, CoinType: ticketCoinType}
+		mixOut[i] = &wire.TxOut{Value: int64(neededPerTicket), Version: 0, PkScript: newP2PKHSizedScript(), CoinType: ticketCoinType}
 	}
 	relayFee := w.RelayFeeForCoinType(ctx, ticketCoinType)
 	var changeSourceUpdates []func(walletdb.ReadWriteTx) error
@@ -1286,8 +1538,15 @@ func (w *Wallet) mixedSplit(ctx context.Context, req *PurchaseTicketsRequest, ne
 	if atx.ChangeIndex >= 0 {
 		change = atx.Tx.TxOut[atx.ChangeIndex]
 	}
-	// Convert SKAAmount to dcrutil.Amount for smallestMixChange (mixing is VAR-only)
-	relayFeeInt64, _ := relayFee.Int64()
+	// Convert SKAAmount to dcrutil.Amount for smallestMixChange (mixing is VAR-only).
+	// Guard the int64 conversion so a misconfigured VAR relay fee fails loudly
+	// instead of computing a wraparound dust threshold; matches the canonical
+	// guard pattern in wallet/txauthor/author.go (NewUnsignedTransaction).
+	relayFeeInt64, err := relayFee.Int64()
+	if err != nil {
+		return nil, nil, errors.E(errors.Invalid,
+			"fee overflow: configured VAR relay fee rate produces a fee that exceeds int64")
+	}
 	if change != nil && dcrutil.Amount(change.Value) < smallestMixChange(dcrutil.Amount(relayFeeInt64)) {
 		change = nil
 	}
@@ -1408,6 +1667,24 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		return nil, errors.E(op, errors.Invalid, "expiry height must be above next block height")
 	}
 
+	// Pre-flight: staking requires VAR. If the source account holds no VAR
+	// at all (e.g. operator pointed at an SKA-only account), surface an
+	// actionable error here rather than failing late inside mixedSplit /
+	// individualSplit as a generic InsufficientBalance.
+	varBalance, err := w.AccountBalanceByCoinType(ctx, req.SourceAccount, cointype.CoinTypeVAR, req.MinConf)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+	// Check Spendable (not Total): a wallet with all VAR locked in tickets
+	// has Total > 0 but Spendable = 0; the ticket purchase still cannot
+	// fund a new split, and the late mixedSplit/individualSplit failure
+	// reports the same condition with less actionable wording.
+	if varBalance.Spendable == 0 {
+		return nil, errors.E(op, errors.InsufficientBalance,
+			errors.Errorf("source account %d has no spendable VAR; staking requires spendable VAR (cointype %d)",
+				req.SourceAccount, cointype.CoinTypeVAR))
+	}
+
 	stakeAddrFunc := func(op errors.Op, account, branch uint32) (stdaddr.StakeAddress, uint32, error) {
 		const accountName = "" // not used, so can be faked.
 		a, err := w.nextAddress(ctx, op, w.persistReturnedChild(ctx, nil), accountName,
@@ -1473,7 +1750,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		// watching of addresses and outpoints that need to be watched.
 		// A better solution would be to watch for the data first,
 		// before publishing transactions.
-		ctx := context.TODO()
+		ctx := context.Background()
 		_, err := w.watchHDAddrs(ctx, false, n)
 		if err != nil {
 			log.Errorf("Failed to watch for future addresses after ticket "+
@@ -1686,7 +1963,9 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			return nil, err
 		}
 		w.lockedOutpointMu.Lock()
+		var publishHeight int32
 		err = walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+			_, publishHeight = w.txStore.MainChainTip(dbtx)
 			watch, err := w.processTransactionRecord(ctx, dbtx, rec, nil, nil)
 			watchOutPoints = append(watchOutPoints, watch...)
 			return err
@@ -1696,10 +1975,18 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			return nil, err
 		}
 		w.recentlyPublishedMu.Lock()
-		w.recentlyPublished[rec.Hash] = struct{}{}
+		w.markRecentlyPublishedLocked(rec.Hash, publishHeight, splitTx.Expiry)
 		w.recentlyPublishedMu.Unlock()
 		err = n.PublishTransactions(ctx, splitTx)
 		if err != nil {
+			// Match publishAndWatch: keep the wallet's view consistent
+			// with the network by abandoning the locally-recorded but
+			// unpublished transaction.
+			hash := splitTx.TxHash()
+			log.Errorf("Abandoning ticket split %v which failed to publish", &hash)
+			if abandonErr := w.AbandonTransaction(ctx, &hash); abandonErr != nil {
+				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
+			}
 			return nil, err
 		}
 	}
@@ -1725,16 +2012,16 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	// Create each ticket.
 	ticketHashes := make([]*chainhash.Hash, 0, req.Count)
 	tickets := make([]*wire.MsgTx, 0, req.Count)
-	outpoint := wire.OutPoint{Hash: splitTx.TxHash()}
+	splitOutpoint := wire.OutPoint{Hash: splitTx.TxHash()}
 	for _, index := range splitOutputIndexes {
 		// Generate the extended outpoint that we need to use for ticket
 		// input.
 		var eop *Input
-		outpoint.Index = uint32(index)
-		log.Infof("Split output is %v", &outpoint)
+		splitOutpoint.Index = uint32(index)
+		log.Infof("Split output is %v", &splitOutpoint)
 		txOut := splitTx.TxOut[index]
 		eop = &Input{
-			OutPoint: outpoint,
+			OutPoint: splitOutpoint,
 			PrevOut:  *txOut,
 		}
 
@@ -1792,7 +2079,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				return err
 			}
 
-			err = w.checkHighFees(dcrutil.Amount(eop.PrevOut.Value), ticket)
+			err = w.checkHighFees(dcrutil.Amount(eop.PrevOut.Value), cointype.Zero(), ticket)
 			if err != nil {
 				return err
 			}
@@ -1802,6 +2089,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				return err
 			}
 
+			_, publishHeight := w.txStore.MainChainTip(dbtx)
 			watch, err := w.processTransactionRecord(ctx, dbtx, rec, nil, nil)
 			watchOutPoints = append(watchOutPoints, watch...)
 			if err != nil {
@@ -1809,7 +2097,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			}
 
 			w.recentlyPublishedMu.Lock()
-			w.recentlyPublished[rec.Hash] = struct{}{}
+			w.markRecentlyPublishedLocked(rec.Hash, publishHeight, ticket.Expiry)
 			w.recentlyPublishedMu.Unlock()
 
 			return nil
@@ -1846,6 +2134,14 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		// Publish transaction
 		err = n.PublishTransactions(ctx, ticket)
 		if err != nil {
+			// The ticket was already recorded locally before publish;
+			// abandon it so wallet state stays consistent with the
+			// network. Mirrors publishAndWatch.
+			hash := ticket.TxHash()
+			log.Errorf("Abandoning ticket %v which failed to publish", &hash)
+			if abandonErr := w.AbandonTransaction(ctx, &hash); abandonErr != nil {
+				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
+			}
 			return purchaseTicketsResponse, errors.E(op, err)
 		}
 		log.Infof("Published ticket purchase %v", ticket.TxHash())
@@ -2045,7 +2341,7 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 
 		txOut := &wire.TxOut{
 			Value:    int64(output.Amount),
-			Version:  wire.DefaultPkScriptVersion, // XXX
+			Version:  wire.DefaultPkScriptVersion,
 			PkScript: output.PkScript,
 			CoinType: output.CoinType,
 		}
@@ -2186,7 +2482,7 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 	appendInput := func(output *udb.Credit) {
 		txOut := &wire.TxOut{
 			Value:    int64(output.Amount),
-			Version:  wire.DefaultPkScriptVersion, // XXX
+			Version:  wire.DefaultPkScriptVersion,
 			PkScript: output.PkScript,
 			CoinType: output.CoinType,
 		}
@@ -2242,7 +2538,7 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 	}
 
 	eligible = eligible[:0]
-	seen = nil
+	seen = make(map[outpoint]struct{})
 	outTotal = 0
 	outTotalSKA = cointype.Zero()
 	unspent, err := w.txStore.UnspentOutputs(dbtx, coinType)
@@ -2283,25 +2579,36 @@ func (w *Wallet) signP2PKHMsgTx(msgtx *wire.MsgTx, prevOutputs []Input, addrmgrN
 	for i, output := range prevOutputs {
 		_, addrs := stdscript.ExtractAddrs(output.PrevOut.Version, output.PrevOut.PkScript, w.chainParams)
 		if len(addrs) != 1 {
-			continue // not error? errors.E(errors.Bug, "previous output address is not P2PKH")
+			return errors.E(errors.Op("wallet.signP2PKHMsgTx"), errors.Bug,
+				errors.Errorf("input %d: previous output is not a P2PKH script (extracted %d addresses)", i, len(addrs)))
 		}
 		apkh, ok := addrs[0].(*stdaddr.AddressPubKeyHashEcdsaSecp256k1V0)
 		if !ok {
 			return errors.E(errors.Bug, "previous output address is not P2PKH")
 		}
 
-		privKey, done, err := w.manager.PrivateKey(addrmgrNs, apkh)
+		// Wrap each iteration so its decrypted private key is released
+		// (done()) immediately after this input is signed, instead of
+		// accumulating N decrypted secp256k1 keys in memory until the
+		// outer function returns.
+		err := func() error {
+			privKey, done, err := w.manager.PrivateKey(addrmgrNs, apkh)
+			if err != nil {
+				return err
+			}
+			defer done()
+
+			sigscript, err := sign.SignatureScript(msgtx, i, output.PrevOut.PkScript,
+				txscript.SigHashAll, privKey.Serialize(), dcrec.STEcdsaSecp256k1, true)
+			if err != nil {
+				return errors.E(errors.Op("txscript.SignatureScript"), err)
+			}
+			msgtx.TxIn[i].SignatureScript = sigscript
+			return nil
+		}()
 		if err != nil {
 			return err
 		}
-		defer done()
-
-		sigscript, err := sign.SignatureScript(msgtx, i, output.PrevOut.PkScript,
-			txscript.SigHashAll, privKey.Serialize(), dcrec.STEcdsaSecp256k1, true)
-		if err != nil {
-			return errors.E(errors.Op("txscript.SignatureScript"), err)
-		}
-		msgtx.TxIn[i].SignatureScript = sigscript
 	}
 
 	return nil
@@ -2417,7 +2724,7 @@ func createUnsignedVote(ticketHash *chainhash.Hash, ticketPurchase *wire.MsgTx,
 		uint32(blockHeight))
 	vote.AddTxOut(&wire.TxOut{
 		Value:    0,
-		Version:  wire.DefaultPkScriptVersion, // XXX
+		Version:  wire.DefaultPkScriptVersion,
 		PkScript: blockRefScript,
 		CoinType: cointype.CoinTypeVAR, // Votes are VAR-only
 	})
@@ -2429,7 +2736,7 @@ func createUnsignedVote(ticketHash *chainhash.Hash, ticketPurchase *wire.MsgTx,
 	}
 	vote.AddTxOut(&wire.TxOut{
 		Value:    0,
-		Version:  wire.DefaultPkScriptVersion, // XXX
+		Version:  wire.DefaultPkScriptVersion,
 		PkScript: voteScript,
 		CoinType: cointype.CoinTypeVAR, // Votes are VAR-only
 	})
