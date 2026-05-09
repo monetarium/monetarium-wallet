@@ -639,7 +639,7 @@ func TestTxToMultisigInternalSKAFeePreBudget(t *testing.T) {
 func TestTxToMultisigInternalVARFeePreBudget(t *testing.T) {
 	// Stand-in for w.RelayFee() — pick a deliberately non-default rate so
 	// the test fails if the production path silently drops back to a
-	// constant. 1e5 atoms/kB is 10× the static dcrwallet default; an
+	// constant. 1e5 atoms/kB is 10× the upstream Decred wallet default; an
 	// operator setting --minrelaytxfee higher than the default is exactly
 	// the workflow this fix unblocks.
 	relayFee := dcrutil.Amount(1e5)

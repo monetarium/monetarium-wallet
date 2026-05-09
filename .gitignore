@@ -3,7 +3,7 @@ cmd/repaircfilters/repaircfilters
 cmd/sweepaccount/sweepaccount
 cmd/treasurykey/treasurykey
 
-/dcrwallet
+/monwallet
 vendor
 *~
 .vscode
@@ -22,7 +22,7 @@ wallet/udb/*.kv
 *.test
 
 # Prevent binary files in RPC directories
-internal/rpc/*/dcrwallet
+internal/rpc/*/monwallet
 
 # Binaries
 monetarium-wallet
@@ -33,5 +33,5 @@ monetarium-wallet
 go.work
 go.work.sum
 WALLET_MAINNET_SETUP.md
-dcrwallet.sample.conf
+monwallet.sample.conf
 mainnet-wallet.conf

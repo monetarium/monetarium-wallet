@@ -71,7 +71,7 @@ func displaySimnetMiningAddrs(seed []byte, imported bool) error {
 
 	fmt.Println("")
 	fmt.Println("NOTE: only start the wallet after at least 2 blocks (i.e. blocks at heights 1")
-	fmt.Println("and 2) have been mined in the backing dcrd node, otherwise account and address")
+	fmt.Println("and 2) have been mined in the backing mond node, otherwise account and address")
 	fmt.Println("discovery may not work correctly.")
 	fmt.Println("")
 

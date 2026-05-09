@@ -3499,7 +3499,7 @@ func ticketChangeMatured(params *chaincfg.Params, txHeight, curHeight int32) boo
 // ticketMatured returns whether a ticket mined at txHeight has
 // reached ticket maturity in a chain with a tip height curHeight.
 func ticketMatured(params *chaincfg.Params, txHeight, curHeight int32) bool {
-	// dcrd has an off-by-one in the calculation of the ticket
+	// mond has an off-by-one in the calculation of the ticket
 	// maturity, which results in maturity being one block higher
 	// than the params would indicate.
 	return txHeight >= 0 && curHeight-txHeight > int32(params.TicketMaturity)
@@ -4077,7 +4077,7 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 				creditHasExpiry := fetchRawCreditHasExpiry(cVal, DBVersion)
 
 				// Outputs with expiry require maturity like coinbase.
-				// dcrd enforces CoinbaseMaturity for any output with expiry set.
+				// mond enforces CoinbaseMaturity for any output with expiry set.
 				requiresMaturity := creditFromCoinbase || creditHasExpiry
 				matureOutput := (requiresMaturity &&
 					coinbaseMatured(s.chainParams, height, syncHeight))
@@ -4253,7 +4253,7 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 				creditHasExpiry := fetchRawCreditHasExpiry(cVal, DBVersion)
 
 				// Outputs with expiry (like SKA emissions) require maturity like coinbase.
-				// dcrd enforces CoinbaseMaturity for any output with expiry set.
+				// mond enforces CoinbaseMaturity for any output with expiry set.
 				requiresMaturity := creditFromCoinbase || creditHasExpiry
 				matureOutput := (requiresMaturity &&
 					coinbaseMatured(s.chainParams, height, syncHeight))

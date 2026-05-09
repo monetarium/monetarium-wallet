@@ -9,11 +9,11 @@
 // Full documentation of the API implemented by this package is maintained in a
 // language-agnostic document:
 //
-//	https://github.com/decred/dcrwallet/blob/master/rpc/documentation/api.md
+//	https://github.com/decred/monwallet/blob/master/rpc/documentation/api.md
 //
 // Any API changes must be performed according to the steps listed here:
 //
-//	https://github.com/decred/dcrwallet/blob/master/rpc/documentation/serverchanges.md
+//	https://github.com/decred/monwallet/blob/master/rpc/documentation/serverchanges.md
 package rpcserver
 
 import (
@@ -175,7 +175,7 @@ type walletServer struct {
 }
 
 // loaderServer provides RPC clients with the ability to load and close wallets,
-// as well as establishing a RPC connection to a dcrd consensus server.
+// as well as establishing a RPC connection to a mond consensus server.
 type loaderServer struct {
 	ready     atomic.Uint32
 	loader    *loader.Loader
@@ -1635,7 +1635,7 @@ func (s *walletServer) GetTicket(ctx context.Context, req *pb.GetTicketRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
-	// The dcrd client could be nil here if the network backend is not
+	// The mond client could be nil here if the network backend is not
 	// the consensus rpc client.  This is fine since the chain client is
 	// optional.
 	n, _ := s.wallet.NetworkBackend()

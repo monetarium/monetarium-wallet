@@ -275,7 +275,7 @@ func TxPaysHighFees(tx *wire.MsgTx) (bool, error) {
 // SKA1 mainnet with MinRelayTxFee=4e18 and MaxFeeMultiplier=2500 that floor is
 // 1e22 atoms (10000 SKA). The function therefore does not flag txs paying less
 // than that absolute amount, even when their fee-rate per-kB is many multiples
-// of MinRelayTxFee. This matches dcrwallet's VAR PaysHighFees behavior at the
+// of MinRelayTxFee. This matches upstream Decred wallet's VAR PaysHighFees behavior at the
 // small-tx end and is intentional — the gate is a sanity check on grossly
 // overpaying transactions, not a fee-rate ceiling.
 //

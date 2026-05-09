@@ -9,7 +9,7 @@ package rpchelp
 
 import (
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 )
 
 // Common return types.
@@ -51,12 +51,12 @@ var Methods = []struct {
 	{"getaddressesbyaccount", returnsStringArray},
 	{"getbalance", []any{(*types.GetBalanceResult)(nil)}},
 	{"getcoinbalance", []any{(*types.GetCoinBalanceResult)(nil)}},
-	{"getbestblock", []any{(*dcrdtypes.GetBestBlockResult)(nil)}},
+	{"getbestblock", []any{(*mondtypes.GetBestBlockResult)(nil)}},
 	{"getbestblockhash", returnsString},
 	{"getblockcount", returnsNumber},
 	{"getblockhash", returnsString},
-	{"getblockheader", []any{(*dcrdtypes.GetBlockHeaderVerboseResult)(nil)}},
-	{"getblock", []any{(*dcrdtypes.GetBlockVerboseResult)(nil)}},
+	{"getblockheader", []any{(*mondtypes.GetBlockHeaderVerboseResult)(nil)}},
+	{"getblock", []any{(*mondtypes.GetBlockVerboseResult)(nil)}},
 	{"getcoinjoinsbyacct", []any{(*map[string]uint32)(nil)}},
 	{"getcurrentnet", []any{(*uint32)(nil)}},
 	{"getinfo", []any{(*types.InfoWalletResult)(nil)}},
@@ -70,7 +70,7 @@ var Methods = []struct {
 	{"getstakeinfo", []any{(*types.GetStakeInfoResult)(nil)}},
 	{"gettickets", []any{(*types.GetTicketsResult)(nil)}},
 	{"gettransaction", []any{(*types.GetTransactionResult)(nil)}},
-	{"gettxout", []any{(*dcrdtypes.GetTxOutResult)(nil)}},
+	{"gettxout", []any{(*mondtypes.GetTxOutResult)(nil)}},
 	{"getunconfirmedbalance", returnsNumber},
 	{"getvotechoices", []any{(*types.GetVoteChoicesResult)(nil)}},
 	{"getvotefeeconsolidationaddress", []any{(*types.GetVoteFeeConsolidationAddressResult)(nil)}},
@@ -88,7 +88,7 @@ var Methods = []struct {
 	{"listaddresstransactions", returnsLTRArray},
 	{"listalltransactions", returnsLTRArray},
 	{"listcointypes", []any{(*types.ListCoinTypesResult)(nil)}},
-	{"listlockunspent", []any{(*[]dcrdtypes.TransactionInput)(nil)}},
+	{"listlockunspent", []any{(*[]mondtypes.TransactionInput)(nil)}},
 	{"listreceivedbyaccount", []any{(*[]types.ListReceivedByAccountResult)(nil)}},
 	{"listreceivedbyaddress", []any{(*[]types.ListReceivedByAddressResult)(nil)}},
 	{"listsinceblock", []any{(*types.ListSinceBlockResult)(nil)}},
@@ -131,7 +131,7 @@ var Methods = []struct {
 	{"unlockaccount", nil},
 	{"validateaddress", []any{(*types.ValidateAddressWalletResult)(nil)}},
 	{"verifymessage", returnsBool},
-	{"version", []any{(*map[string]dcrdtypes.VersionResult)(nil)}},
+	{"version", []any{(*map[string]mondtypes.VersionResult)(nil)}},
 	{"walletinfo", []any{(*types.WalletInfoResult)(nil)}},
 	{"walletislocked", returnsBool},
 	{"walletlock", nil},

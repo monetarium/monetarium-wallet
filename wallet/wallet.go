@@ -23,7 +23,7 @@ import (
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/internal/compat"
 	"github.com/monetarium/monetarium-wallet/internal/loggers"
-	"github.com/monetarium/monetarium-wallet/rpc/client/dcrd"
+	"github.com/monetarium/monetarium-wallet/rpc/client/mond"
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-wallet/validate"
 	"github.com/monetarium/monetarium-wallet/wallet/txauthor"
@@ -45,7 +45,7 @@ import (
 	"github.com/monetarium/monetarium-node/hdkeychain"
 	"github.com/monetarium/monetarium-node/mixing/mixclient"
 	"github.com/monetarium/monetarium-node/mixing/mixpool"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/sign"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
@@ -1301,7 +1301,7 @@ func (w *Wallet) ClearManualFee(ct cointype.CoinType) {
 	w.feesMu.Unlock()
 }
 
-// queryDynamicFee queries dcrd RPC for current dynamic fee estimate.
+// queryDynamicFee queries mond RPC for current dynamic fee estimate.
 // Returns fee as SKAAmount (big.Int) to support both VAR and SKA coins.
 func (w *Wallet) queryDynamicFee(ctx context.Context, ct cointype.CoinType) (cointype.SKAAmount, error) {
 	n, err := w.NetworkBackend()
@@ -2096,7 +2096,7 @@ func log2(x int) int {
 }
 
 // BlockLocators returns block locators, suitable for use in a getheaders wire
-// message or dcrd JSON-RPC request, for the blocks in sidechain and saved in
+// message or mond JSON-RPC request, for the blocks in sidechain and saved in
 // the wallet's main chain.  For memory and lookup efficiency, many older hashes
 // are skipped, with increasing gaps between included hashes.
 //
@@ -2787,7 +2787,7 @@ func (w *Wallet) ListCoinTypes(ctx context.Context, confirms int32) ([]cointype.
 
 // CurrentAddress gets the most recently requested payment address from a wallet.
 // If the address has already been used (there is at least one transaction
-// spending to it in the blockchain or dcrd mempool), the next chained address
+// spending to it in the blockchain or mond mempool), the next chained address
 // is returned.
 func (w *Wallet) CurrentAddress(account uint32) (stdaddr.Address, error) {
 	const op errors.Op = "wallet.CurrentAddress"
@@ -2816,7 +2816,7 @@ func (w *Wallet) CurrentAddress(account uint32) (stdaddr.Address, error) {
 // from a wallet and persists it to the database. This ensures the address
 // appears in getaddressesbyaccount and can receive funds.
 // If the address has already been used (there is at least one transaction
-// spending to it in the blockchain or dcrd mempool), the next chained address
+// spending to it in the blockchain or mond mempool), the next chained address
 // is returned.
 func (w *Wallet) CurrentAddressAndPersist(ctx context.Context, account uint32) (stdaddr.Address, error) {
 	const op errors.Op = "wallet.CurrentAddressAndPersist"
@@ -3874,7 +3874,7 @@ const (
 	TicketStatusRevoked // revoked
 )
 
-func makeTicketSummary(rpc *dcrd.RPC, dbtx walletdb.ReadTx, w *Wallet,
+func makeTicketSummary(rpc *mond.RPC, dbtx walletdb.ReadTx, w *Wallet,
 	details *udb.TicketDetails) *TicketSummary {
 
 	ticketHeight := details.Ticket.Height()
@@ -3933,7 +3933,7 @@ func makeTicketSummary(rpc *dcrd.RPC, dbtx walletdb.ReadTx, w *Wallet,
 // the ability to use the rpc chain client, this function is able to determine
 // whether a ticket has been missed or not.  Otherwise, it is just known to be
 // unspent (possibly live or missed).
-func (w *Wallet) GetTicketInfoPrecise(ctx context.Context, rpc *dcrd.RPC, hash *chainhash.Hash) (*TicketSummary, *wire.BlockHeader, error) {
+func (w *Wallet) GetTicketInfoPrecise(ctx context.Context, rpc *mond.RPC, hash *chainhash.Hash) (*TicketSummary, *wire.BlockHeader, error) {
 	const op errors.Op = "wallet.GetTicketInfoPrecise"
 
 	var ticketSummary *TicketSummary
@@ -4088,7 +4088,7 @@ func (w *Wallet) blockRange(dbtx walletdb.ReadTx, startBlock, endBlock *BlockIde
 // the ability to use the rpc chain client, this function is able to determine
 // whether tickets have been missed or not.  Otherwise, tickets are just known
 // to be unspent (possibly live or missed).
-func (w *Wallet) GetTicketsPrecise(ctx context.Context, rpc *dcrd.RPC,
+func (w *Wallet) GetTicketsPrecise(ctx context.Context, rpc *mond.RPC,
 	f func([]*TicketSummary, *wire.BlockHeader) (bool, error),
 	startBlock, endBlock *BlockIdentifier) error {
 
@@ -5196,7 +5196,7 @@ func (w *Wallet) StakeInfo(ctx context.Context) (*StakeInfoData, error) {
 
 // StakeInfoPrecise collects and returns staking statistics for this wallet.  It
 // uses RPC to query further information than StakeInfo.
-func (w *Wallet) StakeInfoPrecise(ctx context.Context, rpc *dcrd.RPC) (*StakeInfoData, error) {
+func (w *Wallet) StakeInfoPrecise(ctx context.Context, rpc *mond.RPC) (*StakeInfoData, error) {
 	const op errors.Op = "wallet.StakeInfoPrecise"
 
 	res := &StakeInfoData{}
@@ -5376,7 +5376,7 @@ func (w *Wallet) ResetLockedOutpoints() {
 // LockedOutpoints returns a slice of currently locked outpoints.  This is
 // intended to be used by marshaling the result as a JSON array for
 // listlockunspent RPC results.
-func (w *Wallet) LockedOutpoints(ctx context.Context, accountName string) ([]dcrdtypes.TransactionInput, error) {
+func (w *Wallet) LockedOutpoints(ctx context.Context, accountName string) ([]mondtypes.TransactionInput, error) {
 	w.lockedOutpointMu.Lock()
 	allLocked := make([]outpoint, len(w.lockedOutpoints))
 	i := 0
@@ -5387,7 +5387,7 @@ func (w *Wallet) LockedOutpoints(ctx context.Context, accountName string) ([]dcr
 	w.lockedOutpointMu.Unlock()
 
 	allAccts := accountName == "" || accountName == "*"
-	acctLocked := make([]dcrdtypes.TransactionInput, 0, len(allLocked))
+	acctLocked := make([]mondtypes.TransactionInput, 0, len(allLocked))
 	err := walletdb.View(ctx, w.db, func(tx walletdb.ReadTx) error {
 		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
@@ -5433,7 +5433,7 @@ func (w *Wallet) LockedOutpoints(ctx context.Context, accountName string) ([]dcr
 			if details.TxType != stake.TxTypeRegular {
 				tree = 1
 			}
-			acctLocked = append(acctLocked, dcrdtypes.TransactionInput{
+			acctLocked = append(acctLocked, mondtypes.TransactionInput{
 				Amount: dcrutil.Amount(output.Value).ToCoin(),
 				Txid:   op.hash.String(),
 				Vout:   op.index,
@@ -5525,7 +5525,7 @@ func ticketChangeMatured(params *chaincfg.Params, txHeight, curHeight int32) boo
 // ticketMatured returns whether a ticket mined at txHeight has
 // reached ticket maturity in a chain with a tip height curHeight.
 func ticketMatured(params *chaincfg.Params, txHeight, curHeight int32) bool {
-	// dcrd has an off-by-one in the calculation of the ticket
+	// mond has an off-by-one in the calculation of the ticket
 	// maturity, which results in maturity being one block higher
 	// than the params would indicate.
 	return txHeight >= 0 && curHeight-txHeight > int32(params.TicketMaturity)

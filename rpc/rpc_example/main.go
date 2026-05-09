@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/monetarium/monetarium-wallet/rpc/client/dcrwallet"
+	"github.com/monetarium/monetarium-wallet/rpc/client/monwallet"
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/dcrutil"
@@ -34,7 +34,7 @@ func main() {
 	os.Exit(0)
 }
 
-func connectWallet(host, user, pass, certFile string) (*dcrwallet.Client, error) {
+func connectWallet(host, user, pass, certFile string) (*monwallet.Client, error) {
 	cert, err := os.ReadFile(certFile)
 	if err != nil {
 		return nil, err
@@ -50,7 +50,7 @@ func connectWallet(host, user, pass, certFile string) (*dcrwallet.Client, error)
 	if err != nil {
 		return nil, err
 	}
-	return dcrwallet.NewClient(dcrwallet.RawRequestCaller(client), params), nil
+	return monwallet.NewClient(monwallet.RawRequestCaller(client), params), nil
 }
 
 func run() error {

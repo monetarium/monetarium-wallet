@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/monetarium/monetarium-wallet/errors"
-	"github.com/monetarium/monetarium-wallet/rpc/client/dcrd"
+	"github.com/monetarium/monetarium-wallet/rpc/client/mond"
 	"github.com/monetarium/monetarium-wallet/validate"
 	"github.com/monetarium/monetarium-wallet/wallet"
 	"github.com/monetarium/monetarium-node/blockchain/stake"
@@ -33,14 +33,14 @@ import (
 var requiredAPIVersion = semver{Major: 8, Minor: 3, Patch: 0}
 
 // Syncer implements wallet synchronization services by processing
-// notifications from a dcrd JSON-RPC server.
+// notifications from a mond JSON-RPC server.
 type Syncer struct {
 	atomicWalletSynced     atomic.Uint32 // CAS (synced=1) when wallet syncing complete
 	atomicTargetSyncHeight atomic.Int32
 
 	wallet   *wallet.Wallet
 	opts     *RPCOptions
-	rpc      *dcrd.RPC
+	rpc      *mond.RPC
 	notifier *notifier
 
 	blake256Hasher   hash.Hash
@@ -62,7 +62,7 @@ type Syncer struct {
 }
 
 // RPCOptions specifies the network and security settings for establishing a
-// websocket connection to a dcrd JSON-RPC server.
+// websocket connection to a mond JSON-RPC server.
 type RPCOptions struct {
 	Address     string
 	DefaultPort string
@@ -75,7 +75,7 @@ type RPCOptions struct {
 	Insecure    bool
 }
 
-// NewSyncer creates a Syncer that will sync the wallet using dcrd JSON-RPC.
+// NewSyncer creates a Syncer that will sync the wallet using mond JSON-RPC.
 func NewSyncer(w *wallet.Wallet, r *RPCOptions) *Syncer {
 	return &Syncer{
 		wallet:         w,
@@ -110,8 +110,8 @@ func (s *Syncer) SetCallbacks(cb *Callbacks) {
 	s.cb = cb
 }
 
-// RPC returns the JSON-RPC client to the underlying dcrd node.
-func (s *Syncer) RPC() *dcrd.RPC {
+// RPC returns the JSON-RPC client to the underlying mond node.
+func (s *Syncer) RPC() *mond.RPC {
 	return s.rpc
 }
 
@@ -407,8 +407,8 @@ func (s *Syncer) getHeaders(ctx context.Context) error {
 	return nil
 }
 
-// getMissingHeaders fetches missing headers one by one from dcrd. This assumes
-// that the initial header sync and rescan have been performed and that dcrd's
+// getMissingHeaders fetches missing headers one by one from mond. This assumes
+// that the initial header sync and rescan have been performed and that mond's
 // data filter (for block rescans) has been loaded.
 //
 // This falls back to doing a full getHeaders process when a large number of
@@ -433,7 +433,7 @@ func (s *Syncer) getMissingHeaders(ctx context.Context) error {
 		return s.getHeaders(ctx)
 	}
 
-	// Perform a rescan of this block on dcrd's side, to have the same data
+	// Perform a rescan of this block on mond's side, to have the same data
 	// as if it had been received from a blockConnected notification.
 	//
 	// This must be done one by one because a new block might have
@@ -489,11 +489,11 @@ func (s *Syncer) waitRPCSync(ctx context.Context, minHeight int64) error {
 			minHeight = info.Headers
 		}
 		if info.Blocks >= minHeight && (isSimnet || !info.InitialBlockDownload) {
-			// dcrd is synced.
+			// mond is synced.
 			return nil
 		}
 
-		log.Infof("Waiting for MONN instance to catch up to minimum block "+
+		log.Infof("Waiting for MOND instance to catch up to minimum block "+
 			"height %d (%d blocks, %d headers, chain synced=%v)",
 			minHeight, info.Blocks, info.Headers, !info.InitialBlockDownload)
 
@@ -519,7 +519,7 @@ var hashStop chainhash.Hash
 // Run synchronizes the wallet, returning when synchronization fails or the
 // context is cancelled.  If startupSync is true, all synchronization tasks
 // needed to fully register the wallet for notifications and synchronize it with
-// the dcrd server are performed.  Otherwise, it will listen for notifications
+// the mond server are performed.  Otherwise, it will listen for notifications
 // but not register for any updates.
 func (s *Syncer) Run(ctx context.Context) (err error) {
 	defer func() {
@@ -596,7 +596,7 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 		return err
 	}
 	defer wsClient.Close()
-	s.rpc = dcrd.New(wsClient)
+	s.rpc = mond.New(wsClient)
 
 	// Verify that the server is running on the expected network.
 	var netID wire.CurrencyNet
@@ -830,7 +830,7 @@ func (n *notifier) Close() error {
 }
 
 func (s *Syncer) winningTickets(ctx context.Context, params json.RawMessage) error {
-	block, height, winners, err := dcrd.WinningTickets(params)
+	block, height, winners, err := mond.WinningTickets(params)
 	if err != nil {
 		return err
 	}
@@ -838,7 +838,7 @@ func (s *Syncer) winningTickets(ctx context.Context, params json.RawMessage) err
 }
 
 func (s *Syncer) blockConnected(ctx context.Context, params json.RawMessage) error {
-	header, relevant, err := dcrd.BlockConnected(params)
+	header, relevant, err := mond.BlockConnected(params)
 	if err != nil {
 		return err
 	}
@@ -924,7 +924,7 @@ func (s *Syncer) handleBlockConnected(ctx context.Context, header *wire.BlockHea
 }
 
 func (s *Syncer) relevantTxAccepted(ctx context.Context, params json.RawMessage) error {
-	tx, err := dcrd.RelevantTxAccepted(params)
+	tx, err := mond.RelevantTxAccepted(params)
 	if err != nil {
 		return err
 	}
@@ -935,7 +935,7 @@ func (s *Syncer) relevantTxAccepted(ctx context.Context, params json.RawMessage)
 }
 
 func (s *Syncer) storeTSpend(ctx context.Context, params json.RawMessage) error {
-	tx, err := dcrd.TSpend(params)
+	tx, err := mond.TSpend(params)
 	if err != nil {
 		return err
 	}
@@ -948,7 +948,7 @@ func (s *Syncer) mixMessage(ctx context.Context, params json.RawMessage) error {
 		return nil
 	}
 
-	msg, err := dcrd.MixMessage(params)
+	msg, err := mond.MixMessage(params)
 	if err != nil {
 		return err
 	}

@@ -1,4 +1,4 @@
-package dcrwallet
+package monwallet
 
 import (
 	"context"
@@ -51,7 +51,7 @@ func (r *rawRequester) Call(ctx context.Context, method string, res any, args ..
 	return json.Unmarshal(resp, res)
 }
 
-// Client provides convenience methods for type-safe dcrwallet JSON-RPC usage.
+// Client provides convenience methods for type-safe monwallet JSON-RPC usage.
 type Client struct {
 	Caller
 	net *chaincfg.Params

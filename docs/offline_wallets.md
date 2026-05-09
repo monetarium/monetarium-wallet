@@ -11,7 +11,7 @@ account as an argument.
 A wallet is then created using the public key, by the following command:
 
 ```
-dcrwallet --create --createwatchingonly
+monwallet --create --createwatchingonly
 ```
 
 This wallet can safely be connected to an online daemon and used to monitor the 
@@ -31,11 +31,11 @@ losing other funds from the cold wallet.
 
 A tool has been created to help easily move offline funds on *nix machines. 
 This tool is located in cmd/movefunds and can be installed as follows, 
-granted that dcrd and dcrwallet are installed and vendored dependencies 
+granted that mond and monwallet are installed and vendored dependencies 
 are up to date with dep:
 
 ```
-cd $GOPATH/src/github.com/dcrwallet/cmd/movefunds
+cd $GOPATH/src/github.com/monwallet/cmd/movefunds
 go install
 ```
 
@@ -62,7 +62,7 @@ the following procedure can be done:
 2. Open unspent.json and remove any outputs you do not want to spend.
 
 3. Open a terminal and change directory to where unspent.json is. Then, copy 
-    config.json from $GOPATH/src/github.com/dcrwallet/cmd/movefunds to 
+    config.json from $GOPATH/src/github.com/monwallet/cmd/movefunds to 
 	this directory.
 	```
 	cp $GOPATH/src/github.com/monetarium/monetarium-wallet/cmd/movefunds/config.json config.json

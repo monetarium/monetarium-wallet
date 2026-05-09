@@ -45,7 +45,7 @@ const (
 	// maxStandardTxSize is the maximum size allowed for transactions that
 	// are considered standard and will therefore be relayed and considered
 	// for mining.
-	// TODO: import from dcrd.
+	// TODO: import from mond.
 	maxStandardTxSize = 100000
 
 	// sanityVerifyFlags are the flags used to enable and disable features of
@@ -838,7 +838,7 @@ func (w *Wallet) txToMultisig(ctx context.Context, op errors.Op, account uint32,
 		return nil, nil, nil, errors.E(op, err)
 	}
 
-	// Request updates from dcrd for new transactions sent to this script
+	// Request updates from mond for new transactions sent to this script
 	// hash address.  Match publishAndWatch's log-and-continue policy: a
 	// LoadTxFilter failure should not retroactively invalidate an
 	// already-published transaction.
@@ -2784,7 +2784,7 @@ func createUnsignedVote(ticketHash *chainhash.Hash, ticketPurchase *wire.MsgTx,
 	// Note: Non-VAR (SKA) coin type fee rewards are distributed through separate
 	// SSFee transactions created by the mining code, not through vote outputs.
 	// Votes only contain VAR rewards (stake return + subsidy + VAR fees).
-	// See dcrd/internal/mining/mining.go createSSFeeTx() for SKA fee distribution.
+	// See mond/internal/mining/mining.go createSSFeeTx() for SKA fee distribution.
 
 	// Add SSFee consolidation address output (REQUIRED)
 	// This output tells miners where to send batched SSFee UTXOs for this voter.

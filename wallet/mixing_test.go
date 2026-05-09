@@ -76,7 +76,7 @@ func TestIsMixTx(t *testing.T) {
 }
 
 const (
-	// https://dcrdata.decred.org/tx/ab70b9b3fc88feb7be0c1a1b9ba47cac9dea10f158911fd9cfaf3af3f80878f3
+	// https://mondata.decred.org/tx/ab70b9b3fc88feb7be0c1a1b9ba47cac9dea10f158911fd9cfaf3af3f80878f3
 	// Monetarium format with CoinType byte in TxOut
 	mix0Hex = "010000000774cfd12c8a901bd9b0e5cd972c138e181339f3eef3429928e10851ca0bf436d3060000" +
 		"00000000000074cfd12c8a901bd9b0e5cd972c138e181339f3eef3429928e10851ca0bf436d30d00" +

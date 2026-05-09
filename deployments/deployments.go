@@ -9,7 +9,7 @@ import (
 
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-node/chaincfg"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/wire"
 )
 
@@ -118,8 +118,8 @@ func (d *HardcodedDeployment) Active(height int32, net wire.CurrencyNet) bool {
 }
 
 const (
-	lockedinStatus = dcrdtypes.AgendaInfoStatusLockedIn
-	activeStatus   = dcrdtypes.AgendaInfoStatusActive
+	lockedinStatus = mondtypes.AgendaInfoStatusLockedIn
+	activeStatus   = mondtypes.AgendaInfoStatusActive
 )
 
 // Querier defines the interface for a chain backend that can (trustfully)
@@ -127,7 +127,7 @@ const (
 type Querier interface {
 	// Deployments should return information about existing agendas,
 	// including their deployment status.
-	Deployments(context.Context) (map[string]dcrdtypes.AgendaInfo, error)
+	Deployments(context.Context) (map[string]mondtypes.AgendaInfo, error)
 }
 
 // DCP0010Active returns whether the consensus rules for the next block with the

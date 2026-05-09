@@ -32,7 +32,7 @@ func testWalletConfig() *wallet.Config {
 func setupTestWallet(ctx context.Context, t *testing.T) (*wallet.Wallet, func()) {
 	cfg := testWalletConfig()
 
-	f, err := os.CreateTemp(t.TempDir(), "dcrwallet.integtest")
+	f, err := os.CreateTemp(t.TempDir(), "monwallet.integtest")
 	if err != nil {
 		t.Fatal(err)
 	}

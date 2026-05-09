@@ -338,7 +338,7 @@ or upon received an error.
 
 - `string network_address`: The host/IP and optional port of the RPC server to
   connect to.  IP addresses may be IPv4 or IPv6.  If the port is missing, a
-  default port is chosen corresponding to the default dcrd RPC port of the
+  default port is chosen corresponding to the default mond RPC port of the
   active Decred network.
 
 - `string username`: The RPC username required to authenticate to the RPC
@@ -2594,7 +2594,7 @@ by the private passphrase.  This does not affect any other accounts.
 #### `GetTrackedVSPTickets`
 
 The `GetTrackedVSPTickets` request returns the list of tickets currently tracked
-by the VSP client inside dcrwallet. This only applies to tickets purchased
+by the VSP client inside monwallet. This only applies to tickets purchased
 following the new vspd mode.
 
 **Request** `GetTrackedVSPTicketsRequest`
@@ -3037,7 +3037,7 @@ perform actions in the P2P network related to blockchain data not necessarily
 tracked by the wallet.
 
 In order to use this service, the wallet must have already been loaded. Most
-operations fail if the wallet is not connected to an underlying dcrd instance
+operations fail if the wallet is not connected to an underlying mond instance
 (when running in regular RPC mode) or to remote peers (when running in SPV mode).
 
 **Methods**

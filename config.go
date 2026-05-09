@@ -39,7 +39,7 @@ const (
 )
 
 const (
-	defaultCAFilename              = "dcrd.cert"
+	defaultCAFilename              = "mond.cert"
 	defaultConfigFilename          = "monetarium-wallet.conf"
 	defaultLogLevel                = "info"
 	defaultLogDirname              = "logs"
@@ -70,13 +70,13 @@ const (
 )
 
 var (
-	dcrdDefaultCAFile         = filepath.Join(dcrutil.AppDataDir("monetarium", false), "rpc.cert")
+	mondDefaultCAFile         = filepath.Join(dcrutil.AppDataDir("monetarium", false), "rpc.cert")
 	defaultAppDataDir         = dcrutil.AppDataDir("monetarium-wallet", false)
 	defaultConfigFile         = filepath.Join(defaultAppDataDir, defaultConfigFilename)
 	defaultRPCKeyFile         = filepath.Join(defaultAppDataDir, "rpc.key")
 	defaultRPCCertFile        = filepath.Join(defaultAppDataDir, "rpc.cert")
-	defaultDcrdClientCertFile = filepath.Join(defaultAppDataDir, "dcrd-client.cert")
-	defaultDcrdClientKeyFile  = filepath.Join(defaultAppDataDir, "dcrd-client.key")
+	defaultMondClientCertFile = filepath.Join(defaultAppDataDir, "mond-client.cert")
+	defaultMondClientKeyFile  = filepath.Join(defaultAppDataDir, "mond-client.key")
 	defaultRPCClientCAFile    = filepath.Join(defaultAppDataDir, "clients.pem")
 	defaultLogDir             = filepath.Join(defaultAppDataDir, defaultLogDirname)
 )
@@ -117,15 +117,15 @@ type config struct {
 	DisableCoinTypeUpgrades bool                `long:"disablecointypeupgrades" description:"Never upgrade from legacy to SLIP0044 coin type keys"`
 
 	// RPC client options
-	RPCConnect       string                  `short:"c" long:"rpcconnect" description:"Network address of MONN RPC server"`
-	CAFile           *cfgutil.ExplicitString `long:"cafile" description:"MONN RPC Certificate Authority"`
+	RPCConnect       string                  `short:"c" long:"rpcconnect" description:"Network address of MOND RPC server"`
+	CAFile           *cfgutil.ExplicitString `long:"cafile" description:"MOND RPC Certificate Authority"`
 	ClientCAFile     *cfgutil.ExplicitString `long:"clientcafile" description:"Certficate Authority to verify TLS client certificates"`
-	DisableClientTLS bool                    `long:"noclienttls" description:"Disable TLS for MONN RPC; only allowed when connecting to localhost"`
-	DcrdUsername     string                  `long:"dcrdusername" description:"MONN RPC username; overrides --username"`
-	DcrdPassword     string                  `long:"dcrdpassword" default-mask:"-" description:"MONN RPC password; overrides --password"`
-	DcrdClientCert   *cfgutil.ExplicitString `long:"dcrdclientcert" description:"TLS client certificate to present to authenticate RPC connections to MONN"`
-	DcrdClientKey    *cfgutil.ExplicitString `long:"dcrdclientkey" description:"Key for MONN RPC client certificate"`
-	DcrdAuthType     string                  `long:"dcrdauthtype" description:"Method for MONN JSON-RPC client authentication (basic or clientcert)"`
+	DisableClientTLS bool                    `long:"noclienttls" description:"Disable TLS for MOND RPC; only allowed when connecting to localhost"`
+	MondUsername     string                  `long:"mondusername" description:"MOND RPC username; overrides --username"`
+	MondPassword     string                  `long:"mondpassword" default-mask:"-" description:"MOND RPC password; overrides --password"`
+	MondClientCert   *cfgutil.ExplicitString `long:"mondclientcert" description:"TLS client certificate to present to authenticate RPC connections to MOND"`
+	MondClientKey    *cfgutil.ExplicitString `long:"mondclientkey" description:"Key for MOND RPC client certificate"`
+	MondAuthType     string                  `long:"mondauthtype" description:"Method for MOND JSON-RPC client authentication (basic or clientcert)"`
 
 	// Proxy and Tor settings
 	Proxy        string `long:"proxy" description:"Establish network connections and DNS lookups through a SOCKS5 proxy (e.g. 127.0.0.1:9050)"`
@@ -133,7 +133,7 @@ type config struct {
 	ProxyPass    string `long:"proxypass" default-mask:"-" description:"Proxy server password"`
 	CircuitLimit int    `long:"circuitlimit" description:"Set maximum number of open Tor circuits; used only when --torisolation is enabled"`
 	TorIsolation bool   `long:"torisolation" description:"Enable Tor stream isolation by randomizing user credentials for each connection"`
-	NoDcrdProxy  bool   `long:"nodcrdproxy" description:"Never use configured proxy to dial dcrd websocket connectons"`
+	NoMondProxy  bool   `long:"nomondproxy" description:"Never use configured proxy to dial mond websocket connectons"`
 	dial         func(ctx context.Context, network, address string) (net.Conn, error)
 	lookup       func(name string) ([]net.IP, error)
 
@@ -157,8 +157,8 @@ type config struct {
 	NoLegacyRPC            bool                    `long:"nolegacyrpc" description:"Disable JSON-RPC server"`
 	LegacyRPCMaxClients    int64                   `long:"rpcmaxclients" description:"Max JSON-RPC HTTP POST clients"`
 	LegacyRPCMaxWebsockets int64                   `long:"rpcmaxwebsockets" description:"Max JSON-RPC websocket clients"`
-	Username               string                  `short:"u" long:"username" description:"JSON-RPC username and default dcrd RPC username"`
-	Password               string                  `short:"P" long:"password" default-mask:"-" description:"JSON-RPC password and default dcrd RPC password"`
+	Username               string                  `short:"u" long:"username" description:"JSON-RPC username and default mond RPC username"`
+	Password               string                  `short:"P" long:"password" default-mask:"-" description:"JSON-RPC password and default mond RPC password"`
 	JSONRPCAuthType        string                  `long:"jsonrpcauthtype" description:"Method for JSON-RPC client authentication (basic or clientcert)"`
 
 	// IPC options
@@ -352,8 +352,8 @@ func loadConfig(ctx context.Context) (*config, []string, error) {
 		WalletPass:              wallet.InsecurePubPassphrase,
 		CAFile:                  cfgutil.NewExplicitString(""),
 		ClientCAFile:            cfgutil.NewExplicitString(defaultRPCClientCAFile),
-		DcrdClientCert:          cfgutil.NewExplicitString(defaultDcrdClientCertFile),
-		DcrdClientKey:           cfgutil.NewExplicitString(defaultDcrdClientKeyFile),
+		MondClientCert:          cfgutil.NewExplicitString(defaultMondClientCertFile),
+		MondClientKey:           cfgutil.NewExplicitString(defaultMondClientKeyFile),
 		dial:                    new(net.Dialer).DialContext,
 		lookup:                  net.LookupIP,
 		PromptPass:              defaultPromptPass,
@@ -365,7 +365,7 @@ func loadConfig(ctx context.Context) (*config, []string, error) {
 		LegacyRPCMaxClients:     defaultRPCMaxClients,
 		LegacyRPCMaxWebsockets:  defaultRPCMaxWebsockets,
 		JSONRPCAuthType:         defaultAuthType,
-		DcrdAuthType:            defaultAuthType,
+		MondAuthType:            defaultAuthType,
 		EnableTicketBuyer:       defaultEnableTicketBuyer,
 		EnableVoting:            defaultEnableVoting,
 		PurchaseAccount:         defaultPurchaseAccount,
@@ -461,11 +461,11 @@ func loadConfig(ctx context.Context) (*config, []string, error) {
 		if !cfg.ClientCAFile.ExplicitlySet() {
 			cfg.ClientCAFile.Value = filepath.Join(cfg.AppDataDir.Value, "clients.pem")
 		}
-		if !cfg.DcrdClientCert.ExplicitlySet() {
-			cfg.DcrdClientCert.Value = filepath.Join(cfg.AppDataDir.Value, "dcrd-client.cert")
+		if !cfg.MondClientCert.ExplicitlySet() {
+			cfg.MondClientCert.Value = filepath.Join(cfg.AppDataDir.Value, "mond-client.cert")
 		}
-		if !cfg.DcrdClientKey.ExplicitlySet() {
-			cfg.DcrdClientKey.Value = filepath.Join(cfg.AppDataDir.Value, "dcrd-client.key")
+		if !cfg.MondClientKey.ExplicitlySet() {
+			cfg.MondClientKey.Value = filepath.Join(cfg.AppDataDir.Value, "mond-client.key")
 		}
 		if !cfg.LogDir.ExplicitlySet() {
 			cfg.LogDir.Value = filepath.Join(cfg.AppDataDir.Value, defaultLogDirname)
@@ -815,12 +815,12 @@ func loadConfig(ctx context.Context) (*config, []string, error) {
 			return loadConfigError(err)
 		}
 	} else {
-		// If CAFile is unset, choose either the copy or local dcrd cert.
+		// If CAFile is unset, choose either the copy or local mond cert.
 		if !cfg.CAFile.ExplicitlySet() {
 			cfg.CAFile.Value = filepath.Join(cfg.AppDataDir.Value, defaultCAFilename)
 
 			// If the CA copy does not exist, check if we're connecting to
-			// a local dcrd and switch to its RPC cert if it exists.
+			// a local mond and switch to its RPC cert if it exists.
 			certExists, err := cfgutil.FileExists(cfg.CAFile.Value)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -828,14 +828,14 @@ func loadConfig(ctx context.Context) (*config, []string, error) {
 			}
 			if !certExists {
 				if _, ok := localhostListeners[RPCHost]; ok {
-					dcrdCertExists, err := cfgutil.FileExists(
-						dcrdDefaultCAFile)
+					mondCertExists, err := cfgutil.FileExists(
+						mondDefaultCAFile)
 					if err != nil {
 						fmt.Fprintln(os.Stderr, err)
 						return loadConfigError(err)
 					}
-					if dcrdCertExists {
-						cfg.CAFile.Value = dcrdDefaultCAFile
+					if mondCertExists {
+						cfg.CAFile.Value = mondDefaultCAFile
 					}
 				}
 			}
@@ -976,50 +976,50 @@ func loadConfig(ctx context.Context) (*config, []string, error) {
 	cfg.CAFile.Value = cleanAndExpandPath(cfg.CAFile.Value)
 	cfg.RPCCert.Value = cleanAndExpandPath(cfg.RPCCert.Value)
 	cfg.RPCKey.Value = cleanAndExpandPath(cfg.RPCKey.Value)
-	cfg.DcrdClientCert.Value = cleanAndExpandPath(cfg.DcrdClientCert.Value)
-	cfg.DcrdClientKey.Value = cleanAndExpandPath(cfg.DcrdClientKey.Value)
+	cfg.MondClientCert.Value = cleanAndExpandPath(cfg.MondClientCert.Value)
+	cfg.MondClientKey.Value = cleanAndExpandPath(cfg.MondClientKey.Value)
 	cfg.ClientCAFile.Value = cleanAndExpandPath(cfg.ClientCAFile.Value)
 
-	// If the dcrd username or password are unset, use the same auth as for
-	// the client.  The two settings were previously shared for dcrd and
+	// If the mond username or password are unset, use the same auth as for
+	// the client.  The two settings were previously shared for mond and
 	// client auth, so this avoids breaking backwards compatibility while
-	// allowing users to use different auth settings for dcrd and wallet.
-	if cfg.DcrdUsername == "" {
-		cfg.DcrdUsername = cfg.Username
+	// allowing users to use different auth settings for mond and wallet.
+	if cfg.MondUsername == "" {
+		cfg.MondUsername = cfg.Username
 	}
-	if cfg.DcrdPassword == "" {
-		cfg.DcrdPassword = cfg.Password
+	if cfg.MondPassword == "" {
+		cfg.MondPassword = cfg.Password
 	}
 
-	switch cfg.DcrdAuthType {
+	switch cfg.MondAuthType {
 	case authTypeBasic:
 	case authTypeClientCert:
 		if cfg.DisableClientTLS {
-			err := fmt.Errorf("dcrdauthtype=clientcert is " +
+			err := fmt.Errorf("mondauthtype=clientcert is " +
 				"incompatible with disableclienttls")
 			fmt.Fprintln(os.Stderr, err)
 			return loadConfigError(err)
 		}
-		dcrdClientCertExists, _ := cfgutil.FileExists(
-			cfg.DcrdClientCert.Value)
-		if !dcrdClientCertExists {
-			err := fmt.Errorf("dcrdclientcert %q is required "+
-				"by dcrdauthtype=clientcert but does not exist",
-				cfg.DcrdClientCert.Value)
+		mondClientCertExists, _ := cfgutil.FileExists(
+			cfg.MondClientCert.Value)
+		if !mondClientCertExists {
+			err := fmt.Errorf("mondclientcert %q is required "+
+				"by mondauthtype=clientcert but does not exist",
+				cfg.MondClientCert.Value)
 			fmt.Fprintln(os.Stderr, err)
 			return loadConfigError(err)
 		}
-		dcrdClientKeyExists, _ := cfgutil.FileExists(
-			cfg.DcrdClientKey.Value)
-		if !dcrdClientKeyExists {
-			err := fmt.Errorf("dcrdclientkey %q is required "+
-				"by dcrdauthtype=clientcert but does not exist",
-				cfg.DcrdClientKey.Value)
+		mondClientKeyExists, _ := cfgutil.FileExists(
+			cfg.MondClientKey.Value)
+		if !mondClientKeyExists {
+			err := fmt.Errorf("mondclientkey %q is required "+
+				"by mondauthtype=clientcert but does not exist",
+				cfg.MondClientKey.Value)
 			fmt.Fprintln(os.Stderr, err)
 			return loadConfigError(err)
 		}
 	default:
-		err := fmt.Errorf("unknown dcrd authtype %q", cfg.DcrdAuthType)
+		err := fmt.Errorf("unknown mond authtype %q", cfg.MondAuthType)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return loadConfigError(err)

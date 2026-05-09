@@ -12,7 +12,7 @@ import (
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/gcs"
 	"github.com/monetarium/monetarium-node/mixing"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/jrick/bitset"
@@ -39,7 +39,7 @@ func (s *Syncer) PublishTransactions(ctx context.Context, txs ...*wire.MsgTx) er
 	return s.rpc.PublishTransactions(ctx, txs...)
 }
 
-// PublishMixMessages submits each mixing message to the dcrd mixpool for acceptance.
+// PublishMixMessages submits each mixing message to the mond mixpool for acceptance.
 // If accepted, the messages are published to other peers.
 func (s *Syncer) PublishMixMessages(ctx context.Context, msgs ...mixing.Message) error {
 	return s.rpc.PublishMixMessages(ctx, msgs...)
@@ -61,7 +61,7 @@ func (s *Syncer) StakeDifficulty(ctx context.Context) (dcrutil.Amount, error) {
 }
 
 // Deployments fulfills the DeploymentQuerier interface.
-func (s *Syncer) Deployments(ctx context.Context) (map[string]dcrdtypes.AgendaInfo, error) {
+func (s *Syncer) Deployments(ctx context.Context) (map[string]mondtypes.AgendaInfo, error) {
 	info, err := s.rpc.GetBlockchainInfo(ctx)
 	if err != nil {
 		return nil, err
@@ -70,7 +70,7 @@ func (s *Syncer) Deployments(ctx context.Context) (map[string]dcrdtypes.AgendaIn
 }
 
 // GetTxOut fulfills the LiveTicketQuerier interface.
-func (s *Syncer) GetTxOut(ctx context.Context, txHash *chainhash.Hash, index uint32, tree int8, includeMempool bool) (*dcrdtypes.GetTxOutResult, error) {
+func (s *Syncer) GetTxOut(ctx context.Context, txHash *chainhash.Hash, index uint32, tree int8, includeMempool bool) (*mondtypes.GetTxOutResult, error) {
 	return s.rpc.GetTxOut(ctx, txHash, index, tree, includeMempool)
 }
 
@@ -115,7 +115,7 @@ func (s *Syncer) GetFeeEstimatesByCoinType(ctx context.Context, coinType uint8) 
 	if err != nil {
 		return nil, err
 	}
-	// Convert dcrd.FeeEstimates to wallet.FeeEstimates
+	// Convert mond.FeeEstimates to wallet.FeeEstimates
 	return &wallet.FeeEstimates{
 		CoinType:             estimates.CoinType,
 		MinRelayFee:          estimates.MinRelayFee,

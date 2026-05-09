@@ -21,17 +21,17 @@ import (
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/slog"
 	vspd "github.com/decred/vspd/client/v4"
-	dcrdstdaddr "github.com/decred/dcrd/txscript/v4/stdaddr"
+	mondstdaddr "github.com/decred/dcrd/txscript/v4/stdaddr"
 )
 
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-// vspSignAdapter wraps our SignMessage to use the original dcrd stdaddr type
+// vspSignAdapter wraps our SignMessage to use the original mond stdaddr type
 // that vspd expects. This is needed because vspd hasn't been migrated to
 // monetarium/node yet.
-func vspSignAdapter(w *Wallet) func(ctx context.Context, msg string, addr dcrdstdaddr.Address) ([]byte, error) {
-	return func(ctx context.Context, msg string, addr dcrdstdaddr.Address) ([]byte, error) {
-		// Convert dcrd's Address to our Address by parsing the string representation
+func vspSignAdapter(w *Wallet) func(ctx context.Context, msg string, addr mondstdaddr.Address) ([]byte, error) {
+	return func(ctx context.Context, msg string, addr mondstdaddr.Address) ([]byte, error) {
+		// Convert mond's Address to our Address by parsing the string representation
 		ourAddr, err := stdaddr.DecodeAddress(addr.String(), w.chainParams)
 		if err != nil {
 			return nil, fmt.Errorf("failed to convert address: %w", err)

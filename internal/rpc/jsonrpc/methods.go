@@ -29,7 +29,7 @@ import (
 	"github.com/monetarium/monetarium-wallet/chain"
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/p2p"
-	"github.com/monetarium/monetarium-wallet/rpc/client/dcrd"
+	"github.com/monetarium/monetarium-wallet/rpc/client/mond"
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-wallet/spv"
 	"github.com/monetarium/monetarium-wallet/version"
@@ -50,7 +50,7 @@ import (
 	"github.com/monetarium/monetarium-node/dcrjson"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/hdkeychain"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/sign"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
@@ -148,7 +148,7 @@ type skaCreditLookup func(ctx context.Context, op wire.OutPoint) (*udb.Credit, e
 // The wire format carries SKAValueIn through deserialize/serialize for txs
 // built by this wallet, so the common case is a no-op. This function defends
 // against a third-party tool that builds wire.MsgTx from primitives (only
-// PreviousOutPoint + ValueIn + SignatureScript — the upstream dcrwallet shape)
+// PreviousOutPoint + ValueIn + SignatureScript — the upstream Decred wallet shape)
 // without the V13 wire-format extension fields, which would otherwise
 // produce an SKA tx with SKAValueIn=nil; the wallet would happily sign it
 // and the node would reject the broadcast with a fraud-proof error.
@@ -652,7 +652,7 @@ func unimplemented(*Server, context.Context, any) (any, error) {
 }
 
 // unsupported handles a standard bitcoind RPC request which is
-// unsupported by dcrwallet due to design differences.
+// unsupported by upstream Decred wallet due to design differences.
 func unsupported(*Server, context.Context, any) (any, error) {
 	return nil, &dcrjson.RPCError{
 		Code:    -1,
@@ -680,7 +680,7 @@ func lazyApplyHandler(s *Server, ctx context.Context, request *dcrjson.Request) 
 			}
 			chainSyncer, ok := n.(*chain.Syncer)
 			if !ok {
-				return nil, rpcErrorf(dcrjson.ErrRPCClientNotConnected, "RPC passthrough requires dcrd RPC synchronization")
+				return nil, rpcErrorf(dcrjson.ErrRPCClientNotConnected, "RPC passthrough requires mond RPC synchronization")
 			}
 			var resp json.RawMessage
 			var params = make([]any, len(request.Params))
@@ -2014,7 +2014,7 @@ func (s *Server) getBestBlock(ctx context.Context, icmd any) (any, error) {
 	}
 
 	hash, height := w.MainChainTip(ctx)
-	result := &dcrdtypes.GetBestBlockResult{
+	result := &mondtypes.GetBestBlockResult{
 		Hash:   hash.String(),
 		Height: int64(height),
 	}
@@ -2071,7 +2071,7 @@ func (s *Server) getBlockHeader(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
-	// Attempt RPC passthrough if connected to DCRD.
+	// Attempt RPC passthrough if connected to MOND.
 	n, err := w.NetworkBackend()
 	if err != nil {
 		return nil, err
@@ -2127,7 +2127,7 @@ func (s *Server) getBlockHeader(ctx context.Context, icmd any) (any, error) {
 	}
 
 	// Calculate past median time. Look at the last 11 blocks, starting
-	// with the requested block, which is consistent with dcrd.
+	// with the requested block, which is consistent with mond.
 	iBlkHeader := blockHeader // start with the block header for the requested block
 	timestamps := make([]int64, 0, 11)
 	for i := 0; i < cap(timestamps); i++ {
@@ -2154,7 +2154,7 @@ func (s *Server) getBlockHeader(ctx context.Context, icmd any) (any, error) {
 		powHash = blockHeader.PowHashV2()
 	}
 
-	return &dcrdtypes.GetBlockHeaderVerboseResult{
+	return &mondtypes.GetBlockHeaderVerboseResult{
 		Hash:          blockHash.String(),
 		PowHash:       powHash.String(),
 		Confirmations: confirmations,
@@ -2195,7 +2195,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 		return nil, err
 	}
 
-	// Attempt RPC passthrough if connected to DCRD.
+	// Attempt RPC passthrough if connected to MOND.
 	if chainSyncer, ok := n.(*chain.Syncer); ok {
 		var resp json.RawMessage
 		err := chainSyncer.RPC().Call(ctx, "getblock", &resp, cmd.Hash, cmd.Verbose, cmd.VerboseTx)
@@ -2254,7 +2254,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 	}
 
 	// Calculate past median time. Look at the last 11 blocks, starting
-	// with the requested block, which is consistent with dcrd.
+	// with the requested block, which is consistent with mond.
 	timestamps := make([]int64, 0, 11)
 	for iBlkHeader := blockHeader; ; {
 		timestamps = append(timestamps, iBlkHeader.Timestamp.Unix())
@@ -2281,7 +2281,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 	}
 
 	sbitsFloat := float64(blockHeader.SBits) / cointype.AtomsPerVAR
-	blockReply := dcrdtypes.GetBlockVerboseResult{
+	blockReply := mondtypes.GetBlockVerboseResult{
 		Hash:          cmd.Hash,
 		PoWHash:       powHash.String(),
 		Version:       blockHeader.Version,
@@ -2328,7 +2328,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 		blockReply.STx = stxNames
 	} else {
 		txns := blk.Transactions
-		rawTxns := make([]dcrdtypes.TxRawResult, len(txns))
+		rawTxns := make([]mondtypes.TxRawResult, len(txns))
 		for i, tx := range txns {
 			rawTxn, err := createTxRawResult(w.ChainParams(), tx, uint32(i), blockHeader, confirmations, isTreasuryEnabled)
 			if err != nil {
@@ -2339,7 +2339,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 		blockReply.RawTx = rawTxns
 
 		stxns := blk.STransactions
-		rawSTxns := make([]dcrdtypes.TxRawResult, len(stxns))
+		rawSTxns := make([]mondtypes.TxRawResult, len(stxns))
 		for i, tx := range stxns {
 			rawSTxn, err := createTxRawResult(w.ChainParams(), tx, uint32(i), blockHeader, confirmations, isTreasuryEnabled)
 			if err != nil {
@@ -2354,7 +2354,7 @@ func (s *Server) getBlock(ctx context.Context, icmd any) (any, error) {
 }
 
 func createTxRawResult(chainParams *chaincfg.Params, mtx *wire.MsgTx, blkIdx uint32, blkHeader *wire.BlockHeader,
-	confirmations int64, isTreasuryEnabled bool) (*dcrdtypes.TxRawResult, error) {
+	confirmations int64, isTreasuryEnabled bool) (*mondtypes.TxRawResult, error) {
 
 	b := new(strings.Builder)
 	b.Grow(2 * mtx.SerializeSize())
@@ -2363,7 +2363,7 @@ func createTxRawResult(chainParams *chaincfg.Params, mtx *wire.MsgTx, blkIdx uin
 		return nil, err
 	}
 
-	txReply := &dcrdtypes.TxRawResult{
+	txReply := &mondtypes.TxRawResult{
 		Hex:           b.String(),
 		Txid:          mtx.CachedTxHash().String(),
 		Version:       int32(mtx.Version),
@@ -2384,12 +2384,12 @@ func createTxRawResult(chainParams *chaincfg.Params, mtx *wire.MsgTx, blkIdx uin
 
 // createVinList returns a slice of JSON objects for the inputs of the passed
 // transaction.
-func createVinList(mtx *wire.MsgTx, isTreasuryEnabled bool) []dcrdtypes.Vin {
+func createVinList(mtx *wire.MsgTx, isTreasuryEnabled bool) []mondtypes.Vin {
 	// Treasurybase transactions only have a single txin by definition.
 	//
 	// NOTE: This check MUST come before the coinbase check because a
 	// treasurybase will be identified as a coinbase as well.
-	vinList := make([]dcrdtypes.Vin, len(mtx.TxIn))
+	vinList := make([]mondtypes.Vin, len(mtx.TxIn))
 	if isTreasuryEnabled && blockchain.IsTreasuryBase(mtx) {
 		txIn := mtx.TxIn[0]
 		vinEntry := &vinList[0]
@@ -2454,7 +2454,7 @@ func createVinList(mtx *wire.MsgTx, isTreasuryEnabled bool) []dcrdtypes.Vin {
 		vinEntry.AmountIn = dcrutil.Amount(txIn.ValueIn).ToCoin()
 		vinEntry.BlockHeight = txIn.BlockHeight
 		vinEntry.BlockIndex = txIn.BlockIndex
-		vinEntry.ScriptSig = &dcrdtypes.ScriptSig{
+		vinEntry.ScriptSig = &mondtypes.ScriptSig{
 			Asm: disbuf,
 			Hex: hex.EncodeToString(txIn.SignatureScript),
 		}
@@ -2465,9 +2465,9 @@ func createVinList(mtx *wire.MsgTx, isTreasuryEnabled bool) []dcrdtypes.Vin {
 
 // createVoutList returns a slice of JSON objects for the outputs of the passed
 // transaction.
-func createVoutList(mtx *wire.MsgTx, chainParams *chaincfg.Params, filterAddrMap map[string]struct{}) []dcrdtypes.Vout {
+func createVoutList(mtx *wire.MsgTx, chainParams *chaincfg.Params, filterAddrMap map[string]struct{}) []mondtypes.Vout {
 	txType := stake.DetermineTxType(mtx)
-	voutList := make([]dcrdtypes.Vout, 0, len(mtx.TxOut))
+	voutList := make([]mondtypes.Vout, 0, len(mtx.TxOut))
 	for i, v := range mtx.TxOut {
 		// The disassembled string will contain [error] inline if the
 		// script doesn't fully parse, so ignore the error here.
@@ -2532,7 +2532,7 @@ func createVoutList(mtx *wire.MsgTx, chainParams *chaincfg.Params, filterAddrMap
 			continue
 		}
 
-		var vout dcrdtypes.Vout
+		var vout mondtypes.Vout
 		voutSPK := &vout.ScriptPubKey
 		vout.N = uint32(i)
 		vout.Value = dcrutil.Amount(v.Value).ToCoin()
@@ -2667,7 +2667,7 @@ func (s *Server) getInfo(ctx context.Context, icmd any) (any, error) {
 
 	n, _ := s.walletLoader.NetworkBackend()
 	if chainSyncer, ok := n.(*chain.Syncer); ok {
-		var consensusInfo dcrdtypes.InfoChainResult
+		var consensusInfo mondtypes.InfoChainResult
 		err := chainSyncer.RPC().Call(ctx, "getinfo", &consensusInfo)
 		if err != nil {
 			return nil, err
@@ -2747,7 +2747,7 @@ func (s *Server) getAccount(ctx context.Context, icmd any) (any, error) {
 
 // getAccountAddress handles a getaccountaddress by returning the most
 // recently-created chained address that has not yet been used (does not yet
-// appear in the blockchain, or any tx that has arrived in the dcrd mempool).
+// appear in the blockchain, or any tx that has arrived in the mond mempool).
 // If the most recently-requested address has been used, a new address (the
 // next chained address in the keypool) is used.  This can fail if the keypool
 // runs out (and will return dcrjson.ErrRPCWalletKeypoolRanOut if that happens).
@@ -3961,7 +3961,7 @@ func (s *Server) getTxOut(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
-	// Attempt RPC passthrough if connected to DCRD.
+	// Attempt RPC passthrough if connected to MOND.
 	n, err := w.NetworkBackend()
 	if err != nil {
 		return nil, err
@@ -3991,7 +3991,7 @@ func (s *Server) getTxOut(ctx context.Context, icmd any) (any, error) {
 		return nil, nil // output is spent or does not exist.
 	}
 
-	// gettxout's response shape (dcrdtypes.GetTxOutResult) only carries the
+	// gettxout's response shape (mondtypes.GetTxOutResult) only carries the
 	// VAR-scale int64 Value field, so an SKA UTXO would be reported as
 	// `value: 0` with no way for the caller to distinguish "spent" from
 	// "SKA UTXO." Refuse with an actionable error pointing at listunspent,
@@ -4023,11 +4023,11 @@ func (s *Server) getTxOut(ctx context.Context, icmd any) (any, error) {
 		confirmations = int64(confirms(utxo.Block.Height, bestHeight))
 	}
 
-	return &dcrdtypes.GetTxOutResult{
+	return &mondtypes.GetTxOutResult{
 		BestBlock:     bestHash.String(),
 		Confirmations: confirmations,
 		Value:         utxo.Amount.ToCoin(),
-		ScriptPubKey: dcrdtypes.ScriptPubKeyResult{
+		ScriptPubKey: mondtypes.ScriptPubKeyResult{
 			Asm:       disbuf,
 			Hex:       hex.EncodeToString(utxo.PkScript),
 			ReqSigs:   int32(reqSigs),
@@ -4227,9 +4227,9 @@ var helpDescsMu sync.Mutex // Help may execute concurrently, so synchronize acce
 func (s *Server) help(ctx context.Context, icmd any) (any, error) {
 	cmd := icmd.(*types.HelpCmd)
 	// TODO: The "help" RPC should use a HTTP POST client when calling down to
-	// dcrd for additional help methods.  This avoids including websocket-only
+	// mond for additional help methods.  This avoids including websocket-only
 	// requests in the help, which are not callable by wallet JSON-RPC clients.
-	var rpc *dcrd.RPC
+	var rpc *mond.RPC
 	n, _ := s.walletLoader.NetworkBackend()
 	if chainSyncer, ok := n.(*chain.Syncer); ok {
 		rpc = chainSyncer.RPC()
@@ -5127,7 +5127,7 @@ func (s *Server) sendOutputsFromTreasury(ctx context.Context, w *wallet.Wallet, 
 		return "", err
 	}
 
-	// Send to dcrd.
+	// Send to mond.
 	n, ok := s.walletLoader.NetworkBackend()
 	if !ok {
 		return "", errNoNetwork
@@ -6702,7 +6702,7 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "invalid sighash flag")
 	}
 
-	// TODO: really we probably should look these up with dcrd anyway to
+	// TODO: really we probably should look these up with mond anyway to
 	// make sure that they match the blockchain if present.
 	inputs := make(map[wire.OutPoint][]byte)
 	scripts := make(map[string][]byte)
@@ -6774,10 +6774,10 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 	}
 
 	// Now we go and look for any inputs that we were not provided by
-	// querying dcrd with getrawtransaction. We queue up a bunch of async
+	// querying mond with getrawtransaction. We queue up a bunch of async
 	// requests and will wait for replies after we have checked the rest of
 	// the arguments.
-	requested := make(map[wire.OutPoint]*dcrdtypes.GetTxOutResult)
+	requested := make(map[wire.OutPoint]*mondtypes.GetTxOutResult)
 	var requestedMu sync.Mutex
 	requestedGroup, gctx := errgroup.WithContext(ctx)
 	n, _ := s.walletLoader.NetworkBackend()
@@ -7284,7 +7284,7 @@ func (s *Server) verifyMessage(ctx context.Context, icmd any) (any, error) {
 // with the server.  The chainClient is optional, and this is simply a helper
 // function for the versionWithChainRPC and versionNoChainRPC handlers.
 func (s *Server) version(ctx context.Context, icmd any) (any, error) {
-	resp := make(map[string]dcrdtypes.VersionResult)
+	resp := make(map[string]mondtypes.VersionResult)
 	n, _ := s.walletLoader.NetworkBackend()
 	if chainSyncer, ok := n.(*chain.Syncer); ok {
 		err := chainSyncer.RPC().Call(ctx, "version", &resp)
@@ -7293,7 +7293,7 @@ func (s *Server) version(ctx context.Context, icmd any) (any, error) {
 		}
 	}
 
-	walletVersion := dcrdtypes.VersionResult{
+	walletVersion := mondtypes.VersionResult{
 		VersionString: version.String(),
 		Major:         version.Major,
 		Minor:         version.Minor,
@@ -7301,18 +7301,14 @@ func (s *Server) version(ctx context.Context, icmd any) (any, error) {
 		Prerelease:    version.PreRelease,
 		BuildMetadata: version.BuildMetadata,
 	}
-	apiVersion := dcrdtypes.VersionResult{
+	apiVersion := mondtypes.VersionResult{
 		VersionString: jsonrpcSemverString,
 		Major:         jsonrpcSemverMajor,
 		Minor:         jsonrpcSemverMinor,
 		Patch:         jsonrpcSemverPatch,
 	}
-	// Canonical (monw*) keys; the legacy dcrwallet* keys are emitted for one
-	// deprecation cycle so existing tooling that reads them keeps working.
 	resp["monw"] = walletVersion
 	resp["monwjsonrpcapi"] = apiVersion
-	resp["dcrwallet"] = walletVersion
-	resp["dcrwalletjsonrpcapi"] = apiVersion
 	return resp, nil
 }
 
@@ -8131,7 +8127,7 @@ func createUnsignedSKAEmissionTransaction(auth *chaincfg.SKAEmissionAuth,
 
 	// NOTE: Nonce checking is NOT performed during transaction creation
 	// because wallets cannot reliably know the chain state due to reorgs and lag.
-	// The nonce will be validated during block acceptance in dcrd
+	// The nonce will be validated during block acceptance in mond
 	// which uses the actual blockchain state for proper replay protection.
 
 	// Validate emission amounts

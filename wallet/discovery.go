@@ -558,7 +558,7 @@ func (w *Wallet) findLastUsedAccount(ctx context.Context, n NetworkBackend, bloc
 }
 
 // existsAddrIndexFinder implements address and account discovery using the
-// exists address index of a trusted dcrd RPC server.
+// exists address index of a trusted mond RPC server.
 type existsAddrIndexFinder struct {
 	wallet   *Wallet
 	rpc      usedAddressesQuerier

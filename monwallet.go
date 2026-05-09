@@ -433,7 +433,7 @@ func run(ctx context.Context) error {
 
 	// When not running with --noinitialload, it is the main package's
 	// responsibility to synchronize the wallet with the network through SPV or
-	// the trusted dcrd server.  This blocks until cancelled.
+	// the trusted mond server.  This blocks until cancelled.
 	if !cfg.NoInitialLoad {
 		if done(ctx) {
 			return ctx.Err()
@@ -583,15 +583,15 @@ func rpcSyncLoop(ctx context.Context, w *wallet.Wallet) {
 	certs := readCAFile()
 	clientCert, clientKey := readClientCertKey()
 	dial := cfg.dial
-	if cfg.NoDcrdProxy {
+	if cfg.NoMondProxy {
 		dial = new(net.Dialer).DialContext
 	}
 	for {
 		rpcOptions := &chain.RPCOptions{
 			Address:     cfg.RPCConnect,
 			DefaultPort: activeNet.JSONRPCClientPort,
-			User:        cfg.DcrdUsername,
-			Pass:        cfg.DcrdPassword,
+			User:        cfg.MondUsername,
+			Pass:        cfg.MondPassword,
 			Dial:        dial,
 			CA:          certs,
 			Insecure:    cfg.DisableClientTLS,
@@ -639,17 +639,17 @@ func readCAFile() []byte {
 }
 
 func readClientCertKey() ([]byte, []byte) {
-	if cfg.DcrdAuthType != authTypeClientCert {
+	if cfg.MondAuthType != authTypeClientCert {
 		return nil, nil
 	}
-	cert, err := os.ReadFile(cfg.DcrdClientCert.Value)
+	cert, err := os.ReadFile(cfg.MondClientCert.Value)
 	if err != nil {
-		log.Warnf("Cannot open MONN RPC client certificate: %v", err)
+		log.Warnf("Cannot open MOND RPC client certificate: %v", err)
 		cert = nil
 	}
-	key, err := os.ReadFile(cfg.DcrdClientKey.Value)
+	key, err := os.ReadFile(cfg.MondClientKey.Value)
 	if err != nil {
-		log.Warnf("Cannot open MONN RPC client key: %v", err)
+		log.Warnf("Cannot open MOND RPC client key: %v", err)
 		key = nil
 	}
 	return cert, key

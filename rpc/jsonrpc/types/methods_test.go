@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/monetarium/monetarium-node/dcrjson"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 )
 
 // TestWalletSvrCmds tests all of the wallet server commands marshal and
@@ -768,7 +768,7 @@ func TestWalletSvrCmds(t *testing.T) {
 				return dcrjson.NewCmd(Method("lockunspent"), true, `[{"txid":"123","vout":1}]`)
 			},
 			staticCmd: func() any {
-				txInputs := []dcrdtypes.TransactionInput{
+				txInputs := []mondtypes.TransactionInput{
 					{Txid: "123", Vout: 1},
 				}
 				return NewLockUnspentCmd(true, txInputs)
@@ -776,7 +776,7 @@ func TestWalletSvrCmds(t *testing.T) {
 			marshalled: `{"jsonrpc":"1.0","method":"lockunspent","params":[true,[{"txid":"123","vout":1,"tree":0}]],"id":1}`,
 			unmarshalled: &LockUnspentCmd{
 				Unlock: true,
-				Transactions: []dcrdtypes.TransactionInput{
+				Transactions: []mondtypes.TransactionInput{
 					{Txid: "123", Vout: 1},
 				},
 			},

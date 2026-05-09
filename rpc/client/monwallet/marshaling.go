@@ -1,4 +1,4 @@
-package dcrwallet
+package monwallet
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/hdkeychain"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 )
@@ -64,7 +64,7 @@ func marshalTx(tx *wire.MsgTx) json.Marshaler {
 
 func unmarshalOutpoints(ops *[]*wire.OutPoint) json.Unmarshaler {
 	f := unmarshalJSONFunc(func(j []byte) error {
-		var array []dcrdtypes.TransactionInput
+		var array []mondtypes.TransactionInput
 		err := json.Unmarshal(j, &array)
 		if err != nil {
 			return err

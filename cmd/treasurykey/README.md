@@ -18,10 +18,10 @@ It prints out three values:
 
 This information must be stored in a secure location.
 
-The public key will be hardcoded inside `dcrd` and `dcrwallet`. Both daemons
+The public key will be hardcoded inside `mond` and `monwallet`. Both daemons
 will use it to identify valid treasury spend transactions.
 
-The WIF must be imported into the dcrwallet that will generate TSPEND
+The WIF must be imported into the monwallet that will generate TSPEND
 transactions.
 
 For example:
@@ -36,7 +36,7 @@ WIF        : PmQeT3VmoxDRjgsfwVJLV13ioNyxmd9XuQmQu86UPiQQAn5XkRfLN
 
 Import key into treasury wallet.
 ```
-dcrctl --wallet importprivkey PmQeT3VmoxDRjgsfwVJLV13ioNyxmd9XuQmQu86UPiQQAn5XkRfLN imported false
+monctl --wallet importprivkey PmQeT3VmoxDRjgsfwVJLV13ioNyxmd9XuQmQu86UPiQQAn5XkRfLN imported false
 ```
 
 It is suggested to repeat this process so that there are at least two valid

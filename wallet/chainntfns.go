@@ -807,7 +807,7 @@ func (w *Wallet) VoteOnOwnedTickets(ctx context.Context, winningTicketHashes []*
 
 			// Note: Non-VAR (SKA) coin type fees are distributed through SSFee
 			// transactions created by the mining code, not through vote outputs.
-			// See dcrd/internal/mining/mining.go createSSFeeTx() for details.
+			// See mond/internal/mining/mining.go createSSFeeTx() for details.
 
 			// Deal with consensus votes
 			vote, err := createUnsignedVote(ticketHash, ticketPurchase,

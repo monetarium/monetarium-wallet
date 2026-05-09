@@ -2,7 +2,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-package dcrd
+package mond
 
 import (
 	"bytes"
@@ -77,7 +77,7 @@ func (f *cfilterV2) UnmarshalJSON(j []byte) error {
 	return err
 }
 
-// cfilterv2Reply implements the reply to a cfilterv2 query to a dcrd rpc
+// cfilterv2Reply implements the reply to a cfilterv2 query to a mond rpc
 // server.
 type cfilterV2Reply struct {
 	Filter      *cfilterV2 `json:"data"`

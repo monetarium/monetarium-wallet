@@ -10,7 +10,7 @@ package types
 
 import (
 	"github.com/monetarium/monetarium-node/dcrjson"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 )
 
 // Method describes the exact type used when registering methods with dcrjson.
@@ -905,12 +905,12 @@ func NewListUnspentCmdWithCoinType(minConf, maxConf *int, addresses *[]string, a
 // LockUnspentCmd defines the lockunspent JSON-RPC command.
 type LockUnspentCmd struct {
 	Unlock       bool
-	Transactions []dcrdtypes.TransactionInput
+	Transactions []mondtypes.TransactionInput
 }
 
 // NewLockUnspentCmd returns a new instance which can be used to issue a
 // lockunspent JSON-RPC command.
-func NewLockUnspentCmd(unlock bool, transactions []dcrdtypes.TransactionInput) *LockUnspentCmd {
+func NewLockUnspentCmd(unlock bool, transactions []mondtypes.TransactionInput) *LockUnspentCmd {
 	return &LockUnspentCmd{
 		Unlock:       unlock,
 		Transactions: transactions,
@@ -1648,7 +1648,7 @@ func init() {
 		dcrjson.MustRegister(Method(register[i].method), register[i].cmd, 0)
 	}
 
-	// dcrd methods also implemented by dcrwallet
+	// mond methods also implemented by monwallet
 	register = []registeredMethod{
 		{"createrawtransaction", (*CreateRawTransactionCmd)(nil)},
 		{"debuglevel", (*DebugLevelCmd)(nil)},
@@ -1673,7 +1673,7 @@ func init() {
 		dcrjson.MustRegister(Method(register[i].method), register[i].cmd, 0)
 	}
 
-	// Websocket-specific methods implemented by dcrwallet
+	// Websocket-specific methods implemented by monwallet
 	register = []registeredMethod{
 		{"authenticate", (*AuthenticateCmd)(nil)},
 	}
@@ -1683,7 +1683,7 @@ func init() {
 	}
 }
 
-// CreateRawTransactionCmd extends the dcrd createrawtransaction command with
+// CreateRawTransactionCmd extends the mond createrawtransaction command with
 // an optional CoinType. Amounts is now a single map[string]string for both
 // VAR and SKA — decimal coin strings preserve SKA big.Int precision and avoid
 // float64 round-trip loss for VAR amounts above ~9e7 VAR.
@@ -1697,7 +1697,7 @@ func init() {
 // precision. An entry of "" falls back to the float64 Amount for backwards
 // compatibility with existing callers.
 type CreateRawTransactionCmd struct {
-	Inputs       []dcrdtypes.TransactionInput
+	Inputs       []mondtypes.TransactionInput
 	Amounts      map[string]string `jsonrpcusage:"{\"address\":\"amount\",...}"` // Decimal coin strings (VAR or SKA per CoinType)
 	LockTime     *int64
 	Expiry       *int64
@@ -1705,24 +1705,24 @@ type CreateRawTransactionCmd struct {
 	InputAmounts *[]string `json:"inputamounts,omitempty"` // Optional decimal-coin override per input (index-aligned with Inputs)
 }
 
-// newtype definitions of dcrd commands we implement.
+// newtype definitions of mond commands we implement.
 type (
-	AuthenticateCmd dcrdtypes.AuthenticateCmd
-	DebugLevelCmd   dcrdtypes.DebugLevelCmd
-	GetBestBlockCmd         dcrdtypes.GetBestBlockCmd
-	GetBestBlockHashCmd     dcrdtypes.GetBestBlockHashCmd
-	GetBlockCountCmd        dcrdtypes.GetBlockCountCmd
-	GetBlockHashCmd         dcrdtypes.GetBlockHashCmd
-	GetBlockHeaderCmd       dcrdtypes.GetBlockHeaderCmd
-	GetBlockCmd             dcrdtypes.GetBlockCmd
-	GetCFilterV2Cmd         dcrdtypes.GetCFilterV2Cmd
-	GetCurrentNetCmd        dcrdtypes.GetCurrentNetCmd
-	GetInfoCmd              dcrdtypes.GetInfoCmd
-	GetPeerInfoCmd          dcrdtypes.GetPeerInfoCmd
-	GetTxOutCmd             dcrdtypes.GetTxOutCmd
-	HelpCmd                 dcrdtypes.HelpCmd
-	SendRawTransactionCmd   dcrdtypes.SendRawTransactionCmd
-	ValidateAddressCmd      dcrdtypes.ValidateAddressCmd
-	VerifyMessageCmd        dcrdtypes.VerifyMessageCmd
-	VersionCmd              dcrdtypes.VersionCmd
+	AuthenticateCmd mondtypes.AuthenticateCmd
+	DebugLevelCmd   mondtypes.DebugLevelCmd
+	GetBestBlockCmd         mondtypes.GetBestBlockCmd
+	GetBestBlockHashCmd     mondtypes.GetBestBlockHashCmd
+	GetBlockCountCmd        mondtypes.GetBlockCountCmd
+	GetBlockHashCmd         mondtypes.GetBlockHashCmd
+	GetBlockHeaderCmd       mondtypes.GetBlockHeaderCmd
+	GetBlockCmd             mondtypes.GetBlockCmd
+	GetCFilterV2Cmd         mondtypes.GetCFilterV2Cmd
+	GetCurrentNetCmd        mondtypes.GetCurrentNetCmd
+	GetInfoCmd              mondtypes.GetInfoCmd
+	GetPeerInfoCmd          mondtypes.GetPeerInfoCmd
+	GetTxOutCmd             mondtypes.GetTxOutCmd
+	HelpCmd                 mondtypes.HelpCmd
+	SendRawTransactionCmd   mondtypes.SendRawTransactionCmd
+	ValidateAddressCmd      mondtypes.ValidateAddressCmd
+	VerifyMessageCmd        mondtypes.VerifyMessageCmd
+	VersionCmd              mondtypes.VersionCmd
 )

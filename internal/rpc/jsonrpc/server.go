@@ -26,7 +26,7 @@ import (
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/dcrjson"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/gorilla/websocket"
 )
 
@@ -86,9 +86,6 @@ type handler struct {
 }
 
 // jsonAuthFail sends a message back to the client if the http auth is rejected.
-// Note: HTTP clients that cached Basic-auth credentials under the legacy
-// "dcrwallet RPC" realm will be re-prompted after this rename to "monw RPC".
-// Document this in release notes; no persistent state is affected.
 func jsonAuthFail(w http.ResponseWriter) {
 	w.Header().Add("WWW-Authenticate", `Basic realm="monw RPC"`)
 	http.Error(w, "401 Unauthorized.", http.StatusUnauthorized)
@@ -265,8 +262,8 @@ func (s *Server) Stop() {
 }
 
 // handlerClosure creates a closure function for handling requests of the given
-// method.  This may be a request that is handled directly by dcrwallet, or
-// a chain server request that is handled by passing the request down to dcrd.
+// method.  This may be a request that is handled directly by monwallet, or
+// a chain server request that is handled by passing the request down to mond.
 //
 // NOTE: These handlers do not handle special cases, such as the authenticate
 // method.  Each of these must be checked beforehand (the method is already
@@ -345,7 +342,7 @@ func (s *Server) invalidAuth(req *dcrjson.Request) bool {
 	if err != nil {
 		return false
 	}
-	authCmd, ok := cmd.(*dcrdtypes.AuthenticateCmd)
+	authCmd, ok := cmd.(*mondtypes.AuthenticateCmd)
 	if !ok {
 		return false
 	}

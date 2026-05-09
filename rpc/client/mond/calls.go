@@ -4,7 +4,7 @@
 
 // TODO: consistent error wrapping
 
-package dcrd
+package mond
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/gcs"
 	"github.com/monetarium/monetarium-node/mixing"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/jrick/bitset"
@@ -36,7 +36,7 @@ type Caller interface {
 	Call(ctx context.Context, method string, res any, args ...any) error
 }
 
-// RPC provides methods for calling dcrd JSON-RPCs without exposing the details
+// RPC provides methods for calling mond JSON-RPCs without exposing the details
 // of JSON encoding.
 type RPC struct {
 	Caller
@@ -82,7 +82,7 @@ func exists(ctx context.Context, r *RPC, method string, res *bitset.Bytes, param
 // ExistsLiveTicket returns whether a ticket identified by its hash is currently
 // live and not immature.
 func (r *RPC) ExistsLiveTicket(ctx context.Context, ticket *chainhash.Hash) (bool, error) {
-	const op errors.Op = "dcrd.ExistsLiveTicket"
+	const op errors.Op = "mond.ExistsLiveTicket"
 	var exists bool
 	err := r.Call(ctx, "existsliveticket", &exists, ticket.String())
 	if err != nil {
@@ -92,10 +92,10 @@ func (r *RPC) ExistsLiveTicket(ctx context.Context, ticket *chainhash.Hash) (boo
 }
 
 // UsedAddresses returns a bitset identifying whether each address has been
-// publically used on the blockchain.  This feature requires the optional dcrd
+// publically used on the blockchain.  This feature requires the optional mond
 // existsaddress index to be enabled.
 func (r *RPC) UsedAddresses(ctx context.Context, addrs []stdaddr.Address) (bitset.Bytes, error) {
-	const op errors.Op = "dcrd.UsedAddresses"
+	const op errors.Op = "mond.UsedAddresses"
 	addrArray, err := json.Marshal(addrSliceToStrings(addrs))
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -111,7 +111,7 @@ func (r *RPC) UsedAddresses(ctx context.Context, addrs []stdaddr.Address) (bitse
 // ExistsLiveTickets returns a bitset identifying whether each ticket is
 // currently live.
 func (r *RPC) ExistsLiveTickets(ctx context.Context, tickets []*chainhash.Hash) (bitset.Bytes, error) {
-	const op errors.Op = "dcrd.ExistsLiveTickets"
+	const op errors.Op = "mond.ExistsLiveTickets"
 	ticketArray, err := json.Marshal(hashSliceToStrings(tickets))
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -133,7 +133,7 @@ func (r *RPC) ExistsLiveTickets(ctx context.Context, tickets []*chainhash.Hash) 
 //	"votes"
 //	"revocations"
 func (r *RPC) MempoolCount(ctx context.Context, kind string) (int, error) {
-	const op errors.Op = "dcrd.MempoolCount"
+	const op errors.Op = "mond.MempoolCount"
 	// This is rather inefficient, as only the count is needed, not all
 	// matching hashes.
 	var hashStrings []string
@@ -153,7 +153,7 @@ func (r *RPC) getRawTransaction(ctx context.Context, hash string) (*wire.MsgTx, 
 
 // GetMempoolTSpends retrieves all mempool tspends.
 func (r *RPC) GetMempoolTSpends(ctx context.Context) ([]*wire.MsgTx, error) {
-	const op errors.Op = "dcrd.GetMempoolTSpends"
+	const op errors.Op = "mond.GetMempoolTSpends"
 	var hashStrings []string
 	err := r.Call(ctx, "getrawmempool", &hashStrings, false, "tspend")
 	if err != nil {
@@ -171,11 +171,11 @@ func (r *RPC) GetMempoolTSpends(ctx context.Context) ([]*wire.MsgTx, error) {
 	return txs, nil
 }
 
-// PublishTransaction submits the transaction to dcrd mempool for acceptance.
+// PublishTransaction submits the transaction to mond mempool for acceptance.
 // If accepted, the transaction is published to other peers.
 // The transaction may not be an orphan.
 func (r *RPC) PublishTransaction(ctx context.Context, tx *wire.MsgTx) error {
-	const op errors.Op = "dcrd.PublishTransaction"
+	const op errors.Op = "mond.PublishTransaction"
 	return r.publishTransaction(ctx, op, tx)
 }
 
@@ -198,13 +198,13 @@ func (r *RPC) publishTransaction(ctx context.Context, op errors.Op, tx *wire.Msg
 	return nil
 }
 
-// PublishTransactions submits each transaction to dcrd mempool for acceptance.
+// PublishTransactions submits each transaction to mond mempool for acceptance.
 // If accepted, the transaction is published to other peers.
 // Transactions are sent in order and later transactions may spend outputs of
 // previous transactions.
 // No transaction may be an orphan.
 func (r *RPC) PublishTransactions(ctx context.Context, txs ...*wire.MsgTx) error {
-	const op errors.Op = "dcrd.PublishTransactions"
+	const op errors.Op = "mond.PublishTransactions"
 
 	// sendrawtransaction does not allow orphans, so we can not concurrently
 	// send transactions.  All transaction sends are attempted, and the
@@ -231,10 +231,10 @@ func (r *RPC) publishMixMessage(ctx context.Context, op errors.Op, msg mixing.Me
 	return r.Call(ctx, "sendrawmixmessage", nil, msg.Command(), b.String())
 }
 
-// PublishMixMessages submits each mixing message to the dcrd mixpool for acceptance.
+// PublishMixMessages submits each mixing message to the mond mixpool for acceptance.
 // If accepted, the messages are published to other peers.
 func (r *RPC) PublishMixMessages(ctx context.Context, msgs ...mixing.Message) error {
-	const op errors.Op = "dcrd.PublishMixMessages"
+	const op errors.Op = "mond.PublishMixMessages"
 
 	var firstErr error
 	for _, msg := range msgs {
@@ -249,11 +249,11 @@ func (r *RPC) PublishMixMessages(ctx context.Context, msgs ...mixing.Message) er
 	return nil
 }
 
-// MixMessage queries the dcrd mixpool for a mixing message by its hash.
+// MixMessage queries the mond mixpool for a mixing message by its hash.
 func (r *RPC) MixMessage(ctx context.Context, hash *chainhash.Hash) (mixing.Message, error) {
-	const op errors.Op = "dcrd.MixMessage"
+	const op errors.Op = "mond.MixMessage"
 
-	var mixMessage *dcrdtypes.GetMixMessageResult
+	var mixMessage *mondtypes.GetMixMessageResult
 	err := r.Call(ctx, "getmixmessage", &mixMessage, hash.String())
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -287,9 +287,9 @@ func (r *RPC) MixMessage(ctx context.Context, hash *chainhash.Hash) (mixing.Mess
 }
 
 // MixPairRequests returns all mixing pair request messages currently held by
-// the dcrd mixpool.
+// the mond mixpool.
 func (r *RPC) MixPairRequests(ctx context.Context) ([]*wire.MsgMixPairReq, error) {
-	const op errors.Op = "dcrd.MixPairRequests"
+	const op errors.Op = "mond.MixPairRequests"
 
 	mixPRs := makeMessageArray[wire.MsgMixPairReq](wire.MixVersion)
 	err := r.Call(ctx, "getmixpairrequests", &mixPRs)
@@ -301,7 +301,7 @@ func (r *RPC) MixPairRequests(ctx context.Context) ([]*wire.MsgMixPairReq, error
 
 // Blocks returns the blocks for each block hash.
 func (r *RPC) Blocks(ctx context.Context, blockHashes []*chainhash.Hash) ([]*wire.MsgBlock, error) {
-	const op errors.Op = "dcrd.Blocks"
+	const op errors.Op = "mond.Blocks"
 
 	blocks := make([]*wire.MsgBlock, len(blockHashes))
 	var g errgroup.Group
@@ -322,7 +322,7 @@ func (r *RPC) Blocks(ctx context.Context, blockHashes []*chainhash.Hash) ([]*wir
 // CFilterV2 returns the version 2 committed filter and the data required for
 // verifying the inclusion proof of the cfilter for a block.
 func (r *RPC) CFilterV2(ctx context.Context, blockHash *chainhash.Hash) (*gcs.FilterV2, uint32, []chainhash.Hash, error) {
-	const opf = "dcrd.CFilterV2(%v)"
+	const opf = "mond.CFilterV2(%v)"
 
 	var res cfilterV2Reply
 	err := r.Call(ctx, "getcfilterv2", &res, blockHash.String())
@@ -346,7 +346,7 @@ type filterProof = struct {
 // If this method errors, a partial result of filter proofs may be returned,
 // with nil filters if the query errored.
 func (r *RPC) CFiltersV2(ctx context.Context, blockHashes []*chainhash.Hash) ([]filterProof, error) {
-	const opf = "dcrd.CFiltersV2(%v)"
+	const opf = "mond.CFiltersV2(%v)"
 
 	filters := make([]filterProof, len(blockHashes))
 	var g errgroup.Group
@@ -373,9 +373,9 @@ func (r *RPC) CFiltersV2(ctx context.Context, blockHashes []*chainhash.Hash) ([]
 }
 
 // Headers returns the block headers starting at the fork point between the
-// client and the dcrd server identified by the client's block locators.
+// client and the mond server identified by the client's block locators.
 func (r *RPC) Headers(ctx context.Context, blockLocators []*chainhash.Hash, hashStop *chainhash.Hash) ([]*wire.BlockHeader, error) {
-	const op errors.Op = "dcrd.Headers"
+	const op errors.Op = "mond.Headers"
 
 	res := &struct {
 		Headers *headers `json:"headers"`
@@ -393,7 +393,7 @@ func (r *RPC) Headers(ctx context.Context, blockLocators []*chainhash.Hash, hash
 // for relevant transaction notifications and rescans.
 // Addresses and outpoints are added to an existing filter if reload is false.
 func (r *RPC) LoadTxFilter(ctx context.Context, reload bool, addrs []stdaddr.Address, outpoints []wire.OutPoint) error {
-	const op errors.Op = "dcrd.LoadTxFilter"
+	const op errors.Op = "mond.LoadTxFilter"
 
 	type outpoint struct {
 		Hash  string `json:"hash"`
@@ -420,7 +420,7 @@ func (r *RPC) LoadTxFilter(ctx context.Context, reload bool, addrs []stdaddr.Add
 // filter to determine which transactions are possibly relevant to the client.
 // The save function is called for the discovered transactions from each block.
 func (r *RPC) Rescan(ctx context.Context, blocks []chainhash.Hash, save func(block *chainhash.Hash, txs []*wire.MsgTx) error) error {
-	const op errors.Op = "dcrd.Rescan"
+	const op errors.Op = "mond.Rescan"
 
 	var res struct {
 		DiscoveredData []struct {
@@ -457,7 +457,7 @@ func (r *RPC) Rescan(ctx context.Context, blocks []chainhash.Hash, save func(blo
 // StakeDifficulty returns the stake difficulty (AKA ticket price) of the next
 // block.
 func (r *RPC) StakeDifficulty(ctx context.Context) (dcrutil.Amount, error) {
-	const op errors.Op = "dcrd.StakeDifficulty"
+	const op errors.Op = "mond.StakeDifficulty"
 
 	var res struct {
 		Sdiff float64 `json:"nextstakedifficulty"`
@@ -473,11 +473,11 @@ func (r *RPC) StakeDifficulty(ctx context.Context) (dcrutil.Amount, error) {
 	return sdiff, nil
 }
 
-// GetBlockchainInfo returns information about the underlying dcrd node.
-func (r *RPC) GetBlockchainInfo(ctx context.Context) (*dcrdtypes.GetBlockChainInfoResult, error) {
-	const op errors.Op = "dcrd.GetBlockchainInfo"
+// GetBlockchainInfo returns information about the underlying mond node.
+func (r *RPC) GetBlockchainInfo(ctx context.Context) (*mondtypes.GetBlockChainInfoResult, error) {
+	const op errors.Op = "mond.GetBlockchainInfo"
 
-	var chainInfo *dcrdtypes.GetBlockChainInfoResult
+	var chainInfo *mondtypes.GetBlockChainInfoResult
 	err := r.Call(ctx, "getblockchaininfo", &chainInfo)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -490,10 +490,10 @@ func (r *RPC) GetBlockchainInfo(ctx context.Context) (*dcrdtypes.GetBlockChainIn
 //
 // NOTE: this returns a nil value with nil error if the output is not known or
 // has already been spent.
-func (r *RPC) GetTxOut(ctx context.Context, txHash *chainhash.Hash, index uint32, tree int8, includeMempool bool) (*dcrdtypes.GetTxOutResult, error) {
-	const op errors.Op = "dcrd.GetTxOut"
+func (r *RPC) GetTxOut(ctx context.Context, txHash *chainhash.Hash, index uint32, tree int8, includeMempool bool) (*mondtypes.GetTxOutResult, error) {
+	const op errors.Op = "mond.GetTxOut"
 
-	var txOut *dcrdtypes.GetTxOutResult
+	var txOut *mondtypes.GetTxOutResult
 	err := r.Call(ctx, "gettxout", &txOut, txHash.String(), index, tree, includeMempool)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -507,7 +507,7 @@ func (r *RPC) GetTxOut(ctx context.Context, txHash *chainhash.Hash, index uint32
 // NOTE: this requires the node to be running with the transaction index
 // enabled, otherwise it will error.
 func (r *RPC) GetConfirmationHeight(ctx context.Context, txHash *chainhash.Hash) (int32, error) {
-	const op errors.Op = "dcrd.GetRawTransaction"
+	const op errors.Op = "mond.GetRawTransaction"
 	var grt struct {
 		BlockHeight int32 `json:"blockheight"`
 	}
@@ -518,7 +518,7 @@ func (r *RPC) GetConfirmationHeight(ctx context.Context, txHash *chainhash.Hash)
 	return grt.BlockHeight, nil
 }
 
-// FeeEstimates contains dynamic fee estimation data from dcrd.
+// FeeEstimates contains dynamic fee estimation data from mond.
 // Fee fields are strings to support big.Int precision for SKA coins.
 type FeeEstimates struct {
 	CoinType             uint8   `json:"cointype"`
@@ -531,7 +531,7 @@ type FeeEstimates struct {
 
 // GetFeeEstimatesByCoinType queries dynamic fee estimates for the specified coin type
 func (r *RPC) GetFeeEstimatesByCoinType(ctx context.Context, coinType uint8) (*FeeEstimates, error) {
-	const op errors.Op = "dcrd.GetFeeEstimatesByCoinType"
+	const op errors.Op = "mond.GetFeeEstimatesByCoinType"
 	var result FeeEstimates
 	err := r.Call(ctx, "getfeestimatesbycointype", &result, coinType)
 	if err != nil {

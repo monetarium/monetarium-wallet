@@ -3,7 +3,7 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-package dcrwallet
+package monwallet
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/hdkeychain"
-	dcrdtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 )
@@ -144,9 +144,9 @@ func (c *Client) ListSinceBlockMinConf(ctx context.Context, blockHash *chainhash
 // left as unlock to keep compatibility with the reference client API and to
 // avoid confusion for those who are already familiar with the lockunspent RPC.
 func (c *Client) LockUnspent(ctx context.Context, unlock bool, ops []*wire.OutPoint) error {
-	outputs := make([]dcrdtypes.TransactionInput, len(ops))
+	outputs := make([]mondtypes.TransactionInput, len(ops))
 	for i, op := range ops {
-		outputs[i] = dcrdtypes.TransactionInput{
+		outputs[i] = mondtypes.TransactionInput{
 			Txid: op.Hash.String(),
 			Vout: op.Index,
 			Tree: op.Tree,
@@ -693,7 +693,7 @@ func (c *Client) FundRawTransaction(ctx context.Context, rawhex string, fundAcco
 }
 
 // GetInfoWallet calls the getinfo method.  It is named differently to avoid a
-// naming clash for dcrd clients with a GetInfo method.
+// naming clash for mond clients with a GetInfo method.
 func (c *Client) GetInfoWallet(ctx context.Context) (*types.InfoWalletResult, error) {
 	res := new(types.InfoWalletResult)
 	err := c.Call(ctx, "getinfo", res)

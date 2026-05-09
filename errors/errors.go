@@ -3,8 +3,8 @@
 // license that can be found in the LICENSE file.
 
 // API originally inspired by https://commandcenter.blogspot.com/2017/12/error-handling-in-upspin.html.
-// Currently, dcrwallet is in the process of converting to the new Go 1.13 error
-// wrapping features.
+// Currently, the upstream Decred wallet is in the process of converting to the
+// new Go 1.13 error wrapping features.
 
 /*
 Package errors provides error creation and matching for all wallet systems.  It
@@ -70,7 +70,7 @@ const (
 	Consensus                       // Consensus violation
 	DoubleSpend                     // Transaction is a double spend
 	Protocol                        // Protocol violation
-	NoPeers                         // Decred network is unreachable due to lack of peers or dcrd RPC connections
+	NoPeers                         // Decred network is unreachable due to lack of peers or mond RPC connections
 	Deployment                      // Inactive consensus deployment
 )
 

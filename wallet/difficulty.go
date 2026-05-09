@@ -5,7 +5,7 @@
 
 package wallet
 
-// This code was copied from dcrd/blockchain/difficulty.go and modified for
+// This code was copied from mond/blockchain/difficulty.go and modified for
 // monetarium-wallet's header storage.
 
 import (
@@ -677,7 +677,7 @@ func (w *Wallet) ancestorHeaderAtHeight(dbtx walletdb.ReadTx, h *wire.BlockHeade
 	case height == int32(h.Height):
 		return h, nil
 	case height > int32(h.Height), height < 0:
-		return nil, nil // dcrd's blockNode.Ancestor returns nil for child heights
+		return nil, nil // mond's blockNode.Ancestor returns nil for child heights
 	}
 
 	if len(chain) > 0 && height-int32(chain[0].Header.Height) >= 0 {
@@ -697,7 +697,7 @@ func (w *Wallet) ancestorHeaderAtHeight(dbtx walletdb.ReadTx, h *wire.BlockHeade
 // isAncestorOf returns whether or not node is an ancestor of the provided
 // target node.
 //
-// Replaces dcrd's internal/blockchain func (node *blockNode).IsAncestorOf(target *blockNode).
+// Replaces mond's internal/blockchain func (node *blockNode).IsAncestorOf(target *blockNode).
 func (w *Wallet) isAncestorOf(dbtx walletdb.ReadTx, node, target *wire.BlockHeader,
 	chain []*BlockNode) (bool, error) {
 
@@ -712,7 +712,7 @@ func (w *Wallet) isAncestorOf(dbtx walletdb.ReadTx, node, target *wire.BlockHead
 // before this node.  This is equivalent to calling Ancestor with the node's
 // height minus provided distance.
 //
-// Replaces dcrd's internal/blockchain func (node *blockNode) RelativeAncestor(distance int64).
+// Replaces mond's internal/blockchain func (node *blockNode) RelativeAncestor(distance int64).
 func (w *Wallet) relativeAncestor(dbtx walletdb.ReadTx, node *wire.BlockHeader,
 	distance int64, chain []*BlockNode) (*wire.BlockHeader, error) {
 

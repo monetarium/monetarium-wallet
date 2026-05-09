@@ -128,7 +128,7 @@ const (
 	// The goal of this upgrade is to make it possible to read P2SH redeem
 	// scripts through the address manager without needing the wallet to be
 	// unlocked.  This is made possible by relying on the fact that since
-	// mainnet launch, dcrwallet has always recorded imported P2SH redeem
+	// mainnet launch, upstream Decred wallet has always recorded imported P2SH redeem
 	// scripts both encrypted in the address manager bucket, and unencrypted
 	// in the transaction store buckets.  During this upgrade, a check is
 	// performed ensuring that no unencrypted scripts are missing.

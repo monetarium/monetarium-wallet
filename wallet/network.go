@@ -22,7 +22,7 @@ import (
 //
 // Note: This is a type alias of an anonymous struct rather than a regular
 // struct due to the packages that fulfill the Peer interface having a
-// dependency graph (spv -> wallet -> rpc/client/dcrd) that prevents directly
+// dependency graph (spv -> wallet -> rpc/client/mond) that prevents directly
 // returning a struct.
 type FilterProof = struct {
 	Filter     *gcs.FilterV2
@@ -69,7 +69,7 @@ type NetworkBackend interface {
 	Err() error
 
 	// GetFeeEstimatesByCoinType queries dynamic fee estimates for the specified coin type.
-	// This method allows the wallet to query current fee estimates from dcrd.
+	// This method allows the wallet to query current fee estimates from mond.
 	GetFeeEstimatesByCoinType(ctx context.Context, coinType uint8) (*FeeEstimates, error)
 }
 
