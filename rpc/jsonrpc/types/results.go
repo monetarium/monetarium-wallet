@@ -88,12 +88,21 @@ type CreateSignatureResult struct {
 
 // CreateAuthorizedEmissionResult models the data returned from the createauthorizedemission
 // command.
+//
+// Warning is populated only when the local one-shot guard could not be
+// persisted to the wallet DB after a successful sign on the forceNonce path
+// (where a prior record exists). Operators MUST treat its presence as a
+// signal not to retry the call without forcenonce=true. When the local
+// guard fails on a fresh (coin, nonce) the call is refused outright rather
+// than returning a signed tx with a warning — see the function comment in
+// internal/rpc/jsonrpc/methods.go for the rationale.
 type CreateAuthorizedEmissionResult struct {
-	Transaction     string `json:"transaction"`     // Hex-encoded signed transaction
-	TransactionHash string `json:"transactionhash"` // Transaction hash
-	Nonce           uint64 `json:"nonce"`           // Nonce used in this emission
-	TotalAmount     string `json:"totalamount"`     // Total amount being emitted (string for big.Int precision)
-	CoinType        uint8  `json:"cointype"`        // Coin type being emitted
+	Transaction     string `json:"transaction"`               // Hex-encoded signed transaction
+	TransactionHash string `json:"transactionhash"`           // Transaction hash
+	Nonce           uint64 `json:"nonce"`                     // Nonce used in this emission
+	TotalAmount     string `json:"totalamount"`               // Total amount being emitted (string for big.Int precision)
+	CoinType        uint8  `json:"cointype"`                  // Coin type being emitted
+	Warning         string `json:"warning,omitempty"`         // Operator-visible warning (e.g. local one-shot guard persistence failed)
 }
 
 // GenerateEmissionKeyResult models the data returned from the generateemissionkey command.

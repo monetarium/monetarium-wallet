@@ -263,6 +263,15 @@ func populateSKAValueIn(ctx context.Context, tx *wire.MsgTx, params *chaincfg.Pa
 						"input %d (%s:%d) has no SKA value recorded in "+
 							"wallet UTXO set", i, op.Hash, op.Index)
 				}
+				// Defense-in-depth: a corrupted credit record carrying more
+				// atoms than the chain's MaxSupply must not reach signing.
+				// The on-wire and caller-supplied branches above already
+				// enforce this; the lookup branch is the third source and
+				// the contract is uniform — see the on-wire comment.
+				if err := validateSKAAtomMagnitude(params, txCoinType, ska); err != nil {
+					return rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+						"input %d (%s:%d): %v", i, op.Hash, op.Index, err)
+				}
 				txIn.ValueIn = 0
 				txIn.SKAValueIn = new(big.Int).Set(ska)
 				continue
@@ -327,6 +336,21 @@ func atomsToDecimalString(atoms int64, atomsPerCoin *big.Int) string {
 // varAtomsToDecimalString is a shorthand for VAR amounts (1e8 atoms per coin).
 func varAtomsToDecimalString(amt dcrutil.Amount) string {
 	return cointype.AtomsToDecimalString(big.NewInt(int64(amt)), big.NewInt(cointype.AtomsPerVAR))
+}
+
+// p2shSKAValueInStr returns the SKA value of a P2SHMultiSigOutput as a decimal-
+// coin string suitable for RawTxInput.SKAValueIn, or nil for VAR outputs.
+// Pulled out as a helper so redeemMultiSigOut can pass the value through the
+// synthesized RawTxInput explicitly rather than relying on SKAValueIn surviving
+// the wire round-trip — and so this small piece of logic is unit-testable
+// without a full wallet mock.
+func p2shSKAValueInStr(p2sh *wallet.P2SHMultiSigOutput, ct cointype.CoinType, params *chaincfg.Params) *string {
+	if p2sh == nil || !ct.IsSKA() {
+		return nil
+	}
+	atomsPerCoin := getAtomsPerCoin(params, ct)
+	s := cointype.AtomsToDecimalString(p2sh.SKAOutputAmount.BigInt(), atomsPerCoin)
+	return &s
 }
 
 // coinsToAtomsBig converts a coin amount (as string or float64) to atoms using big.Int.
@@ -3332,18 +3356,41 @@ func (s *Server) createAuthorizedEmissionUnlocked(
 	txHash := tx.TxHash()
 
 	// Persist the (CoinType, Nonce, txHash) record so a duplicate call
-	// (same coin type and nonce) is refused before signing again. Errors
-	// here are logged but do not fail the call: the signed tx is already
-	// in the operator's hands, and refusing to return it because the local
-	// guard could not be persisted would be a worse outcome (operator
-	// loses the tx; cannot retry without forcenonce). The node's own
-	// nonce check remains the authoritative replay protection.
+	// (same coin type and nonce) is refused before signing again. The
+	// handling splits on priorExists:
+	//
+	//   priorExists=true (forceNonce path) + persist failure:
+	//     The operator already has a prior signed tx for this nonce. The
+	//     current signed tx is in their hands too, and refusing to return
+	//     it would force them to re-sign without our help. Log the failure
+	//     and surface a Warning on the result so scripted callers can detect
+	//     the broken local guard and avoid auto-retrying without forcenonce.
+	//
+	//   priorExists=false (fresh nonce) + persist failure:
+	//     Neither party has the tx yet. Refuse the result outright — the
+	//     operator can repair the DB and retry. Returning the tx with a
+	//     warning here would create a tx in the operator's hands that the
+	//     wallet has no local record of, defeating the one-shot guard's
+	//     entire purpose on its first invocation.
+	//
+	// The node's own nonce check remains the authoritative replay protection
+	// in either case.
 	var hashBytes [32]byte
 	copy(hashBytes[:], txHash[:])
+	var warning string
 	if storeErr := w.StoreEmissionAuthRecord(ctx, cmd.CoinType, nonce, hashBytes, time.Now().Unix()); storeErr != nil {
+		if !priorExists {
+			return nil, rpcErrorf(dcrjson.ErrRPCWallet,
+				"refusing to return authorization: local one-shot guard "+
+					"persistence failed for coin type %d nonce %d: %v — "+
+					"repair the wallet DB and retry, or pass forcenonce=true",
+				cmd.CoinType, nonce, storeErr)
+		}
 		log.Warnf("createauthorizedemission: failed to persist local "+
 			"one-shot guard for coin type %d nonce %d (tx %s): %v",
 			cmd.CoinType, nonce, txHash.String(), storeErr)
+		warning = fmt.Sprintf("local one-shot guard persistence failed (%v); "+
+			"do not retry this call without forcenonce=true", storeErr)
 	}
 
 	return &types.CreateAuthorizedEmissionResult{
@@ -3352,6 +3399,7 @@ func (s *Server) createAuthorizedEmissionUnlocked(
 		Nonce:           nonce,
 		TotalAmount:     totalAmount.String(),
 		CoinType:        cmd.CoinType,
+		Warning:         warning,
 	}, nil
 }
 
@@ -4894,9 +4942,22 @@ func (s *Server) processUnmanagedTicket(ctx context.Context, icmd any) (any, err
 
 // makeOutputsWithCoinTypeBig creates transaction outputs with specified coin type using big.Int amounts.
 // This is essential for SKA transactions where amounts can exceed int64.
+//
+// Outputs are emitted in lexicographic order of the destination address so two
+// identical sendmany calls produce identical on-the-wire transactions (and
+// therefore identical tx hashes prior to change-position randomization). The
+// underlying map iteration would otherwise be non-deterministic; the same
+// deterministic ordering is applied in createrawtransaction at the addr-sort
+// step.
 func makeOutputsWithCoinTypeBig(pairs map[string]*big.Int, chainParams *chaincfg.Params, coinType cointype.CoinType) ([]*wire.TxOut, error) {
+	addrs := make([]string, 0, len(pairs))
+	for addrStr := range pairs {
+		addrs = append(addrs, addrStr)
+	}
+	sort.Strings(addrs)
 	outputs := make([]*wire.TxOut, 0, len(pairs))
-	for addrStr, amt := range pairs {
+	for _, addrStr := range addrs {
+		amt := pairs[addrStr]
 		if amt == nil || amt.Sign() <= 0 {
 			return nil, errNeedPositiveAmount
 		}
@@ -5520,6 +5581,12 @@ func (s *Server) redeemMultiSigOut(ctx context.Context, icmd any) (any, error) {
 		Tree:         cmd.Tree,
 		ScriptPubKey: outpointScriptStr,
 		RedeemScript: "",
+		// SKA inputs: pass the value through explicitly rather than relying on
+		// SKAValueIn surviving the upcoming msgTx → hex → msgTx round-trip.
+		// The wire format round-trips SKAValueIn today, but an explicit
+		// RawTxInput.SKAValueIn (decimal-coin string) is robust against any
+		// future wire-level or intermediate-transform change that drops it.
+		SKAValueIn: p2shSKAValueInStr(p2shOutput, ct, w.ChainParams()),
 	}
 	rtis := []types.RawTxInput{rti}
 
@@ -7066,7 +7133,8 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 	if cmd.RequiredConfirmations != nil {
 		requiredConfs = int32(*cmd.RequiredConfirmations)
 		if requiredConfs < 0 {
-			return nil, errNeedPositiveAmount
+			return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter,
+				"requiredconfirmations must be non-negative; got %d", requiredConfs)
 		}
 	}
 

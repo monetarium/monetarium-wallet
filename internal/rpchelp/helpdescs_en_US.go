@@ -101,7 +101,7 @@ var helpDescsEnUS = map[string]string{
 	"createrawtransaction-locktime":       "Locktime value; a non-zero value will also locktime-activate the inputs",
 	"createrawtransaction-expiry":         "Expiry value; a non-zero value when the transaction expiry",
 	"createrawtransaction-cointype":       "Optional coin type (0=VAR default, 1-255=SKA). When set to a SKA coin, amounts values are interpreted as decimal-coin strings of that SKA coin.",
-	"createrawtransaction-inputamounts":   "Optional decimal-coin override per input (index-aligned with inputs). Supplied entries replace the legacy float64 input amount with full precision; required for VAR amounts above ~9e7 VAR where float64 round-trip loses precision.",
+	"createrawtransaction-inputamounts":   "Optional decimal-coin override per input (index-aligned with inputs). Supplied entries replace the legacy float64 input amount with full precision; required for VAR amounts above ~9e7 VAR where float64 round-trip loses precision, and for any SKA input where the float64 'amount' field cannot represent 18-decimal SKA atoms.",
 	"createrawtransaction--result0":       "Hex-encoded bytes of the serialized transaction",
 
 	// CreateSignatureCmd help.
@@ -961,8 +961,8 @@ var helpDescsEnUS = map[string]string{
 	"settspendpolicy-ticket":    "Ticket hash to set a per-ticket tspend approval policy",
 
 	// SetTxFeeCmd help.
-	"settxfee--synopsis": "Modify the fee per kB of the serialized tx size used each time more fee is required for an authored transaction.",
-	"settxfee-amount":    "The new fee per kB of the serialized tx size valued in Monetarium",
+	"settxfee--synopsis": "Modify the fee per kB of the serialized tx size used each time more fee is required for an authored transaction. Passing 0 clears any manual fee override for the coin type and returns the wallet to its default relay-fee policy (does NOT set a literal zero fee).",
+	"settxfee-amount":    "The new fee per kB of the serialized tx size valued in Monetarium; pass 0 to clear the manual override for the given coin type",
 	"settxfee-cointype":  "Coin type to set fee for (0=VAR, 1-255=SKA coin types)",
 	"settxfee--result0":  "The boolean 'true'",
 

@@ -240,6 +240,32 @@ func TestPopulateSKAValueIn(t *testing.T) {
 		}
 	})
 
+	t.Run("wallet UTXO above MaxSupply is rejected", func(t *testing.T) {
+		// Defense-in-depth: a corrupted credit record carrying more atoms
+		// than the chain's MaxSupply must be rejected before signing. The
+		// other two source branches (on-wire, caller-supplied) already
+		// enforce the same bound; this arm pins the lookup branch.
+		tx := mkSKATx(1)
+		// 101 SKA — one whole coin over the 100-SKA MaxSupply.
+		oversize := new(big.Int).Mul(big.NewInt(101), atomsPerCoin)
+		lookup := func(_ context.Context, _ wire.OutPoint) (*udb.Credit, error) {
+			return &udb.Credit{
+				CoinType:  skaCT,
+				SKAAmount: cointype.NewSKAAmount(oversize),
+			}, nil
+		}
+		err := run(tx, nil, lookup)
+		if err == nil {
+			t.Fatalf("over-MaxSupply UTXO credit must be rejected")
+		}
+		if !strings.Contains(err.Error(), "MaxSupply") {
+			t.Errorf("error must mention MaxSupply; got %q", err.Error())
+		}
+		if tx.TxIn[0].SKAValueIn != nil {
+			t.Fatalf("rejected input must not be left with a populated SKAValueIn")
+		}
+	})
+
 	t.Run("no caller value and no wallet UTXO yields actionable error", func(t *testing.T) {
 		tx := mkSKATx(1)
 		// lookup returns NotExist-style empty credit; populateSKAValueIn must

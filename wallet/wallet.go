@@ -2367,8 +2367,6 @@ func (w *Wallet) Unlock(ctx context.Context, passphrase []byte, timeout <-chan t
 			log.Info("The wallet has been locked due to an incorrect passphrase.")
 		}
 		return errors.E(op, err)
-	default:
-		return errors.E(op, err)
 	case errors.Is(err, errors.Locked):
 		defer w.passphraseUsedMu.RUnlock()
 		w.passphraseUsedMu.RLock()
@@ -2380,6 +2378,8 @@ func (w *Wallet) Unlock(ctx context.Context, passphrase []byte, timeout <-chan t
 			return errors.E(op, errors.Passphrase, err)
 		}
 	case err == nil:
+	default:
+		return errors.E(op, err)
 	}
 	w.replacePassphraseTimeout(wasLocked, timeout)
 	return nil

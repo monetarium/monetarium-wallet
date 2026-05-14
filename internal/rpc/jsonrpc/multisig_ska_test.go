@@ -6,6 +6,7 @@ package jsonrpc
 
 import (
 	"encoding/hex"
+	"math/big"
 	"strings"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdscript"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
+	"github.com/monetarium/monetarium-wallet/wallet"
 )
 
 // TestMultisigCommandsCoinTypeField verifies the CoinType field is properly
@@ -70,6 +72,81 @@ func TestMultisigCommandsCoinTypeField(t *testing.T) {
 		}
 		if cmd.CoinType == nil || *cmd.CoinType != 1 {
 			t.Error("CoinType should be 1")
+		}
+	})
+}
+
+// TestP2SHSKAValueInStr pins the M4 fix from the 2026-05-15 review:
+// redeemMultiSigOut must pass the SKA value through the synthesized
+// RawTxInput.SKAValueIn explicitly so the signing path does not rely on
+// SKAValueIn surviving the wire-format round-trip. Before the fix, the
+// caller-supplied RawTxInput omitted SKAValueIn entirely and any future
+// change that dropped SKAValueIn from serialize/deserialize would have
+// silently signed an SKA tx with a zero input value.
+func TestP2SHSKAValueInStr(t *testing.T) {
+	const skaCT = cointype.CoinType(1)
+	atomsPerCoin := big.NewInt(0).Exp(big.NewInt(10), big.NewInt(18), nil)
+	params := &chaincfg.Params{
+		SKACoins: map[cointype.CoinType]*chaincfg.SKACoinConfig{
+			skaCT: {
+				AtomsPerCoin: new(big.Int).Set(atomsPerCoin),
+				MaxSupply:    new(big.Int).Mul(big.NewInt(1_000_000), atomsPerCoin),
+				Active:       true,
+			},
+		},
+	}
+
+	t.Run("VAR coin type returns nil", func(t *testing.T) {
+		p2sh := &wallet.P2SHMultiSigOutput{
+			OutputAmount: 100,
+		}
+		if got := p2shSKAValueInStr(p2sh, cointype.CoinTypeVAR, params); got != nil {
+			t.Fatalf("VAR must return nil; got %v", *got)
+		}
+	})
+
+	t.Run("nil output returns nil", func(t *testing.T) {
+		if got := p2shSKAValueInStr(nil, skaCT, params); got != nil {
+			t.Fatalf("nil p2sh must return nil; got %v", *got)
+		}
+	})
+
+	t.Run("SKA returns decimal-coin string matching atoms-per-coin", func(t *testing.T) {
+		// 2.5 SKA at 1e18 atoms/coin = 2.5e18 atoms.
+		atoms := new(big.Int).Mul(big.NewInt(25), new(big.Int).Exp(big.NewInt(10), big.NewInt(17), nil))
+		p2sh := &wallet.P2SHMultiSigOutput{
+			SKAOutputAmount: cointype.NewSKAAmount(atoms),
+			CoinType:        skaCT,
+		}
+		got := p2shSKAValueInStr(p2sh, skaCT, params)
+		if got == nil {
+			t.Fatalf("SKA must return non-nil")
+		}
+		// Re-parse via coinsToAtomsBig to confirm round-trip.
+		back, err := coinsToAtomsBig(*got, atomsPerCoin)
+		if err != nil {
+			t.Fatalf("returned string %q must round-trip via coinsToAtomsBig: %v", *got, err)
+		}
+		if back.Cmp(atoms) != 0 {
+			t.Fatalf("round-trip mismatch: returned %q parsed to %s, want %s", *got, back, atoms)
+		}
+	})
+
+	t.Run("SKA value at MaxSupply boundary round-trips", func(t *testing.T) {
+		// Operator-visible upper bound — ensure the decimal-string format
+		// does not lose precision at the high end of the supply range.
+		atoms := new(big.Int).Mul(big.NewInt(999_999), atomsPerCoin)
+		p2sh := &wallet.P2SHMultiSigOutput{
+			SKAOutputAmount: cointype.NewSKAAmount(atoms),
+			CoinType:        skaCT,
+		}
+		got := p2shSKAValueInStr(p2sh, skaCT, params)
+		if got == nil {
+			t.Fatalf("SKA must return non-nil")
+		}
+		back, err := coinsToAtomsBig(*got, atomsPerCoin)
+		if err != nil || back.Cmp(atoms) != 0 {
+			t.Fatalf("boundary round-trip failed: string=%q parsed=%v err=%v want=%v", *got, back, err, atoms)
 		}
 	})
 }
