@@ -1684,18 +1684,14 @@ func init() {
 }
 
 // CreateRawTransactionCmd extends the mond createrawtransaction command with
-// an optional CoinType. Amounts is now a single map[string]string for both
-// VAR and SKA — decimal coin strings preserve SKA big.Int precision and avoid
+// an optional CoinType. Amounts is a single map[string]string for both VAR
+// and SKA — decimal coin strings preserve SKA big.Int precision and avoid
 // float64 round-trip loss for VAR amounts above ~9e7 VAR.
 //
-// The legacy float64 Amount on each TransactionInput is lossy for VAR values
-// above ~9e7 VAR (single-precision-equivalent at int64 atom scale) and
-// fundamentally too small for SKA (1e18 atoms/coin vs ~15 significant decimal
-// digits in float64). InputAmounts is an optional parallel slice of
-// decimal-coin strings indexed by input position; when an entry is non-empty
-// the parser uses it instead of the float64 Amount field, preserving full
-// precision. An entry of "" falls back to the float64 Amount for backwards
-// compatibility with existing callers.
+// InputAmounts is an optional parallel slice of decimal-coin strings indexed
+// by input position; when an entry is non-empty the parser uses it instead
+// of the float64 Amount field on TransactionInput, preserving full precision.
+// An entry of "" falls back to the float64 Amount for backwards compatibility.
 type CreateRawTransactionCmd struct {
 	Inputs       []mondtypes.TransactionInput
 	Amounts      map[string]string `jsonrpcusage:"{\"address\":\"amount\",...}"` // Decimal coin strings (VAR or SKA per CoinType)
