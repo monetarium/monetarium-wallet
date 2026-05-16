@@ -31,8 +31,10 @@ const (
 	RedeemP2PKHSigScriptSize = 1 + 73 + 1 + 33
 
 	// RedeemP2SHSigScriptSize is the worst case (largest) serialize size
-	// of a transaction input script that redeems a P2SH output.
-	// It is calculated as:
+	// of a transaction input script that redeems a P2SH-wrapped P2PK
+	// output (single-signature, single-pubkey redeem script). It is NOT
+	// correct for redeeming a P2SH-wrapped N-of-M multisig — use
+	// RedeemP2SHMultiSigSigScriptSize for that case. It is calculated as:
 	//
 	//  - OP_DATA_73
 	//  - 73-byte signature
@@ -120,6 +122,36 @@ const (
 	//   - 1 byte OP_TSPEND
 	TSPENDInputSize = 1 + 73 + 1 + 33 + 1
 )
+
+// RedeemP2SHMultiSigSigScriptSize returns the worst-case serialize size of a
+// transaction input sigScript that redeems a P2SH-wrapped N-of-M multisig
+// output. requiredSigs is M (the number of signatures needed); redeemScriptLen
+// is the byte length of the opcode-serialized multisig redeem script
+// (`OP_M <push33><pubkey>... OP_N OP_CHECKMULTISIG`, i.e. 34*N + 3 bytes).
+//
+// Layout for a fully-signed P2SH-multisig (Decred fork omits the OP_0
+// CHECKMULTISIG dummy — see txscript/sign/sign.go:signMultiSig):
+//
+//   - requiredSigs × (OP_DATA_73 + 73 signature bytes)   // 74 bytes per sig
+//   - <push opcode> redeemScript                          // 1-3 bytes + script
+//
+// Each signature is the worst-case 72-byte DER ECDSA signature plus a 1-byte
+// sighash flag, pushed with OP_DATA_73 (1 opcode byte). The redeem-script
+// push opcode is OP_DATA_N for <=75 bytes and OP_PUSHDATA{1,2,4} otherwise.
+func RedeemP2SHMultiSigSigScriptSize(requiredSigs, redeemScriptLen int) int {
+	var pushPrefix int
+	switch {
+	case redeemScriptLen <= 75:
+		pushPrefix = 1 // OP_DATA_N (single opcode encoding length)
+	case redeemScriptLen <= 255:
+		pushPrefix = 2 // OP_PUSHDATA1 + 1-byte length
+	case redeemScriptLen <= 65535:
+		pushPrefix = 3 // OP_PUSHDATA2 + 2-byte length
+	default:
+		pushPrefix = 5 // OP_PUSHDATA4 + 4-byte length
+	}
+	return requiredSigs*(1+73) + pushPrefix + redeemScriptLen
+}
 
 func sumOutputSerializeSizes(outputs []*wire.TxOut) (serializeSize int) {
 	for _, txOut := range outputs {

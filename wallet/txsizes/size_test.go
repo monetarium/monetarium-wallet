@@ -74,6 +74,47 @@ func TestEstimateSerializeSize(t *testing.T) {
 	}
 }
 
+// TestRedeemP2SHMultiSigSigScriptSize asserts the worst-case sigScript size
+// formula for redeeming a P2SH-wrapped N-of-M multisig. Each row covers a
+// realistic multisig shape (M = required sigs, N = total pubkeys); the
+// expected size is computed by hand from the layout described in the
+// RedeemP2SHMultiSigSigScriptSize doc comment.
+func TestRedeemP2SHMultiSigSigScriptSize(t *testing.T) {
+	// Multisig redeem script for N pubkeys is OP_M + N*(OP_DATA_33 + 33
+	// pubkey) + OP_N + OP_CHECKMULTISIG = 34*N + 3 bytes.
+	redeemLen := func(n int) int { return 34*n + 3 }
+
+	cases := []struct {
+		name string
+		m, n int
+		want int
+	}{
+		// 1-of-1: redeem=37 (<=75 → push prefix 1); sigScript = 1*74 + 1 + 37 = 112.
+		{"1-of-1", 1, 1, 74 + 1 + 37},
+		// 1-of-2: redeem=71 (<=75 → push 1); sigScript = 74 + 1 + 71 = 146.
+		{"1-of-2", 1, 2, 74 + 1 + 71},
+		// 2-of-2: redeem=71; sigScript = 148 + 1 + 71 = 220.
+		{"2-of-2", 2, 2, 148 + 1 + 71},
+		// 1-of-3: redeem=105 (>75 → OP_PUSHDATA1, push 2); sigScript = 74 + 2 + 105 = 181.
+		{"1-of-3", 1, 3, 74 + 2 + 105},
+		// 2-of-3: redeem=105; sigScript = 148 + 2 + 105 = 255.
+		{"2-of-3", 2, 3, 148 + 2 + 105},
+		// 3-of-5: redeem=173 (push 2); sigScript = 222 + 2 + 173 = 397.
+		{"3-of-5", 3, 5, 3*74 + 2 + 173},
+		// 7-of-15: redeem=513 (>255 → OP_PUSHDATA2, push 3); sigScript = 518 + 3 + 513 = 1034.
+		{"7-of-15", 7, 15, 7*74 + 3 + 513},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RedeemP2SHMultiSigSigScriptSize(tc.m, redeemLen(tc.n))
+			if got != tc.want {
+				t.Errorf("RedeemP2SHMultiSigSigScriptSize(M=%d, redeemLen(N=%d)=%d) = %d, want %d",
+					tc.m, tc.n, redeemLen(tc.n), got, tc.want)
+			}
+		})
+	}
+}
+
 // TestEstimateInputSizeRoundTrip asserts that EstimateInputSize matches the
 // actual serialized size of a TxIn in the V13 wire format, including the
 // SKAValueInLen byte that is always present (0 for VAR inputs). Catches the

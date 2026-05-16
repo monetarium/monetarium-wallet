@@ -85,10 +85,16 @@ func (w *Wallet) FetchP2SHMultiSigOutput(ctx context.Context, outPoint *wire.Out
 func (w *Wallet) PrepareRedeemMultiSigOutTxOutput(ctx context.Context, msgTx *wire.MsgTx, p2shOutput *P2SHMultiSigOutput, pkScript *[]byte, ct cointype.CoinType) error {
 	const op errors.Op = "wallet.PrepareRedeemMultiSigOutTxOutput"
 
+	// The P2SH output being redeemed is a multisig (asserted by the
+	// stdscript.STMultiSig check in the caller), so size each input's
+	// worst-case sigScript with the multisig-aware helper. The legacy
+	// RedeemP2SHSigScriptSize models a P2SH-wrapped P2PK and undercounts
+	// real multisig sigScripts by 70-150 bytes — see size.go.
+	sigScriptSize := txsizes.RedeemP2SHMultiSigSigScriptSize(
+		int(p2shOutput.M), len(p2shOutput.RedeemScript))
 	scriptSizes := make([]int, 0, len(msgTx.TxIn))
-	// generate the script sizes for the inputs
 	for range msgTx.TxIn {
-		scriptSizes = append(scriptSizes, txsizes.RedeemP2SHSigScriptSize)
+		scriptSizes = append(scriptSizes, sigScriptSize)
 	}
 
 	txOut := wire.NewTxOut(0, *pkScript)
