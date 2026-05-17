@@ -407,9 +407,14 @@ func TestPrepareRedeemMultiSigOutMatchesSignedSize(t *testing.T) {
 			//     amount big.Int-encodes to 10-12 bytes (≤ 6 bytes slack).
 			// Anything materially beyond that suggests the estimator is
 			// over-allocating wire space.
+			//
+			// The SKA bonus is 16 (not 8) to give clear headroom over the
+			// 3*M + 6 worst-case combined savings: for the 3-of-5 row this
+			// avoids the exact-tie at 21 bytes that would flake when every
+			// signed signature lands at the short end of DER variance.
 			slack := tc.required*3 + 4
 			if tc.coinType.IsSKA() {
-				slack += 8
+				slack += 16
 			}
 			if actualSize < estimatedSize-slack {
 				t.Errorf("signed tx size %d much smaller than estimate %d (delta %d > slack %d)"+

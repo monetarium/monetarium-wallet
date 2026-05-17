@@ -2600,6 +2600,19 @@ func deleteMultisigOutUS(ns walletdb.ReadWriteBucket, k []byte) error {
 	return nil
 }
 
+// deleteMultisigOut removes the main multisig record. Used by RemoveUnconfirmed
+// when abandoning a wallet-created multisig tx that never made it on chain —
+// the entry was speculatively inserted by insertMultisigOutIntoTxMgr inside the
+// same walletdb.Update as authoring, then orphaned when network publish failed.
+// Without this drain the entry persists as a phantom unspent credit.
+func deleteMultisigOut(ns walletdb.ReadWriteBucket, k []byte) error {
+	err := ns.NestedReadWriteBucket(bucketMultisig).Delete(k)
+	if err != nil {
+		return errors.E(errors.IO, err)
+	}
+	return nil
+}
+
 func existsMultisigOutUS(ns walletdb.ReadBucket, k []byte) bool {
 	v := ns.NestedReadBucket(bucketMultisigUsp).Get(k)
 	return v != nil

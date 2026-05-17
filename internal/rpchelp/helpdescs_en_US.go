@@ -827,6 +827,12 @@ var helpDescsEnUS = map[string]string{
 	"redeemmultisigouts-cointype":        "Coin type (0=VAR default, 1-255=SKA)",
 	"redeemmultisigoutsresult-results":   "Resulting partially-signed redemption transactions.",
 	"redeemmultisigoutsresult-truncated": "True when more unspent multisig outputs exist than were processed in this call. Spend the returned transactions and call again to drain the rest.",
+	"redeemmultisigoutsresult-skipped":   "Multisig credits the wallet recorded as unspent but the node reports as missing or spent on chain; surfaced rather than dropped so the operator can correlate stale wallet state with on-chain truth. Typically orphans of a failed-publish multisig tx.",
+	"skippedmultisigoutpoint-hash":       "Hash of the transaction that produced the skipped output.",
+	"skippedmultisigoutpoint-vout":       "Output index within the transaction.",
+	"skippedmultisigoutpoint-tree":       "Tree (regular or stake) the transaction is on.",
+	"skippedmultisigoutpoint-cointype":   "Coin type stored on the wallet's multisig credit record (0=VAR, 1-255=SKA).",
+	"skippedmultisigoutpoint-reason":     "Human-readable reason the credit was skipped, e.g. 'output not unspent on chain'.",
 
 	// RenameAccountCmd help.
 	"renameaccount--synopsis":  "Renames an account.",

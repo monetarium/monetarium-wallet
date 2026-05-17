@@ -5651,11 +5651,25 @@ func (s *Server) redeemMultiSigOuts(ctx context.Context, icmd any) (any, error) 
 		return nil, err
 	}
 
+	// Defensive filter: confirm each candidate against the node's UTXO view
+	// before authoring a redemption. A wallet-authored multisig tx that fails
+	// to publish leaves a phantom entry in bucketMultisigUsp; without this
+	// step we'd emit a raw transaction spending an output that doesn't exist
+	// on chain (see RemoveUnconfirmed in wallet/udb/txunmined.go for the
+	// root-cause fix that prevents new phantoms).
+	// A nil network backend (SPV-only / no node connection) is expected and
+	// handled by chainSyncerQueryFunc: it returns a nil query and the filter
+	// passes msos through unverified with a WARN log. The discarded ok values
+	// are intentional.
+	n, _ := s.walletLoader.NetworkBackend()
+	chainSyncer, _ := n.(*chain.Syncer)
+	live, skipped := filterLiveMultisigCredits(ctx, msos, chainSyncerQueryFunc(chainSyncer))
+
 	// Resolve the per-call iteration cap. Whether more outputs remain after
 	// coin-type filtering is determined by the collect function below.
 	max := resolveRedeemMultiSigOutsCap(cmd.Number)
 
-	rmsoResults, truncated := redeemMultiSigOutsCollect(ctx, msos, max, cmd.ToAddress, cmd.CoinType,
+	rmsoResults, truncated := redeemMultiSigOutsCollect(ctx, live, max, cmd.ToAddress, cmd.CoinType,
 		func(ctx context.Context, req *types.RedeemMultiSigOutCmd) (types.RedeemMultiSigOutResult, error) {
 			res, err := s.redeemMultiSigOut(ctx, req)
 			if err != nil {
@@ -5664,7 +5678,110 @@ func (s *Server) redeemMultiSigOuts(ctx context.Context, icmd any) (any, error) 
 			return res.(types.RedeemMultiSigOutResult), nil
 		})
 
-	return types.RedeemMultiSigOutsResult{Results: rmsoResults, Truncated: truncated}, nil
+	return types.RedeemMultiSigOutsResult{Results: rmsoResults, Truncated: truncated, Skipped: skipped}, nil
+}
+
+// multisigChainQuery resolves a single multisig outpoint against the node's
+// UTXO set, returning (nil, nil) if the output is spent or never existed —
+// matching the contract of mond's gettxout. A non-nil error signals the chain
+// is unreachable and the caller should treat all credits as live (the SPV /
+// no-node-connection fallback).
+type multisigChainQuery func(ctx context.Context, op *wire.OutPoint) (*mondtypes.GetTxOutResult, error)
+
+// chainSyncerQueryFunc wraps a chain.Syncer into a multisigChainQuery. When the
+// syncer is nil (no node connection / SPV-only mode), the returned query is nil
+// so callers can detect "no chain to consult" and skip filtering.
+func chainSyncerQueryFunc(cs *chain.Syncer) multisigChainQuery {
+	if cs == nil {
+		return nil
+	}
+	return func(ctx context.Context, op *wire.OutPoint) (*mondtypes.GetTxOutResult, error) {
+		// includeMempool=true is intentional. A redemption authored against
+		// a multisig credit whose parent tx is still in mempool must not be
+		// dropped as "phantom" — the parent has been broadcast and the
+		// wallet legitimately needs to spend it. The residual race (parent
+		// gets evicted before the redemption is mined and the redemption
+		// becomes invalid) is acceptable: it has the same shape as any
+		// unmined-spend flow and the wallet retries. Do not "tighten" this
+		// to false thinking it strengthens validation — it breaks the
+		// just-broadcast-but-not-yet-mined path.
+		return cs.GetTxOut(ctx, &op.Hash, op.Index, op.Tree, true)
+	}
+}
+
+// filterLiveMultisigCredits partitions the wallet's recorded multisig credits
+// into those the node confirms are unspent (live) and those it does not
+// (skipped). When query is nil the chain cannot be consulted: returns msos
+// unchanged with an empty skipped list and a single WARN log so operators
+// know verification was bypassed. Per-credit query errors are logged but do
+// not block the credit — failing closed would deny recovery on transient RPC
+// flakes, which matters more for a recovery RPC than perfect accuracy.
+func filterLiveMultisigCredits(ctx context.Context, msos []*udb.MultisigCredit,
+	query multisigChainQuery) ([]*udb.MultisigCredit, []types.SkippedMultisigOutpoint) {
+
+	if query == nil {
+		if len(msos) > 0 {
+			log.Warnf("redeemmultisigouts: chain query unavailable; returning %d "+
+				"credits unverified (no node connection or SPV-only mode)", len(msos))
+		}
+		return msos, nil
+	}
+
+	// Fan-out the per-credit lookups concurrently. Pattern mirrors the
+	// signrawtransaction prevout fetch at methods.go:6847-6880.
+	//
+	// SetLimit caps in-flight gettxout calls: a wallet with thousands of
+	// accumulated multisig credits would otherwise stampede mond's RPC pool
+	// before the 256-cap in resolveRedeemMultiSigOutsCap fires (it runs after
+	// this filter). 16 keeps latency reasonable (~16 round-trip waves over a
+	// 256-credit batch) without saturating typical node configurations.
+	//
+	// Each call gets a per-credit 5s timeout so a single hung query does not
+	// stall g.Wait until the caller's outer context expires; on deadline we
+	// fall through to the "treat as live" branch below, preserving recovery
+	// behaviour on flaky nodes.
+	results := make([]*mondtypes.GetTxOutResult, len(msos))
+	errs := make([]error, len(msos))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(16)
+	for i, mso := range msos {
+		i, mso := i, mso
+		g.Go(func() error {
+			qctx, cancel := context.WithTimeout(gctx, 5*time.Second)
+			defer cancel()
+			res, err := query(qctx, mso.OutPoint)
+			results[i] = res
+			errs[i] = err
+			return nil // never abort the batch on a single failure
+		})
+	}
+	_ = g.Wait()
+
+	live := make([]*udb.MultisigCredit, 0, len(msos))
+	var skipped []types.SkippedMultisigOutpoint
+	for i, mso := range msos {
+		switch {
+		case errs[i] != nil:
+			log.Warnf("redeemmultisigouts: gettxout failed for %v: %v — "+
+				"treating credit as live and continuing", mso.OutPoint, errs[i])
+			live = append(live, mso)
+		case results[i] == nil:
+			log.Warnf("redeemmultisigouts: phantom multisig credit %v "+
+				"(coinType=%d, scriptHash=%x): node reports output as spent "+
+				"or never existed — skipping", mso.OutPoint, mso.CoinType,
+				mso.ScriptHash[:])
+			skipped = append(skipped, types.SkippedMultisigOutpoint{
+				Hash:     mso.OutPoint.Hash.String(),
+				Vout:     mso.OutPoint.Index,
+				Tree:     mso.OutPoint.Tree,
+				CoinType: uint8(mso.CoinType),
+				Reason:   "output not unspent on chain",
+			})
+		default:
+			live = append(live, mso)
+		}
+	}
+	return live, skipped
 }
 
 // redeemMultiSigOutsCollect iterates the cap-bounded multisig credits and

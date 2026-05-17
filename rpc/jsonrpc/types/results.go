@@ -97,12 +97,12 @@ type CreateSignatureResult struct {
 // than returning a signed tx with a warning — see the function comment in
 // internal/rpc/jsonrpc/methods.go for the rationale.
 type CreateAuthorizedEmissionResult struct {
-	Transaction     string `json:"transaction"`               // Hex-encoded signed transaction
-	TransactionHash string `json:"transactionhash"`           // Transaction hash
-	Nonce           uint64 `json:"nonce"`                     // Nonce used in this emission
-	TotalAmount     string `json:"totalamount"`               // Total amount being emitted (string for big.Int precision)
-	CoinType        uint8  `json:"cointype"`                  // Coin type being emitted
-	Warning         string `json:"warning,omitempty"`         // Operator-visible warning (e.g. local one-shot guard persistence failed)
+	Transaction     string `json:"transaction"`       // Hex-encoded signed transaction
+	TransactionHash string `json:"transactionhash"`   // Transaction hash
+	Nonce           uint64 `json:"nonce"`             // Nonce used in this emission
+	TotalAmount     string `json:"totalamount"`       // Total amount being emitted (string for big.Int precision)
+	CoinType        uint8  `json:"cointype"`          // Coin type being emitted
+	Warning         string `json:"warning,omitempty"` // Operator-visible warning (e.g. local one-shot guard persistence failed)
 }
 
 // GenerateEmissionKeyResult models the data returned from the generateemissionkey command.
@@ -389,9 +389,27 @@ type RedeemMultiSigOutResult struct {
 // outputs processed in a single call (server-side cap, currently 256). Callers
 // that see Truncated=true should spend the returned redemption transactions
 // and re-call to drain the remaining outputs.
+//
+// Skipped lists multisig credits the wallet considered unspent locally but the
+// node reports as missing/spent — typically orphans of a failed-publish multisig
+// tx that the wallet authored but the network never accepted. Surfaced rather
+// than silently dropped so operators can correlate stale wallet state with
+// on-chain truth.
 type RedeemMultiSigOutsResult struct {
 	Results   []RedeemMultiSigOutResult `json:"results"`
 	Truncated bool                      `json:"truncated"`
+	Skipped   []SkippedMultisigOutpoint `json:"skipped,omitempty"`
+}
+
+// SkippedMultisigOutpoint describes a multisig credit that the
+// redeemmultisigouts handler refused to author a redemption for because the
+// node's UTXO set disagrees with the wallet's bucketMultisigUsp record.
+type SkippedMultisigOutpoint struct {
+	Hash     string `json:"hash"`
+	Vout     uint32 `json:"vout"`
+	Tree     int8   `json:"tree"`
+	CoinType uint8  `json:"cointype"`
+	Reason   string `json:"reason"`
 }
 
 // SendToMultiSigResult models the data returned from the sendtomultisig
@@ -503,19 +521,19 @@ type ValidateAddressWalletResult = ValidateAddressResult
 
 // WalletInfoResult models the data returned from the walletinfo command.
 type WalletInfoResult struct {
-	DaemonConnected  bool    `json:"daemonconnected"`
-	SPV              bool    `json:"spv"`
-	Unlocked         bool    `json:"unlocked"`
-	CoinType         uint32  `json:"cointype,omitempty"`
-	TxFee            string  `json:"txfee"`
-	VoteBits         uint16  `json:"votebits"`
-	VoteBitsExtended string  `json:"votebitsextended"`
-	VoteVersion      uint32  `json:"voteversion"`
-	Voting           bool    `json:"voting"`
-	VSP              string  `json:"vsp"`
-	ManualTickets    bool    `json:"manualtickets"`
-	BirthHash        string  `json:"birthhash"`
-	BirthHeight      uint32  `json:"birthheight"`
+	DaemonConnected  bool   `json:"daemonconnected"`
+	SPV              bool   `json:"spv"`
+	Unlocked         bool   `json:"unlocked"`
+	CoinType         uint32 `json:"cointype,omitempty"`
+	TxFee            string `json:"txfee"`
+	VoteBits         uint16 `json:"votebits"`
+	VoteBitsExtended string `json:"votebitsextended"`
+	VoteVersion      uint32 `json:"voteversion"`
+	Voting           bool   `json:"voting"`
+	VSP              string `json:"vsp"`
+	ManualTickets    bool   `json:"manualtickets"`
+	BirthHash        string `json:"birthhash"`
+	BirthHeight      uint32 `json:"birthheight"`
 }
 
 // AccountUnlockedResult models the data returned by the accountunlocked

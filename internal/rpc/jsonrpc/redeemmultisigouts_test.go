@@ -11,6 +11,7 @@ import (
 
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
+	mondtypes "github.com/monetarium/monetarium-node/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/rpc/jsonrpc/types"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
@@ -287,4 +288,123 @@ func TestRedeemMultiSigOutsBatchCoinTypePropagation(t *testing.T) {
 			t.Errorf("filtered call CoinType: want SKA1, got %s", got)
 		}
 	})
+}
+
+// TestFilterLiveMultisigCreditsPhantomSKA mirrors Michael's reported scenario:
+// 2 live SKA + 2 live VAR + 1 phantom SKA. The phantom is the orphan left by a
+// failed-publish multisig tx (see RemoveUnconfirmed fix in txunmined.go). The
+// filter must drop the phantom from `live` and surface it in `skipped` with the
+// stored CoinType and the canonical reason string.
+func TestFilterLiveMultisigCreditsPhantomSKA(t *testing.T) {
+	hashFromByte := func(b byte) chainhash.Hash {
+		var h chainhash.Hash
+		h[0] = b
+		return h
+	}
+	ska := cointype.CoinType(1)
+	mk := func(h chainhash.Hash, ct cointype.CoinType) *udb.MultisigCredit {
+		return &udb.MultisigCredit{
+			OutPoint: &wire.OutPoint{Hash: h, Index: 0},
+			CoinType: ct,
+		}
+	}
+	liveSKA1 := mk(hashFromByte(0xA1), ska)
+	liveSKA2 := mk(hashFromByte(0xA2), ska)
+	liveVAR1 := mk(hashFromByte(0xB1), cointype.CoinTypeVAR)
+	liveVAR2 := mk(hashFromByte(0xB2), cointype.CoinTypeVAR)
+	phantomSKA := mk(hashFromByte(0xDE), ska)
+
+	msos := []*udb.MultisigCredit{liveSKA1, liveSKA2, liveVAR1, liveVAR2, phantomSKA}
+
+	// Stub: returns nil only for the phantom (gettxout's "spent or never
+	// existed" sentinel), non-nil for the rest. The stub treats any per-call
+	// error as live-passthrough, matching the production filter's policy.
+	query := func(_ context.Context, op *wire.OutPoint) (*mondtypes.GetTxOutResult, error) {
+		if op.Hash == phantomSKA.OutPoint.Hash {
+			return nil, nil
+		}
+		return &mondtypes.GetTxOutResult{}, nil
+	}
+
+	live, skipped := filterLiveMultisigCredits(context.Background(), msos, query)
+
+	if len(live) != 4 {
+		t.Fatalf("want 4 live credits, got %d", len(live))
+	}
+	for _, mso := range live {
+		if mso.OutPoint.Hash == phantomSKA.OutPoint.Hash {
+			t.Errorf("phantom %v leaked into live set", mso.OutPoint)
+		}
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("want 1 skipped entry, got %d", len(skipped))
+	}
+	sk := skipped[0]
+	if sk.Hash != phantomSKA.OutPoint.Hash.String() {
+		t.Errorf("skipped.Hash: want %s, got %s", phantomSKA.OutPoint.Hash, sk.Hash)
+	}
+	if sk.CoinType != uint8(ska) {
+		t.Errorf("skipped.CoinType: want %d, got %d", ska, sk.CoinType)
+	}
+	if sk.Reason != "output not unspent on chain" {
+		t.Errorf("skipped.Reason: want %q, got %q",
+			"output not unspent on chain", sk.Reason)
+	}
+}
+
+// TestFilterLiveMultisigCreditsSPVFallback pins the no-node-connection path:
+// query==nil (no chain.Syncer to consult) must pass every credit through
+// unchanged rather than block recovery on operators running SPV-only.
+func TestFilterLiveMultisigCreditsSPVFallback(t *testing.T) {
+	mk := func(b byte) *udb.MultisigCredit {
+		var h chainhash.Hash
+		h[0] = b
+		return &udb.MultisigCredit{OutPoint: &wire.OutPoint{Hash: h}}
+	}
+	msos := []*udb.MultisigCredit{mk(0x01), mk(0x02), mk(0x03)}
+
+	live, skipped := filterLiveMultisigCredits(context.Background(), msos, nil)
+
+	if len(live) != len(msos) {
+		t.Errorf("SPV fallback: want all %d credits passed through, got %d", len(msos), len(live))
+	}
+	if len(skipped) != 0 {
+		t.Errorf("SPV fallback: want skipped empty, got %d entries", len(skipped))
+	}
+	for i := range msos {
+		if live[i] != msos[i] {
+			t.Errorf("SPV fallback: live[%d] should pass the input through unmodified", i)
+		}
+	}
+}
+
+// TestFilterLiveMultisigCreditsTransientErrorPassesThrough verifies that a
+// per-credit gettxout failure (e.g., transient RPC flake) is treated as live
+// rather than dropped. Failing closed on transient errors would deny recovery
+// on flaky links, which matters more for a recovery RPC than perfect accuracy.
+func TestFilterLiveMultisigCreditsTransientErrorPassesThrough(t *testing.T) {
+	hashFromByte := func(b byte) chainhash.Hash {
+		var h chainhash.Hash
+		h[0] = b
+		return h
+	}
+	flaky := &udb.MultisigCredit{OutPoint: &wire.OutPoint{Hash: hashFromByte(0xEE)}}
+	ok := &udb.MultisigCredit{OutPoint: &wire.OutPoint{Hash: hashFromByte(0xFF)}}
+
+	query := func(_ context.Context, op *wire.OutPoint) (*mondtypes.GetTxOutResult, error) {
+		if op.Hash == flaky.OutPoint.Hash {
+			return nil, errors.New("transient rpc error")
+		}
+		return &mondtypes.GetTxOutResult{}, nil
+	}
+
+	live, skipped := filterLiveMultisigCredits(context.Background(),
+		[]*udb.MultisigCredit{flaky, ok}, query)
+
+	if len(live) != 2 {
+		t.Fatalf("want both credits in live (transient-error passthrough), got %d", len(live))
+	}
+	if len(skipped) != 0 {
+		t.Errorf("want skipped empty for transient errors, got %d entries", len(skipped))
+	}
 }

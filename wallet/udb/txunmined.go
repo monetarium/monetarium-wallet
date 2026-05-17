@@ -209,6 +209,22 @@ func (s *Store) RemoveUnconfirmed(ns walletdb.ReadWriteBucket, tx *wire.MsgTx, t
 			return err
 		}
 
+		// Drain any speculative multisig record left behind by
+		// insertMultisigOutIntoTxMgr (createtx.go) when this tx authored a
+		// P2SH multisig output. Without this, an abandoned-publish multisig
+		// tx leaves the entry in bucketMultisig and bucketMultisigUsp forever,
+		// causing redeemmultisigouts to emit a raw transaction for an output
+		// that never reached the chain. Both deletes are idempotent (no-op
+		// on missing keys), so call them unconditionally — this also drains
+		// any legacy bucketMultisigUsp orphans whose matching bucketMultisig
+		// entry was already removed.
+		if err := deleteMultisigOutUS(ns, k); err != nil {
+			return err
+		}
+		if err := deleteMultisigOut(ns, k); err != nil {
+			return err
+		}
+
 		if (stxType == stake.TxTypeSStx) && (i%2 == 1) {
 			// An unconfirmed ticket leaving the store means we need to delete
 			// the respective commitment and its entry from the unspent
