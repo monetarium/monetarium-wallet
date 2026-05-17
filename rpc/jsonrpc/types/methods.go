@@ -1011,13 +1011,14 @@ type RescanWalletCmd struct {
 
 // SendFromCmd defines the sendfrom JSON-RPC command.
 type SendFromCmd struct {
-	FromAccount string
-	ToAddress   string
-	Amount      string // Coin amount as string (preserves precision for SKA)
-	MinConf     *int   `jsonrpcdefault:"1"`
-	Comment     *string
-	CommentTo   *string
-	CoinType    *uint8 `json:"cointype,omitempty"` // Optional: specify coin type (0=VAR, 1-255=SKA)
+	FromAccount           string
+	ToAddress             string
+	Amount                string // Coin amount as string (preserves precision for SKA)
+	MinConf               *int   `jsonrpcdefault:"1"`
+	Comment               *string
+	CommentTo             *string
+	CoinType              *uint8 `json:"cointype,omitempty"`              // Optional: specify coin type (0=VAR, 1-255=SKA)
+	SubtractFeeFromAmount *bool  `json:"subtractfeefromamount,omitempty"` // Optional: when true, fee is taken from the recipient amount instead of change (Bitcoin Core parity)
 }
 
 // NewSendFromCmd returns a new instance which can be used to issue a sendfrom
@@ -1046,6 +1047,22 @@ func NewSendFromCmdWithCoinType(fromAccount, toAddress, amount string, minConf *
 		Comment:     comment,
 		CommentTo:   commentTo,
 		CoinType:    coinType,
+	}
+}
+
+// NewSendFromCmdWithSubtractFee returns a new SendFromCmd with both coin type
+// and the subtractfeefromamount flag specified. Either pointer may be nil to
+// fall back to the default (VAR / false).
+func NewSendFromCmdWithSubtractFee(fromAccount, toAddress, amount string, minConf *int, comment, commentTo *string, coinType *uint8, subtractFeeFromAmount *bool) *SendFromCmd {
+	return &SendFromCmd{
+		FromAccount:           fromAccount,
+		ToAddress:             toAddress,
+		Amount:                amount,
+		MinConf:               minConf,
+		Comment:               comment,
+		CommentTo:             commentTo,
+		CoinType:              coinType,
+		SubtractFeeFromAmount: subtractFeeFromAmount,
 	}
 }
 

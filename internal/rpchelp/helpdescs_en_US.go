@@ -689,7 +689,7 @@ var helpDescsEnUS = map[string]string{
 	"listreceivedbyaddressresult-account":           "DEPRECATED -- Unset",
 	"listreceivedbyaddressresult-address":           "The payment address",
 	"listreceivedbyaddressresult-amount":            "Total amount received by the payment address valued in Monetarium",
-	"listreceivedbyaddressresult-amountstr":          "Total amount as a full-precision decimal string",
+	"listreceivedbyaddressresult-amountstr":         "Total amount as a full-precision decimal string",
 	"listreceivedbyaddressresult-confirmations":     "Number of block confirmations of the most recent transaction relevant to the address",
 	"listreceivedbyaddressresult-txids":             "Transaction hashes of all transactions involving this address",
 	"listreceivedbyaddressresult-involvesWatchonly": "Unset",
@@ -846,14 +846,15 @@ var helpDescsEnUS = map[string]string{
 	// SendFromCmd help.
 	"sendfrom--synopsis": "Authors, signs, and sends a transaction that outputs some amount to a payment address.\n" +
 		"A change output is automatically included to send extra output value back to the original account.",
-	"sendfrom-fromaccount": "Account to pick unspent outputs from",
-	"sendfrom-toaddress":   "Address to pay",
-	"sendfrom-amount":      "Amount to send to the payment address valued in Monetarium",
-	"sendfrom-minconf":     "Minimum number of block confirmations required before a transaction output is eligible to be spent",
-	"sendfrom-comment":     "Unused",
-	"sendfrom-commentto":   "Unused",
-	"sendfrom-cointype":    "Optional coin type to send (0=VAR, 1-255=SKA)",
-	"sendfrom--result0":    "The transaction hash of the sent transaction",
+	"sendfrom-fromaccount":           "Account to pick unspent outputs from",
+	"sendfrom-toaddress":             "Address to pay",
+	"sendfrom-amount":                "Amount to send to the payment address valued in Monetarium",
+	"sendfrom-minconf":               "Minimum number of block confirmations required before a transaction output is eligible to be spent",
+	"sendfrom-comment":               "Unused",
+	"sendfrom-commentto":             "Unused",
+	"sendfrom-cointype":              "Optional coin type to send (0=VAR, 1-255=SKA)",
+	"sendfrom-subtractfeefromamount": "Optional. When true, the transaction fee is deducted from the recipient amount instead of the sender's change. The recipient receives less than the requested amount and the sender spends exactly the requested amount in inputs. Errors if the requested amount does not cover the fee plus the dust threshold.",
+	"sendfrom--result0":              "The transaction hash of the sent transaction",
 
 	// SendFromTreasuryCmd help.
 	"sendfromtreasury--synopsis":      "Send from treasury balance to multiple recipients.",

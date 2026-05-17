@@ -870,6 +870,27 @@ func TestWalletSvrCmds(t *testing.T) {
 			},
 		},
 		{
+			name: "sendfrom optional4",
+			newCmd: func() (any, error) {
+				return dcrjson.NewCmd(Method("sendfrom"), "from", "1Address", "0.5", 6, "comment", "commentto", 1, true)
+			},
+			staticCmd: func() any {
+				return NewSendFromCmdWithSubtractFee("from", "1Address", "0.5", dcrjson.Int(6),
+					dcrjson.String("comment"), dcrjson.String("commentto"), uint8Ptr(1), dcrjson.Bool(true))
+			},
+			marshalled: `{"jsonrpc":"1.0","method":"sendfrom","params":["from","1Address","0.5",6,"comment","commentto",1,true],"id":1}`,
+			unmarshalled: &SendFromCmd{
+				FromAccount:           "from",
+				ToAddress:             "1Address",
+				Amount:                "0.5",
+				MinConf:               dcrjson.Int(6),
+				Comment:               dcrjson.String("comment"),
+				CommentTo:             dcrjson.String("commentto"),
+				CoinType:              uint8Ptr(1),
+				SubtractFeeFromAmount: dcrjson.Bool(true),
+			},
+		},
+		{
 			name: "sendmany",
 			newCmd: func() (any, error) {
 				return dcrjson.NewCmd(Method("sendmany"), "from", `{"1Address":"0.5"}`)

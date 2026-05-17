@@ -6228,8 +6228,18 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 	pairsBig := map[string]*big.Int{
 		cmd.ToAddress: amtBig,
 	}
-	// sendfrom does not currently expose subtractfeefromamount; pass -1.
-	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType, -1)
+
+	// Resolve subtractfeefromamount: when true, the single recipient output
+	// absorbs the fee. nil/false → -1 (default behavior).
+	//
+	// Invariant: sendfrom builds pairsBig with exactly one entry from
+	// cmd.ToAddress, so index 0 is always the recipient. If sendfrom ever
+	// grows multi-recipient support, this hardcoded 0 must be revisited.
+	subtractFeeIdx := -1
+	if cmd.SubtractFeeFromAmount != nil && *cmd.SubtractFeeFromAmount {
+		subtractFeeIdx = 0
+	}
+	return s.sendPairsWithCoinTypeBig(ctx, w, pairsBig, account, minConf, coinType, subtractFeeIdx)
 }
 
 // sendMany handles a sendmany RPC request by creating a new transaction
