@@ -416,8 +416,22 @@ func (fp *vspFeePayment) reconcilePayment() error {
 		err := fp.makeFeeTx(nil)
 		if err != nil {
 			var apiErr types.ErrorResponse
-			if errors.As(err, &apiErr) && apiErr.Code == types.ErrTicketCannotVote {
+			isAPIErr := errors.As(err, &apiErr)
+			switch {
+			case isAPIErr && apiErr.Code == types.ErrTicketCannotVote:
 				fp.remove("ticket cannot vote")
+			case isAPIErr && apiErr.Code == types.ErrFeeAlreadyReceived,
+				errors.Is(err, errStopped):
+				// Nothing to retry.
+			default:
+				// Try again, as with failures to submit the payment.
+				// Start from a new fee tx: the failed one may be half
+				// built, or hold inputs a ticket purchase has since
+				// unlocked.
+				fp.mu.Lock()
+				fp.feeTx = nil
+				fp.mu.Unlock()
+				fp.schedule("reconcile payment", fp.reconcilePayment)
 			}
 			return err
 		}
@@ -534,8 +548,9 @@ func (fp *vspFeePayment) submitPayment() (err error) {
 	if err != nil {
 		var apiErr types.ErrorResponse
 		if errors.As(err, &apiErr) && apiErr.Code == types.ErrFeeExpired {
-			// Fee has been expired, so abandon current feetx, set fp.feeTx
-			// to nil and retry submit payment to make a new fee tx.
+			// Fee has been expired, so abandon current feetx and forget
+			// the expired fee amount.  The retry then asks the VSP for a
+			// new fee and makes a new fee tx.
 			feeHash := feeTx.TxHash()
 			err := w.AbandonTransaction(ctx, &feeHash)
 			if err != nil {
@@ -543,6 +558,7 @@ func (fp *vspFeePayment) submitPayment() (err error) {
 			}
 			fp.mu.Lock()
 			fp.feeTx = nil
+			fp.fee = 0
 			fp.mu.Unlock()
 		}
 		return fmt.Errorf("payfee: %w", err)

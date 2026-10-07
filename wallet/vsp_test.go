@@ -1,0 +1,265 @@
+// Copyright (c) 2026 The Monetarium developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package wallet
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/decred/slog"
+	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/txscript/stdaddr"
+	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
+)
+
+// apiError is a reply that makes the vspd client return types.ErrorResponse
+// with the given code.
+func apiError(code types.ErrorCode) (int, any) {
+	return code.HTTPStatus(), types.ErrorResponse{Code: code, Message: code.DefaultMessage()}
+}
+
+// testVSPClient returns an unlocked wallet with a VSP client pointed at a fake
+// VSP. reply receives the request path and body and returns the HTTP status
+// and the JSON body to send back; the fake signs it with its own key, as vspd
+// does.
+func testVSPClient(ctx context.Context, t *testing.T, reply func(path string, body []byte) (int, any)) *VSPClient {
+	t.Helper()
+
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	t.Cleanup(teardown)
+	if err := w.Unlock(ctx, testPrivPass, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		status, resp := reply(r.URL.Path, body)
+		out, _ := json.Marshal(resp)
+		rw.Header().Set("VSP-Server-Signature",
+			base64.StdEncoding.EncodeToString(ed25519.Sign(priv, out)))
+		rw.WriteHeader(status)
+		rw.Write(out)
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := w.NewVSPClient(VSPClientConfig{
+		URL:    srv.URL,
+		PubKey: base64.StdEncoding.EncodeToString(pub),
+		Policy: &VSPPolicy{MaxFee: 1e8},
+	}, slog.Disabled, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, fp := range c.jobs {
+			fp.stop()
+		}
+	})
+	return c
+}
+
+// testVSPTicket records an unmined ticket purchase in the client's wallet and
+// returns it. Its voting and commitment addresses belong to the wallet, so
+// requests about it can be signed. id makes each ticket distinct.
+func testVSPTicket(ctx context.Context, t *testing.T, c *VSPClient, id byte) *VSPTicket {
+	t.Helper()
+
+	addr, err := c.wallet.NewExternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stakeAddr, ok := addr.(stdaddr.StakeAddress)
+	if !ok {
+		t.Fatalf("%T is not a stake address", addr)
+	}
+
+	const price = 1e8
+	tx := wire.NewMsgTx()
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{id}}, price, nil))
+	ver, script := stakeAddr.VotingRightsScript()
+	tx.AddTxOut(&wire.TxOut{Value: price, Version: ver, PkScript: script})
+	ver, script = stakeAddr.RewardCommitmentScript(price, 0, 0)
+	tx.AddTxOut(&wire.TxOut{Version: ver, PkScript: script})
+	ver, script = stakeAddr.StakeChangeScript()
+	tx.AddTxOut(&wire.TxOut{Version: ver, PkScript: script})
+
+	err = walletdb.Update(ctx, c.wallet.db, func(dbtx walletdb.ReadWriteTx) error {
+		rec, err := udb.NewTxRecordFromMsgTx(tx, time.Now())
+		if err != nil {
+			return err
+		}
+		return c.wallet.txStore.InsertMemPoolTx(dbtx, rec)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hash := tx.TxHash()
+	return &VSPTicket{
+		hash:           &hash,
+		rawTx:          tx,
+		parentTx:       wire.NewMsgTx(),
+		commitmentAddr: stakeAddr,
+		votingAddr:     stakeAddr,
+		wallet:         c.wallet,
+	}
+}
+
+// TestVSPExpiredFeeRequestsNewQuote checks that once the VSP reports the fee
+// as expired, the next attempt asks the VSP for a new fee amount and address
+// instead of paying the expired quote again.
+func TestVSPExpiredFeeRequestsNewQuote(t *testing.T) {
+	ctx := context.Background()
+	var feeAddressCalls atomic.Int32
+	c := testVSPClient(ctx, t, func(path string, _ []byte) (int, any) {
+		switch path {
+		case "/api/v3/payfee":
+			return apiError(types.ErrFeeExpired)
+		case "/api/v3/feeaddress":
+			feeAddressCalls.Add(1)
+		}
+		return apiError(types.ErrInternalError)
+	})
+	ticket := testVSPTicket(ctx, t, c, 1)
+
+	feeTx := wire.NewMsgTx()
+	feeTx.AddTxOut(wire.NewTxOut(1e7, []byte{0x51}))
+	fp := &vspFeePayment{
+		client:  c,
+		ctx:     ctx,
+		ticket:  ticket,
+		policy:  c.policy,
+		params:  c.wallet.chainParams,
+		fee:     1e7,
+		feeAddr: ticket.votingAddr,
+		feeTx:   feeTx,
+	}
+
+	var apiErr types.ErrorResponse
+	err := fp.submitPayment()
+	if !errors.As(err, &apiErr) || apiErr.Code != types.ErrFeeExpired {
+		t.Fatalf("submitPayment: want ErrFeeExpired, got %v", err)
+	}
+
+	// The fake VSP refuses the new quote; only the request matters here.
+	_ = fp.makeFeeTx(nil)
+	if n := feeAddressCalls.Load(); n != 1 {
+		t.Fatalf("after an expired fee, the next attempt made %d feeaddress "+
+			"requests, want 1", n)
+	}
+}
+
+// TestVSPReconcileRetriesWhenFeeTxFails checks that a failure to create the
+// fee transaction schedules another attempt with a new fee transaction, unless
+// the VSP says the ticket can never vote or already has its fee.
+func TestVSPReconcileRetriesWhenFeeTxFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      types.ErrorCode
+		wantRetry bool
+	}{
+		{"VSP error", types.ErrInternalError, true},
+		{"ticket cannot vote", types.ErrTicketCannotVote, false},
+		{"fee already received", types.ErrFeeAlreadyReceived, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c := testVSPClient(ctx, t, func(string, []byte) (int, any) {
+				return apiError(tc.code)
+			})
+			// A ticket purchase hands Process a fee tx with inputs, and
+			// unlocks them again once Process fails.
+			purchaseTx := wire.NewMsgTx()
+			purchaseTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{0xca}}, 1e8, nil))
+			fp := &vspFeePayment{
+				client: c,
+				ctx:    ctx,
+				ticket: testVSPTicket(ctx, t, c, 1),
+				policy: c.policy,
+				params: c.wallet.chainParams,
+				feeTx:  purchaseTx,
+			}
+			c.jobs[*fp.ticket.Hash()] = fp
+
+			if err := fp.reconcilePayment(); err == nil {
+				t.Fatal("reconcilePayment: want an error from the fake VSP")
+			}
+			fp.timerMu.Lock()
+			retry := fp.timer != nil
+			fp.timerMu.Unlock()
+			if retry != tc.wantRetry {
+				t.Fatalf("retry scheduled = %v, want %v", retry, tc.wantRetry)
+			}
+			fp.mu.Lock()
+			reused := fp.feeTx != nil
+			fp.mu.Unlock()
+			if retry && reused {
+				t.Fatal("the retry would reuse the failed attempt's fee tx")
+			}
+		})
+	}
+}
+
+// TestVSPProcessManagedTicketsContinuesPastConfirmed checks that a ticket
+// whose fee the VSP has already confirmed does not stop the remaining tickets
+// from being resumed.
+func TestVSPProcessManagedTicketsContinuesPastConfirmed(t *testing.T) {
+	ctx := context.Background()
+	var confirmedHash string // set once the ticket exists
+	c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+		if path != "/api/v3/ticketstatus" {
+			return apiError(types.ErrInternalError)
+		}
+		var req types.TicketStatusRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			return apiError(types.ErrBadRequest)
+		}
+		if req.TicketHash == confirmedHash {
+			return http.StatusOK, types.TicketStatusResponse{
+				FeeTxStatus: "confirmed",
+				FeeTxHash:   chainhash.Hash{0xfe}.String(),
+				Request:     body,
+			}
+		}
+		return http.StatusOK, types.TicketStatusResponse{
+			FeeTxStatus: "none",
+			Request:     body,
+		}
+	})
+	confirmed := testVSPTicket(ctx, t, c, 1)
+	unpaid := testVSPTicket(ctx, t, c, 2)
+	confirmedHash = confirmed.Hash().String()
+
+	err := c.ProcessManagedTickets(ctx, []*VSPTicket{confirmed, unpaid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	_, resumed := c.jobs[*unpaid.Hash()]
+	c.mu.Unlock()
+	if !resumed {
+		t.Fatal("the unpaid ticket after a confirmed one was not resumed")
+	}
+}
