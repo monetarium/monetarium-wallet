@@ -222,6 +222,96 @@ func TestVSPReconcileRetriesWhenFeeTxFails(t *testing.T) {
 	}
 }
 
+// TestVSPReconcileRetryRequestsNewQuote checks that when the fee transaction
+// cannot be created for a fee the client already holds, the retry asks the VSP
+// for the fee again, so it learns if the VSP has received one meanwhile.
+func TestVSPReconcileRetryRequestsNewQuote(t *testing.T) {
+	ctx := context.Background()
+	var feeAddressCalls atomic.Int32
+	c := testVSPClient(ctx, t, func(path string, _ []byte) (int, any) {
+		if path == "/api/v3/feeaddress" {
+			feeAddressCalls.Add(1)
+		}
+		return apiError(types.ErrInternalError)
+	})
+	ticket := testVSPTicket(ctx, t, c, 1)
+	fp := &vspFeePayment{
+		client:  c,
+		ctx:     ctx,
+		ticket:  ticket,
+		policy:  c.policy,
+		params:  c.wallet.chainParams,
+		fee:     1e7,
+		feeAddr: ticket.votingAddr,
+	}
+	c.jobs[*ticket.Hash()] = fp
+
+	// The test wallet has no funds to pay the fee from.
+	if err := fp.reconcilePayment(); err == nil {
+		t.Fatal("reconcilePayment: want an error from an empty wallet")
+	}
+	fp.stop()
+	_ = fp.makeFeeTx(nil)
+	if n := feeAddressCalls.Load(); n != 1 {
+		t.Fatalf("after a failed fee tx, the retry made %d feeaddress "+
+			"requests, want 1", n)
+	}
+}
+
+// TestVSPReconcileRetryKeepsFinishedFeeTx checks that a failed attempt keeps a
+// fee transaction that a concurrent Process call finished for the same ticket
+// while the attempt waited on the VSP, and drops one that Process left
+// unfinished.
+func TestVSPReconcileRetryKeepsFinishedFeeTx(t *testing.T) {
+	tests := []struct {
+		name     string
+		finished bool
+	}{
+		{"finished", true},
+		{"unfinished", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			other := wire.NewMsgTx()
+			other.AddTxOut(wire.NewTxOut(1e7, []byte{0x51}))
+			var fp *vspFeePayment
+			c := testVSPClient(ctx, t, func(path string, _ []byte) (int, any) {
+				if path == "/api/v3/feeaddress" {
+					// Process stores its fee tx in the job first,
+					// and records its hash once the tx is made.
+					fp.mu.Lock()
+					fp.feeTx = other
+					if tc.finished {
+						fp.feeHash = other.TxHash()
+					}
+					fp.mu.Unlock()
+				}
+				return apiError(types.ErrInternalError)
+			})
+			fp = &vspFeePayment{
+				client: c,
+				ctx:    ctx,
+				ticket: testVSPTicket(ctx, t, c, 1),
+				policy: c.policy,
+				params: c.wallet.chainParams,
+			}
+			c.jobs[*fp.ticket.Hash()] = fp
+
+			if err := fp.reconcilePayment(); err == nil {
+				t.Fatal("reconcilePayment: want an error from the fake VSP")
+			}
+			fp.mu.Lock()
+			kept := fp.feeTx == other
+			fp.mu.Unlock()
+			if kept != tc.finished {
+				t.Fatalf("fee tx made by Process kept = %v, want %v",
+					kept, tc.finished)
+			}
+		})
+	}
+}
+
 // TestVSPProcessManagedTicketsContinuesPastConfirmed checks that a ticket
 // whose fee the VSP has already confirmed does not stop the remaining tickets
 // from being resumed.

@@ -411,6 +411,7 @@ func (fp *vspFeePayment) reconcilePayment() error {
 	// creating the feePayment.
 	fp.mu.Lock()
 	feeTx := fp.feeTx
+	startHash := fp.feeHash
 	fp.mu.Unlock()
 	if feeTx == nil || len(feeTx.TxOut) == 0 {
 		err := fp.makeFeeTx(nil)
@@ -425,11 +426,16 @@ func (fp *vspFeePayment) reconcilePayment() error {
 				// Nothing to retry.
 			default:
 				// Try again, as with failures to submit the payment.
-				// Start from a new fee tx: the failed one may be half
-				// built, or hold inputs a ticket purchase has since
-				// unlocked.
+				// Unless a concurrent Process call made a fee tx
+				// meanwhile, ask the VSP for the fee again, as it may
+				// have received one, and start from a new fee tx: the
+				// failed one may be half built, or hold inputs a ticket
+				// purchase has since unlocked.
 				fp.mu.Lock()
-				fp.feeTx = nil
+				if fp.feeHash == startHash {
+					fp.fee = 0
+					fp.feeTx = nil
+				}
 				fp.mu.Unlock()
 				fp.schedule("reconcile payment", fp.reconcilePayment)
 			}
