@@ -259,17 +259,42 @@ func TestVSPReconcileRetryRequestsNewQuote(t *testing.T) {
 }
 
 // TestVSPReconcileRetryKeepsFinishedFeeTx checks that a failed attempt keeps a
-// fee transaction that a concurrent Process call finished for the same ticket
-// while the attempt waited on the VSP, and drops one that Process left
-// unfinished.
+// fee transaction, and its fee, that a concurrent Process call finished for the
+// same ticket while the attempt waited on the VSP. If Process left its fee tx
+// unfinished, or a concurrent attempt cleared it, the retry must ask for the
+// fee again.
 func TestVSPReconcileRetryKeepsFinishedFeeTx(t *testing.T) {
 	tests := []struct {
-		name     string
-		finished bool
-	}{
-		{"finished", true},
-		{"unfinished", false},
-	}
+		name      string
+		startHash chainhash.Hash // fee hash of the job when the attempt starts
+		process   func(fp *vspFeePayment, other *wire.MsgTx)
+		wantKept  bool
+	}{{
+		// Process records the hash once its fee tx is made.
+		name: "finished",
+		process: func(fp *vspFeePayment, other *wire.MsgTx) {
+			fp.feeTx = other
+			fp.feeHash = other.TxHash()
+		},
+		wantKept: true,
+	}, {
+		// Process builds its fee tx in place in the job, and has not
+		// recorded the hash yet.
+		name: "unfinished",
+		process: func(fp *vspFeePayment, other *wire.MsgTx) {
+			fp.feeTx = other
+		},
+	}, {
+		// A concurrent attempt whose fee tx the VSP rejected clears the
+		// tx and the hash. The job still holds an earlier, expired fee's
+		// hash.
+		name:      "failed",
+		startHash: chainhash.Hash{0xee},
+		process: func(fp *vspFeePayment, _ *wire.MsgTx) {
+			fp.feeTx = nil
+			fp.feeHash = chainhash.Hash{}
+		},
+	}}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -278,23 +303,21 @@ func TestVSPReconcileRetryKeepsFinishedFeeTx(t *testing.T) {
 			var fp *vspFeePayment
 			c := testVSPClient(ctx, t, func(path string, _ []byte) (int, any) {
 				if path == "/api/v3/feeaddress" {
-					// Process stores its fee tx in the job first,
-					// and records its hash once the tx is made.
+					// A concurrent call left a quote in the job.
 					fp.mu.Lock()
-					fp.feeTx = other
-					if tc.finished {
-						fp.feeHash = other.TxHash()
-					}
+					fp.fee = 1e7
+					tc.process(fp, other)
 					fp.mu.Unlock()
 				}
 				return apiError(types.ErrInternalError)
 			})
 			fp = &vspFeePayment{
-				client: c,
-				ctx:    ctx,
-				ticket: testVSPTicket(ctx, t, c, 1),
-				policy: c.policy,
-				params: c.wallet.chainParams,
+				client:  c,
+				ctx:     ctx,
+				ticket:  testVSPTicket(ctx, t, c, 1),
+				policy:  c.policy,
+				params:  c.wallet.chainParams,
+				feeHash: tc.startHash,
 			}
 			c.jobs[*fp.ticket.Hash()] = fp
 
@@ -303,10 +326,12 @@ func TestVSPReconcileRetryKeepsFinishedFeeTx(t *testing.T) {
 			}
 			fp.mu.Lock()
 			kept := fp.feeTx == other
+			requote := fp.fee == 0
 			fp.mu.Unlock()
-			if kept != tc.finished {
-				t.Fatalf("fee tx made by Process kept = %v, want %v",
-					kept, tc.finished)
+			if kept != tc.wantKept || requote == tc.wantKept {
+				t.Fatalf("concurrent fee tx kept = %v, fee asked "+
+					"again = %v; want %v, %v",
+					kept, requote, tc.wantKept, !tc.wantKept)
 			}
 		})
 	}

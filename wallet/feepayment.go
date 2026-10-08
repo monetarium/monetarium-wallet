@@ -430,9 +430,11 @@ func (fp *vspFeePayment) reconcilePayment() error {
 				// meanwhile, ask the VSP for the fee again, as it may
 				// have received one, and start from a new fee tx: the
 				// failed one may be half built, or hold inputs a ticket
-				// purchase has since unlocked.
+				// purchase has since unlocked.  A made fee tx sets a
+				// new hash; one the VSP finds invalid or cannot
+				// broadcast zeroes it.
 				fp.mu.Lock()
-				if fp.feeHash == startHash {
+				if fp.feeHash == startHash || fp.feeHash == (chainhash.Hash{}) {
 					fp.fee = 0
 					fp.feeTx = nil
 				}
