@@ -178,7 +178,7 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 			if err != nil {
 				return err
 			}
-			return nil
+			continue
 		} else if status.FeeTxHash != "" {
 			feeHash, err := chainhash.NewHashFromStr(status.FeeTxHash)
 			if err != nil {
