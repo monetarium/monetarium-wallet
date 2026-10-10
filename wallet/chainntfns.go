@@ -655,6 +655,62 @@ func selectOwnedTickets(w *Wallet, dbtx walletdb.ReadTx, tickets []*chainhash.Ha
 	return owned
 }
 
+// ticketConsolidationHash160 returns the hash160 that a vote's SSFee
+// consolidation output should pay for the given ticket. ticketAddr is the
+// ticket's first commitment address and commitmentHash160 its hash160.
+//
+// When the commitment address belongs to an account of this wallet, the
+// account's consolidation address is used: the custom one if set, otherwise
+// the account's first external address. That is the buyer voting their own
+// ticket.
+//
+// When it does not, the ticket's own commitment hash160 is used. This is the
+// normal case for a VSP voting wallet, which holds only the ticket's imported
+// voting key while the commitment address belongs to the buyer — so it must
+// not be treated as an error. It used to be, and the vote was abandoned: on
+// the Monetarium testnet VSP two voting wallets held 26 tickets and cast not
+// one vote, the only trace being a single error line per called ticket. The
+// votes that did appear came from buyers' own online wallets, which is why
+// the failure stayed invisible until a buyer went offline and the ticket was
+// missed.
+//
+// The commitment hash160 is the right fallback rather than an address of the
+// voting wallet, for two reasons. It moves no one's money: internal/mining
+// pays this output, and the commitment address is the same party the vote's
+// VAR reward already pays a couple of outputs earlier, so the buyer keeps
+// their fee income — whereas a voting-wallet address would quietly divert
+// every customer's SSFee to the VSP operator, which consensus would not
+// object to (validate.go only requires the recipient to match some voter's
+// consolidation address). And it is derived from the ticket, so redundant
+// voting wallets all stamp the same value and keep producing byte-identical
+// votes instead of mutually double-spending ones.
+func (w *Wallet) ticketConsolidationHash160(dbtx walletdb.ReadTx,
+	addrmgrNs walletdb.ReadBucket, ticketHash *chainhash.Hash,
+	ticketAddr stdaddr.StakeAddress, commitmentHash160 []byte) ([]byte, error) {
+
+	accountNumber, err := w.manager.AddrAccount(addrmgrNs, ticketAddr)
+	if err != nil {
+		log.Debugf("No local account for ticket %v commitment address "+
+			"(expected for a VSP voting wallet); consolidating SSFee to "+
+			"the ticket's commitment address", ticketHash)
+		return commitmentHash160, nil
+	}
+
+	accountName, err := w.manager.AccountName(addrmgrNs, accountNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	customHash160, err := udb.GetAccountConsolidationAddr(dbtx, accountName)
+	if err != nil {
+		return nil, err
+	}
+	if customHash160 != nil {
+		return customHash160, nil
+	}
+	return w.getFirstExternalAddressHash160(dbtx, accountName)
+}
+
 // VoteOnOwnedTickets creates and publishes vote transactions for all owned
 // tickets in the winningTicketHashes slice if wallet voting is enabled.  The
 // vote is only valid when voting on the block described by the passed block
@@ -747,37 +803,13 @@ func (w *Wallet) VoteOnOwnedTickets(ctx context.Context, winningTicketHashes []*
 				continue
 			}
 
-			// Look up account for this address
-			accountNumber, err := w.manager.AddrAccount(addrmgrNs, ticketAddr)
+			// Where this vote's SSFee consolidation output pays.
+			consolidationHash160, err := w.ticketConsolidationHash160(dbtx,
+				addrmgrNs, ticketHash, ticketAddr, ticketHash160s[0])
 			if err != nil {
-				log.Errorf("Failed to find account for ticket %v: %v", ticketHash, err)
+				log.Errorf("Failed to determine SSFee consolidation address "+
+					"for ticket %v: %v", ticketHash, err)
 				continue
-			}
-			accountName, err := w.manager.AccountName(addrmgrNs, accountNumber)
-			if err != nil {
-				log.Errorf("Failed to get account name for ticket %v: %v", ticketHash, err)
-				continue
-			}
-
-			// Get consolidation address for this account
-			// First get custom address if set, otherwise use auto-default (first external address)
-			var consolidationHash160 []byte
-			customHash160, err := udb.GetAccountConsolidationAddr(dbtx, accountName)
-			if err != nil {
-				log.Errorf("Failed to get consolidation address for account %s: %v",
-					accountName, err)
-				continue
-			}
-			if customHash160 != nil {
-				consolidationHash160 = customHash160
-			} else {
-				// Use auto-default: first external address (index 0)
-				consolidationHash160, err = w.getFirstExternalAddressHash160(dbtx, accountName)
-				if err != nil {
-					log.Errorf("Failed to get default consolidation address for account %s: %v",
-						accountName, err)
-					continue
-				}
 			}
 
 			ticketVoteBits := defaultVoteBits
