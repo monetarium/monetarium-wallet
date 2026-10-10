@@ -474,6 +474,12 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 	return
 }
 
+// isDialableAddrType returns whether the wallet can dial addresses of the given
+// type.  The wallet has no Tor support, so only IP addresses are dialable.
+func isDialableAddrType(addrType addrmgr.NetAddressType) bool {
+	return addrType == addrmgr.IPv4Address || addrType == addrmgr.IPv6Address
+}
+
 // peerCandidate returns a peer address that we shall attempt to connect to.
 // Only peers not already remotes or in the process of connecting are returned.
 // Any address returned is marked in s.connectingRemotes before returning.
@@ -481,7 +487,7 @@ func (s *Syncer) peerCandidate(svcs wire.ServiceFlag) (*addrmgr.NetAddress, erro
 	// Try to obtain peer candidates at random, decreasing the requirements
 	// as more tries are performed.
 	for tries := 0; tries < 100; tries++ {
-		kaddr := s.lp.AddrManager().GetAddress()
+		kaddr := s.lp.AddrManager().GetAddress(isDialableAddrType)
 		if kaddr == nil {
 			break
 		}
