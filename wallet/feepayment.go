@@ -130,10 +130,23 @@ func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
 
 func (fp *vspFeePayment) remove(reason string) {
 	fp.stop()
-	fp.client.log.Infof("Ticket %v is %s; removing from VSP client", fp.ticket, reason)
 	fp.client.mu.Lock()
-	delete(fp.client.jobs, *fp.ticket.Hash())
+	// A newer job may have taken this ticket's entry meanwhile.
+	removed := fp.client.jobs[*fp.ticket.Hash()] == fp
+	if removed {
+		delete(fp.client.jobs, *fp.ticket.Hash())
+	}
 	fp.client.mu.Unlock()
+	if removed {
+		fp.client.log.Infof("Ticket %v is %s; removing from VSP client", fp.ticket, reason)
+	}
+}
+
+// listed reports whether fp is still the client's job for its ticket.
+func (fp *vspFeePayment) listed() bool {
+	fp.client.mu.Lock()
+	defer fp.client.mu.Unlock()
+	return fp.client.jobs[*fp.ticket.Hash()] == fp
 }
 
 // feePayment returns an existing managed fee payment, or creates and begins
@@ -266,6 +279,12 @@ func (fp *vspFeePayment) next() time.Duration {
 func (fp *vspFeePayment) task(name string, method func() error) func() {
 	return func() {
 		fp.procMu.Lock()
+		if !fp.listed() {
+			// Removed while this attempt waited, or after its timer
+			// fired: the ticket's current job, if any, does the work.
+			fp.procMu.Unlock()
+			return
+		}
 		err := method()
 		fp.procMu.Unlock()
 		fp.mu.Lock()
