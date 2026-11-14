@@ -1763,7 +1763,10 @@ func (s *Server) getBalance(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
-	minConf := int32(*cmd.MinConf)
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
 	if minConf < 0 {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "minconf must be non-negative")
 	}
@@ -3603,7 +3606,11 @@ func (s *Server) getReceivedByAccount(ctx context.Context, icmd any) (any, error
 	// TODO: This is more inefficient that it could be, but the entire
 	// algorithm is already dominated by reading every transaction in the
 	// wallet's history.
-	results, err := w.TotalReceivedForAccounts(ctx, int32(*cmd.MinConf))
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
+	results, err := w.TotalReceivedForAccounts(ctx, minConf)
 	if err != nil {
 		return nil, err
 	}
@@ -3639,9 +3646,14 @@ func (s *Server) getReceivedByAddress(ctx context.Context, icmd any) (any, error
 	// Get the correct AtomsPerCoin for this coin type
 	atomsPerCoin := getAtomsPerCoin(w.ChainParams(), filterCoinType)
 
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
+
 	var totalAtoms *big.Int
 	if filterCoinType.IsSKA() {
-		skaTotal, err := w.TotalReceivedSKAForAddr(ctx, addr, int32(*cmd.MinConf), filterCoinType)
+		skaTotal, err := w.TotalReceivedSKAForAddr(ctx, addr, minConf, filterCoinType)
 		if err != nil {
 			if errors.Is(err, errors.NotExist) {
 				return nil, errAddressNotInWallet
@@ -3650,7 +3662,7 @@ func (s *Server) getReceivedByAddress(ctx context.Context, icmd any) (any, error
 		}
 		totalAtoms = skaTotal.BigInt()
 	} else {
-		varTotal, err := w.TotalReceivedForAddr(ctx, addr, int32(*cmd.MinConf))
+		varTotal, err := w.TotalReceivedForAddr(ctx, addr, minConf)
 		if err != nil {
 			if errors.Is(err, errors.NotExist) {
 				return nil, errAddressNotInWallet
@@ -4031,7 +4043,11 @@ func (s *Server) getTxOut(ctx context.Context, icmd any) (any, error) {
 
 	// Attempt to read the unspent txout info from wallet.
 	outpoint := wire.OutPoint{Hash: *txHash, Index: cmd.Vout, Tree: cmd.Tree}
-	utxo, err := w.UnspentOutput(ctx, outpoint, *cmd.IncludeMempool)
+	includeMempool := true
+	if cmd.IncludeMempool != nil {
+		includeMempool = *cmd.IncludeMempool
+	}
+	utxo, err := w.UnspentOutput(ctx, outpoint, includeMempool)
 	if err != nil && !errors.Is(err, errors.NotExist) {
 		return nil, err
 	}
@@ -4339,7 +4355,11 @@ func (s *Server) listAccounts(ctx context.Context, icmd any) (any, error) {
 	}
 
 	accountBalances := map[string]float64{}
-	results, err := w.AccountBalances(ctx, int32(*cmd.MinConf))
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
+	results, err := w.AccountBalances(ctx, minConf)
 	if err != nil {
 		return nil, err
 	}
@@ -4394,7 +4414,11 @@ func (s *Server) listReceivedByAccount(ctx context.Context, icmd any) (any, erro
 		return nil, errUnloadedWallet
 	}
 
-	results, err := w.TotalReceivedForAccounts(ctx, int32(*cmd.MinConf))
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
+	results, err := w.TotalReceivedForAccounts(ctx, minConf)
 	if err != nil {
 		return nil, err
 	}
@@ -4456,7 +4480,10 @@ func (s *Server) listReceivedByAddress(ctx context.Context, icmd any) (any, erro
 		allAddrData[address] = AddrData{}
 	}
 
-	minConf := *cmd.MinConf
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
 	var endHeight int32
 	if minConf == 0 {
 		endHeight = -1
@@ -4519,7 +4546,10 @@ func (s *Server) listSinceBlock(ctx context.Context, icmd any) (any, error) {
 		return nil, errUnloadedWallet
 	}
 
-	targetConf := int32(*cmd.TargetConfirmations)
+	targetConf := int32(1)
+	if cmd.TargetConfirmations != nil {
+		targetConf = int32(*cmd.TargetConfirmations)
+	}
 	if targetConf < 1 {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "target_confirmations must be positive")
 	}
@@ -4585,7 +4615,16 @@ func (s *Server) listTransactions(ctx context.Context, icmd any) (any, error) {
 				`Use "*" to reference all accounts.`)
 	}
 
-	return w.ListTransactions(ctx, *cmd.From, *cmd.Count)
+	count := 10
+	if cmd.Count != nil {
+		count = *cmd.Count
+	}
+	from := 0
+	if cmd.From != nil {
+		from = *cmd.From
+	}
+
+	return w.ListTransactions(ctx, from, count)
 }
 
 // listAddressTransactions handles a listaddresstransactions request by
@@ -4684,7 +4723,15 @@ func (s *Server) listUnspent(ctx context.Context, icmd any) (any, error) {
 		ct := cointype.CoinType(*cmd.CoinType)
 		coinTypeFilter = &ct
 	}
-	result, err := w.ListUnspent(ctx, int32(*cmd.MinConf), int32(*cmd.MaxConf), addresses, account, coinTypeFilter)
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
+	maxConf := int32(9999999)
+	if cmd.MaxConf != nil {
+		maxConf = int32(*cmd.MaxConf)
+	}
+	result, err := w.ListUnspent(ctx, minConf, maxConf, addresses, account, coinTypeFilter)
 	if err != nil {
 		if errors.Is(err, errors.NotExist) {
 			return nil, errAddressNotInWallet
@@ -6213,7 +6260,10 @@ func (s *Server) sendFrom(ctx context.Context, icmd any) (any, error) {
 	if strings.HasPrefix(cmd.Amount, "-") {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative amount")
 	}
-	minConf := int32(*cmd.MinConf)
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
 	if minConf < 0 {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative minconf")
 	}
@@ -6281,7 +6331,10 @@ func (s *Server) sendMany(ctx context.Context, icmd any) (any, error) {
 	}
 
 	// Check that minconf is positive.
-	minConf := int32(*cmd.MinConf)
+	minConf := int32(1)
+	if cmd.MinConf != nil {
+		minConf = int32(*cmd.MinConf)
+	}
 	if minConf < 0 {
 		return nil, rpcErrorf(dcrjson.ErrRPCInvalidParameter, "negative minconf")
 	}
@@ -6402,8 +6455,14 @@ func (s *Server) sendToMultiSig(ctx context.Context, icmd any) (any, error) {
 		return nil, err
 	}
 
-	nrequired := int8(*cmd.NRequired)
-	minconf := int32(*cmd.MinConf)
+	nrequired := int8(1)
+	if cmd.NRequired != nil {
+		nrequired = int8(*cmd.NRequired)
+	}
+	minconf := int32(1)
+	if cmd.MinConf != nil {
+		minconf = int32(*cmd.MinConf)
+	}
 
 	// Parse amount via coinsToAtomsBig for both VAR and SKA — preserves SKA
 	// precision (1e18 atoms-per-coin) and avoids VAR float64 round-trip loss.
@@ -6497,7 +6556,11 @@ func (s *Server) sendRawTransaction(ctx context.Context, icmd any) (any, error) 
 		}
 	}
 
-	if !*cmd.AllowHighFees {
+	allowHighFees := false
+	if cmd.AllowHighFees != nil {
+		allowHighFees = *cmd.AllowHighFees
+	}
+	if !allowHighFees {
 		var highFees bool
 		if txrules.GetCoinTypeFromOutputs(msgtx.TxOut).IsSKA() {
 			highFees, err = txrules.TxPaysHighFeesSKA(msgtx, w.ChainParams())
@@ -6880,7 +6943,11 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 	}
 
 	var hashType txscript.SigHashType
-	switch *cmd.Flags {
+	flags := "ALL"
+	if cmd.Flags != nil {
+		flags = *cmd.Flags
+	}
+	switch flags {
 	case "ALL":
 		hashType = txscript.SigHashAll
 	case "NONE":
@@ -6984,7 +7051,7 @@ func (s *Server) signRawTransaction(ctx context.Context, icmd any) (any, error) 
 		for i, txIn := range tx.TxIn {
 			// We don't need the first input of a stakebase tx, as it's garbage
 			// anyway.
-			if i == 0 && *cmd.Flags == "ssgen" {
+			if i == 0 && flags == "ssgen" {
 				continue
 			}
 
@@ -7140,7 +7207,11 @@ func (s *Server) signRawTransactions(ctx context.Context, icmd any) (any, error)
 	// do that now. Otherwise, construct the slice and return it.
 	toReturn := make([]types.SignedTransaction, len(cmd.RawTxs))
 
-	if *cmd.Send {
+	send := true
+	if cmd.Send != nil {
+		send = *cmd.Send
+	}
+	if send {
 		n, ok := s.walletLoader.NetworkBackend()
 		if !ok {
 			return nil, errNoNetwork

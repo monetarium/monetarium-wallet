@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"runtime/trace"
 	"strings"
 	"sync"
@@ -470,7 +471,22 @@ out:
 				go func() {
 					defer task.End()
 					defer wsc.wg.Done()
-					resp, jsonErr := f()
+					// A panic in a handler must not take the whole
+					// wallet down: answer with an internal error and
+					// keep serving.
+					resp, jsonErr := func() (resp any, jsonErr *dcrjson.RPCError) {
+						defer func() {
+							if r := recover(); r != nil {
+								log.Errorf("Panic in websocket RPC "+
+									"handler for %s: %v\n%s",
+									req.Method, r, debug.Stack())
+								resp = nil
+								jsonErr = rpcErrorf(dcrjson.ErrRPCInternal.Code,
+									"handler panicked")
+							}
+						}()
+						return f()
+					}()
 					mresp, err := dcrjson.MarshalResponse(req.Jsonrpc, req.ID, resp, jsonErr)
 					if err != nil {
 						log.Errorf("Unable to marshal response to client %s: %v",
