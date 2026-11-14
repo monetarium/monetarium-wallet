@@ -120,35 +120,73 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
 	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
 
+	return w.NewUnsignedTransactionWithSFFA(ctx, outputs, relayFeePerKbOverride,
+		account, minConf, algo, changeSource, inputSource, -1)
+}
+
+// NewUnsignedTransactionWithSFFA is NewUnsignedTransaction plus Bitcoin-Core
+// "subtractfeefromamount" semantics: when subtractFeeFromAmountIdx >= 0, the
+// converged transaction fee is deducted from the value of that output (the
+// recipient receives the requested amount minus the fee, and the sender's
+// outlay is the requested amount, plus any change too small to keep) instead
+// of from the change. Pass -1
+// to disable, which is exactly NewUnsignedTransaction's behavior.
+func (w *Wallet) NewUnsignedTransactionWithSFFA(ctx context.Context, outputs []*wire.TxOut,
+	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
+	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource,
+	subtractFeeFromAmountIdx int) (*txauthor.AuthoredTx, error) {
+
 	txCoinType := cointype.CoinTypeVAR
 	if len(outputs) > 0 {
 		txCoinType = outputs[0].CoinType
 	}
 	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, outputs,
-		relayFeePerKbOverride, account, minConf, algo, changeSource, inputSource)
+		relayFeePerKbOverride, account, minConf, algo, changeSource, inputSource,
+		subtractFeeFromAmountIdx)
 }
 
 // NewUnsignedSweepTransactionForCoinType is the coin-type-aware sweep variant
 // of NewUnsignedTransaction. It accepts no outputs (the destination receives
 // the swept amount minus fees via changeSource) and requires the caller to
 // specify the coin type explicitly so SKA accounts can be swept.
+//
+// inputSource is optional: nil sweeps every eligible UTXO of txCoinType in
+// the account (the shared implementation wraps the store's coin-typed source
+// with the drain-all sentinel). A non-nil source restricts the sweep to
+// whatever that source returns — used for "send Max from a manual UTXO
+// selection", which must sweep exactly the hand-picked set and nothing else.
+// The source is called with growing targets, so it must ignore the target
+// and return its whole set on every call. Locked outpoints, minConf and
+// unmined spends are not checked for it, so the caller filters the set before
+// the call: the source runs under the wallet's outpoint lock and must not call
+// wallet methods that take it, such as LockedOutpoint or UnspentOutputs.
 func (w *Wallet) NewUnsignedSweepTransactionForCoinType(ctx context.Context,
 	txCoinType cointype.CoinType, relayFeePerKbOverride cointype.SKAAmount,
-	account uint32, minConf int32, changeSource txauthor.ChangeSource) (*txauthor.AuthoredTx, error) {
+	account uint32, minConf int32, changeSource txauthor.ChangeSource,
+	inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
 
 	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, nil,
-		relayFeePerKbOverride, account, minConf, OutputSelectionAlgorithmAll, changeSource, nil)
+		relayFeePerKbOverride, account, minConf, OutputSelectionAlgorithmAll, changeSource, inputSource, -1)
 }
 
 // newUnsignedTransactionWithCoinType is the shared implementation behind
-// NewUnsignedTransaction (output-driven coin type inference) and
-// NewUnsignedSweepTransactionForCoinType (explicit coin type for sweep).
+// NewUnsignedTransaction and NewUnsignedTransactionWithSFFA (output-driven
+// coin type inference) and NewUnsignedSweepTransactionForCoinType (explicit
+// coin type for sweep).
 func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
 	txCoinType cointype.CoinType, outputs []*wire.TxOut,
 	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
-	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
+	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource,
+	subtractFeeFromAmountIdx int) (*txauthor.AuthoredTx, error) {
 
 	const op errors.Op = "wallet.NewUnsignedTransaction"
+
+	// With no outputs the sweep path below is taken, which has no output to
+	// subtract from.
+	if subtractFeeFromAmountIdx >= 0 && len(outputs) == 0 {
+		return nil, errors.E(op, errors.Invalid,
+			"subtractFeeFromAmountIdx set with no outputs")
+	}
 
 	defer w.lockedOutpointMu.Unlock()
 	w.lockedOutpointMu.Lock()
@@ -227,7 +265,7 @@ func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
 				inputSource, changeSource, w.chainParams.MaxTxSize)
 		} else {
 			authoredTx, err = txauthor.NewUnsignedTransaction(outputs, actualRelayFee,
-				inputSource, changeSource, w.chainParams.MaxTxSize, -1)
+				inputSource, changeSource, w.chainParams.MaxTxSize, subtractFeeFromAmountIdx)
 		}
 		if err != nil {
 			return err
@@ -1708,15 +1746,29 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	// at all (e.g. operator pointed at an SKA-only account), surface an
 	// actionable error here rather than failing late inside mixedSplit /
 	// individualSplit as a generic InsufficientBalance.
-	varBalance, err := w.AccountBalanceByCoinType(ctx, req.SourceAccount, cointype.CoinTypeVAR, req.MinConf)
-	if err != nil {
-		return nil, errors.E(op, err)
+	var spendable dcrutil.Amount
+	if req.MinConf == 0 {
+		// AccountBalanceByCoinType never counts unmined credits as
+		// Spendable. Selection at minconf 0 spends published non-stake
+		// ones, as the VSP fee-split retry in PurchaseTickets needs, and
+		// AccountBalance counts those as Spendable.
+		bal, err := w.AccountBalance(ctx, req.SourceAccount, 0)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+		spendable = bal.Spendable
+	} else {
+		varBalance, err := w.AccountBalanceByCoinType(ctx, req.SourceAccount, cointype.CoinTypeVAR, req.MinConf)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+		spendable = varBalance.Spendable
 	}
 	// Check Spendable (not Total): a wallet with all VAR locked in tickets
 	// has Total > 0 but Spendable = 0; the ticket purchase still cannot
 	// fund a new split, and the late mixedSplit/individualSplit failure
 	// reports the same condition with less actionable wording.
-	if varBalance.Spendable == 0 {
+	if spendable == 0 {
 		return nil, errors.E(op, errors.InsufficientBalance,
 			errors.Errorf("source account %d has no spendable VAR; staking requires spendable VAR (cointype %d)",
 				req.SourceAccount, cointype.CoinTypeVAR))
@@ -2212,16 +2264,13 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			continue
 		}
 
-		err = req.VSPClient.Process(ctx, ticket, feeTx)
+		err = w.payPurchaseFee(ctx, req.VSPClient, ticket, feeTx, vspFeeCredits[i])
 		if err != nil {
-			unlock()
 			// The ticket is already published. Keep publishing the
 			// rest; the wallet may retry the fee itself, or it can be
 			// paid with processunmanagedticket.
-			if err != nil {
-				log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
-				feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
-			}
+			log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
+			feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
 			continue
 		}
 	}
@@ -2231,6 +2280,30 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		return purchaseTicketsResponse, errors.E(op, errors.Join(feeErrs...))
 	}
 	return purchaseTicketsResponse, nil
+}
+
+// payPurchaseFee has c process the fee of a ticket just purchased, offering
+// feeTx, which spends the inputs reserved for the fee.  It unlocks them all if
+// Process fails, and otherwise those the paid fee tx does not spend: Process
+// may leave feeTx unused, when the VSP already holds a fee tx for the ticket,
+// or pay the fee tx a scheduled attempt made from other inputs, copied into
+// feeTx.  Recording a fee tx in the wallet unlocks the inputs it spends.
+func (w *Wallet) payPurchaseFee(ctx context.Context, c *VSPClient, ticket *VSPTicket,
+	feeTx *wire.MsgTx, reserved []Input) error {
+
+	err := c.Process(ctx, ticket, feeTx)
+	spent := make(map[wire.OutPoint]bool)
+	if err == nil && len(feeTx.TxOut) != 0 {
+		for _, in := range feeTx.TxIn {
+			spent[in.PreviousOutPoint] = true
+		}
+	}
+	for _, in := range reserved {
+		if !spent[in.OutPoint] {
+			w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
+		}
+	}
+	return err
 }
 
 // ReserveOutputsForAmount returns locked spendable outpoints from the given
@@ -2361,7 +2434,9 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 				continue
 			}
 		case stdscript.STPubKeyHashEcdsaSecp256k1:
-			if output.FromCoinBase {
+			// Outputs of a transaction with an expiry are spendable only
+			// after coinbase maturity, like coinbase outputs.
+			if output.FromCoinBase || output.HasExpiry {
 				if !coinbaseMatured(w.chainParams, output.Height, currentHeight) {
 					continue
 				}
@@ -2488,7 +2563,9 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 				return true
 			}
 		case stdscript.STPubKeyHashEcdsaSecp256k1:
-			if output.FromCoinBase {
+			// Outputs of a transaction with an expiry are spendable only
+			// after coinbase maturity, like coinbase outputs.
+			if output.FromCoinBase || output.HasExpiry {
 				if !coinbaseMatured(w.chainParams, output.Height, currentHeight) {
 					return true
 				}

@@ -6793,8 +6793,8 @@ func (s *Server) updateVSPVoteChoices(ctx context.Context, w *wallet.Wallet, tic
 			return err
 		}
 
-		// Never return errors here, so all tickets are tried.
-		// The first error will be returned to the user.
+		// ForUnspentUnexpiredTickets still tries every ticket and
+		// returns all errors joined.
 		err = vspClient.SetVoteChoice(ctx, ticket, choices, tspendPolicy, treasuryPolicy)
 		if err != nil {
 			return err
@@ -7283,7 +7283,7 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 		return nil, err
 	}
 	tx, err := w.NewUnsignedSweepTransactionForCoinType(ctx, sweepCoinType,
-		feePerKbOverride, account, requiredConfs, changeSource)
+		feePerKbOverride, account, requiredConfs, changeSource, nil)
 	if err != nil {
 		if errors.Is(err, errors.InsufficientBalance) {
 			return nil, rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)
