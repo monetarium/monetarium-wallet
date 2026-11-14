@@ -33,7 +33,8 @@ import (
 // b3 mine augment and aug2 again, and spendAug, the wallet's spend of aug2,
 // stays unmined.
 //
-// The test is VAR only: restoring a spent SKA credit on rollback is #19.
+// The test is VAR only: restoring a spent SKA credit on rollback is
+// TestRollbackRestoresSpentSKACredit.
 func TestPruneUnminedRemovesDetachedSSFee(t *testing.T) {
 	for _, remine := range []bool{false, true} {
 		name := "detached"

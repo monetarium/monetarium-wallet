@@ -4587,7 +4587,9 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 
 			// Only mature coinbase outputs are included.  Miner SSFee
 			// outputs carry the coinbase flag and are checked below.
-			if output.FromCoinBase && details.TxRecord.TxType != stake.TxTypeSSFee {
+			// Outputs of a transaction with an expiry are spendable only
+			// after coinbase maturity, like coinbase outputs.
+			if (output.FromCoinBase || output.HasExpiry) && details.TxRecord.TxType != stake.TxTypeSSFee {
 				if !coinbaseMatured(w.chainParams, output.Height, tipHeight) {
 					continue
 				}
@@ -6908,14 +6910,27 @@ func (w *Wallet) GetVSPTicketsByFeeStatus(ctx context.Context, feeStatus int) ([
 	return response, nil
 }
 
-// SetPublished sets the informed hash as true or false.
+// SetPublished sets the informed hash as true or false.  A transaction that
+// stops being unpublished is notified as an unmined transaction, as
+// AddTransaction notifies a new one.
 func (w *Wallet) SetPublished(ctx context.Context, hash *chainhash.Hash, published bool) error {
 	err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
-		hash := hash
-		err := w.txStore.SetPublished(dbtx, hash, published)
-		if err != nil {
+		changed, err := w.txStore.SetPublished(dbtx, hash, published)
+		if err != nil || !changed || !published {
 			return err
 		}
+		ns := dbtx.ReadBucket(wtxmgrNamespaceKey)
+		details, err := w.txStore.UniqueTxDetails(ns, hash, nil)
+		if err != nil {
+			log.Errorf("Cannot query transaction details for notification: %v", err)
+			return nil
+		}
+		if details == nil {
+			// The flag outlived its transaction, which was never
+			// recorded or is gone.
+			return nil
+		}
+		w.NtfnServer.notifyUnminedTransaction(dbtx, details)
 		return nil
 	})
 	if err != nil {
