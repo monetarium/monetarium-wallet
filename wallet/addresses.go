@@ -9,16 +9,16 @@ import (
 	"encoding/binary"
 	"runtime/trace"
 
-	"github.com/monetarium/monetarium-wallet/errors"
-	"github.com/monetarium/monetarium-wallet/internal/compat"
-	"github.com/monetarium/monetarium-wallet/wallet/txsizes"
-	"github.com/monetarium/monetarium-wallet/wallet/udb"
-	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/hdkeychain"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
+	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/internal/compat"
+	"github.com/monetarium/monetarium-wallet/wallet/txsizes"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
 // AccountKind describes the purpose and type of a wallet account.
@@ -850,7 +850,7 @@ func (w *Wallet) BIP0044BranchNextIndexes(ctx context.Context, account uint32) (
 // BIP00044 account branch.  The next returned address for the branch will be
 // child+1.
 func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, child uint32) error {
-	const op errors.Op = "wallet.ExtendWatchedAddresses"
+	const op errors.Op = "wallet.SyncLastReturnedAddress"
 
 	var (
 		branchXpub *hdkeychain.ExtendedKey
@@ -867,7 +867,7 @@ func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, c
 		var alb *addressBuffer
 		switch branch {
 		case udb.ExternalBranch:
-			alb = &acctData.albInternal
+			alb = &acctData.albExternal
 		case udb.InternalBranch:
 			alb = &acctData.albInternal
 		default:
@@ -876,8 +876,16 @@ func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, c
 
 		branchXpub = alb.branchXpub
 		lastUsed = alb.lastUsed
-		if lastUsed != ^uint32(0) && child > lastUsed {
-			alb.cursor = child - lastUsed
+		// child - lastUsed is the right cursor across the wrap too: on a
+		// branch with no used address yet lastUsed is ^uint32(0), and
+		// child - ^uint32(0) == child + 1, so the next child is
+		// lastUsed + 1 + cursor == child + 1.  Only move the cursor
+		// forward: moving it back would hand out children below child
+		// again, which getnewaddress may already have returned.
+		if lastUsed == ^uint32(0) || child > lastUsed {
+			if next := child - lastUsed; next > alb.cursor {
+				alb.cursor = next
+			}
 		}
 		return nil
 	}()

@@ -10,11 +10,6 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/monetarium/monetarium-wallet/deployments"
-	"github.com/monetarium/monetarium-wallet/errors"
-	"github.com/monetarium/monetarium-wallet/wallet/txrules"
-	"github.com/monetarium/monetarium-wallet/wallet/udb"
-	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	blockchain "github.com/monetarium/monetarium-node/blockchain/standalone"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
@@ -25,6 +20,11 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/txscript/stdscript"
 	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/deployments"
+	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/wallet/txrules"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
 func (w *Wallet) extendMainChain(ctx context.Context, op errors.Op, dbtx walletdb.ReadWriteTx,
@@ -784,6 +784,33 @@ func (w *Wallet) ticketConsolidationHash160(dbtx walletdb.ReadTx,
 	return w.getFirstExternalAddressHash160(dbtx, accountName)
 }
 
+// compactVoteRecords drops nil votes and votes whose transaction record
+// fails to build, compacting votes, ticketHashes and usedVoteBits together
+// with a write index and returning the surviving slices along with a record
+// for every surviving vote.  The parallel slices keep their relative order,
+// so log attribution pairs each vote with its own ticket and vote bits.
+func compactVoteRecords(votes []*wire.MsgTx, ticketHashes []*chainhash.Hash,
+	usedVoteBits []stake.VoteBits) ([]*wire.MsgTx, []*chainhash.Hash,
+	[]stake.VoteBits, []*udb.TxRecord) {
+
+	voteRecords := make([]*udb.TxRecord, 0, len(votes))
+	k := 0
+	for i, vote := range votes {
+		if vote == nil {
+			continue
+		}
+		rec, err := udb.NewTxRecordFromMsgTx(vote, time.Now())
+		if err != nil {
+			log.Errorf("Failed to create transaction record: %v", err)
+			continue
+		}
+		votes[k], ticketHashes[k], usedVoteBits[k] = vote, ticketHashes[i], usedVoteBits[i]
+		voteRecords = append(voteRecords, rec)
+		k++
+	}
+	return votes[:k], ticketHashes[:k], usedVoteBits[:k], voteRecords
+}
+
 // VoteOnOwnedTickets creates and publishes vote transactions for all owned
 // tickets in the winningTicketHashes slice if wallet voting is enabled.  The
 // vote is only valid when voting on the block described by the passed block
@@ -987,25 +1014,12 @@ func (w *Wallet) VoteOnOwnedTickets(ctx context.Context, winningTicketHashes []*
 		log.Errorf("View failed: %v", errors.E(op, err))
 	}
 
-	// Remove nil votes without preserving order.
-	for i := 0; i < len(votes); {
-		if votes[i] == nil {
-			votes[i], votes[len(votes)-1] = votes[len(votes)-1], votes[i]
-			votes = votes[:len(votes)-1]
-			continue
-		}
-		i++
-	}
-
-	voteRecords := make([]*udb.TxRecord, 0, len(votes))
-	for i := range votes {
-		rec, err := udb.NewTxRecordFromMsgTx(votes[i], time.Now())
-		if err != nil {
-			log.Errorf("Failed to create transaction record: %v", err)
-			continue
-		}
-		voteRecords = append(voteRecords, rec)
-	}
+	// Remove nil votes and votes whose record fails to build while
+	// compacting votes, ticketHashes and usedVoteBits together, so the
+	// log below pairs each vote with its own ticket hash and vote bits
+	// whenever at least one ticket failed to vote.
+	votes, ticketHashes, usedVoteBits, voteRecords :=
+		compactVoteRecords(votes, ticketHashes, usedVoteBits)
 	w.recentlyPublishedMu.Lock()
 	for i := range voteRecords {
 		w.markRecentlyPublishedLocked(voteRecords[i].Hash, blockHeight, votes[i].Expiry)
