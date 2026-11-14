@@ -1872,7 +1872,8 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			[]int{txsizes.RedeemP2PKHSigScriptSize},
 			[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}},
 			txsizes.P2PKHPkScriptSize)
-		fee += txrules.FeeForSerializeSize(relayFee, feeEst)
+		pad := txrules.FeeForSerializeSize(relayFee, feeEst)
+		fee += pad
 
 		// Reserve outputs for number of buys.
 		vspFeeCredits = make([][]Input, 0, req.Count)
@@ -1908,8 +1909,12 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			// the first pad.  An unused pad is below the dust limit at the
 			// relay fee it was sized with, so CreateVspPayment gives it to
 			// the miner rather than returning it as change.
+			//
+			// Below stake validation height the estimate is 0 and the two
+			// pads alone are dust, which a node rejects in the split, so
+			// the output is at least the dust threshold.
 			if !req.DontSignTx {
-				feePerTicket = fee + txrules.FeeForSerializeSize(relayFee, feeEst)
+				feePerTicket = max(fee+pad, txrules.DustThreshold(txsizes.P2PKHPkScriptSize, relayFee))
 				log.Infof("VSP fee %v per ticket will be funded from the ticket split", feePerTicket)
 			}
 		} else {
