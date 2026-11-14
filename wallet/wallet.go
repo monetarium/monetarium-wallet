@@ -4585,7 +4585,9 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 
 			// Only mature coinbase outputs are included.  Miner SSFee
 			// outputs carry the coinbase flag and are checked below.
-			if output.FromCoinBase && details.TxRecord.TxType != stake.TxTypeSSFee {
+			// Outputs of a transaction with an expiry are spendable only
+			// after coinbase maturity, like coinbase outputs.
+			if (output.FromCoinBase || output.HasExpiry) && details.TxRecord.TxType != stake.TxTypeSSFee {
 				if !coinbaseMatured(w.chainParams, output.Height, tipHeight) {
 					continue
 				}
@@ -5838,41 +5840,60 @@ func (s sigDataSource) GetScript(a stdaddr.Address) ([]byte, error) { return s.s
 
 // CreateVspPayment receives a tx and ensures that it pays the correct fee
 // amount to the correct address. It then signs that tx and adds it to the
-// wallet without broadcasting it to the network.
+// wallet without broadcasting it to the network. Inputs already in tx must be
+// locked by the caller, or topping them up may select them again.  After an
+// error tx may hold inputs the wallet no longer locks; it must not be reused.
 func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrutil.Amount,
 	feeAddr stdaddr.Address, feeAcct uint32, changeAcct uint32) error {
 
-	// Reserve new outputs to pay the fee if outputs have not already been
-	// reserved.  This will be the case for fee payments that were begun on
-	// already purchased tickets, where the caller did not ensure that fee
-	// outputs would already be reserved.
-	if len(tx.TxIn) == 0 {
-		const minconf = 1
-		// VSP fees are paid in VAR (staking is VAR-only)
-		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, fee, cointype.Zero(), minconf, cointype.CoinTypeVAR)
-		if err != nil {
-			return fmt.Errorf("unable to reserve outputs: %w", err)
+	// The inputs must pay the VSP fee plus the miner fee of a fee tx with
+	// that many inputs.  Reserve more until they do: none may have been
+	// reserved yet, for fee payments begun on already purchased tickets, or
+	// the caller's may fall short.
+	relayFee := w.RelayFee()
+	need := func(inputs int) dcrutil.Amount {
+		sizes := make([]int, max(inputs, 1))
+		for i := range sizes {
+			sizes[i] = txsizes.RedeemP2PKHSigScriptSize
 		}
-		for _, in := range inputs {
-			tx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
-		}
-		// The transaction will be added to the wallet in an unpublished
-		// state, so there is no need to leave the outputs locked.
-		defer func() {
-			for _, in := range inputs {
-				w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
-			}
-		}()
+		return fee + txrules.FeeForSerializeSize(relayFee, txsizes.EstimateSerializeSize(sizes,
+			[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}},
+			txsizes.P2PKHPkScriptSize))
 	}
+
+	// The transaction will be added to the wallet in an unpublished
+	// state, so there is no need to leave the outputs locked.
+	var reserved []Input
+	defer func() {
+		for _, in := range reserved {
+			w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
+		}
+	}()
 
 	var input int64
 	for _, in := range tx.TxIn {
 		input += in.ValueIn
 	}
-	if input < int64(fee) {
-		err := fmt.Errorf("not enough input value to pay fee: %v < %v",
-			dcrutil.Amount(input), fee)
-		return err
+	for input < int64(need(len(tx.TxIn))) {
+		// Mined outputs only: a fee tx resting on an unmined payment
+		// that never mines cannot be broadcast.  Caller inputs are not
+		// filtered.
+		const minconf = 1
+		// VSP fees are paid in VAR (staking is VAR-only)
+		extra, err := w.ReserveOutputsForAmount(ctx, feeAcct,
+			need(len(tx.TxIn))-dcrutil.Amount(input), cointype.Zero(), minconf, cointype.CoinTypeVAR)
+		if err != nil {
+			return fmt.Errorf("unable to reserve outputs to pay fee: inputs %v < %v: %w",
+				dcrutil.Amount(input), need(len(tx.TxIn)), err)
+		}
+		if len(extra) == 0 { // or this loop never ends
+			return errors.E(errors.Bug, "no outputs reserved to pay fee")
+		}
+		for _, in := range extra {
+			tx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
+			input += in.PrevOut.Value
+		}
+		reserved = append(reserved, extra...)
 	}
 
 	vers, feeScript := feeAddr.PaymentScript()
@@ -5901,13 +5922,18 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 		PkScript: feeScript,
 		CoinType: cointype.CoinTypeVAR, // VSP fees are always VAR; set explicitly
 	})
-	feeRate := w.RelayFee()
+	feeRate := relayFee
 	scriptSizes := make([]int, len(tx.TxIn))
 	for i := range scriptSizes {
 		scriptSizes[i] = txsizes.RedeemP2PKHSigScriptSize
 	}
 	est := txsizes.EstimateSerializeSize(scriptSizes, tx.TxOut, txsizes.P2PKHPkScriptSize)
-	change := input
+	// Sum the inputs the tx holds now, so the change pays back every one of
+	// them.
+	var change int64
+	for _, in := range tx.TxIn {
+		change += in.ValueIn
+	}
 	change -= tx.TxOut[0].Value
 	change -= int64(txrules.FeeForSerializeSize(feeRate, est))
 	if !txrules.IsDustAmount(dcrutil.Amount(change), txsizes.P2PKHPkScriptSize, feeRate) {
@@ -6927,14 +6953,27 @@ func (w *Wallet) GetVSPTicketsByFeeStatus(ctx context.Context, feeStatus int) ([
 	return response, nil
 }
 
-// SetPublished sets the informed hash as true or false.
+// SetPublished sets the informed hash as true or false.  A transaction that
+// stops being unpublished is notified as an unmined transaction, as
+// AddTransaction notifies a new one.
 func (w *Wallet) SetPublished(ctx context.Context, hash *chainhash.Hash, published bool) error {
 	err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
-		hash := hash
-		err := w.txStore.SetPublished(dbtx, hash, published)
-		if err != nil {
+		changed, err := w.txStore.SetPublished(dbtx, hash, published)
+		if err != nil || !changed || !published {
 			return err
 		}
+		ns := dbtx.ReadBucket(wtxmgrNamespaceKey)
+		details, err := w.txStore.UniqueTxDetails(ns, hash, nil)
+		if err != nil {
+			log.Errorf("Cannot query transaction details for notification: %v", err)
+			return nil
+		}
+		if details == nil {
+			// The flag outlived its transaction, which was never
+			// recorded or is gone.
+			return nil
+		}
+		w.NtfnServer.notifyUnminedTransaction(dbtx, details)
 		return nil
 	})
 	if err != nil {

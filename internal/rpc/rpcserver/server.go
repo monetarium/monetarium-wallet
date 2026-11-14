@@ -1072,7 +1072,7 @@ func (s *walletServer) SweepAccount(ctx context.Context, req *pb.SweepAccountReq
 	}
 
 	tx, err := s.wallet.NewUnsignedSweepTransactionForCoinType(ctx, sweepCoinType,
-		feePerKbOverride, account, int32(req.RequiredConfirmations), changeSource)
+		feePerKbOverride, account, int32(req.RequiredConfirmations), changeSource, nil)
 	if err != nil {
 		return nil, translateError(err)
 	}
@@ -4433,7 +4433,7 @@ func (s *walletServer) SetVspdVoteChoices(ctx context.Context, req *pb.SetVspdVo
 		if err != nil {
 			return err
 		}
-		if ticketHost == req.VspHost {
+		if wallet.SameVSPHost(ticketHost, req.VspHost) {
 			ticket, err := s.wallet.NewVSPTicket(ctx, hash)
 			if err != nil {
 				return err

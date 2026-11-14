@@ -43,6 +43,10 @@ type vspFeePayment struct {
 	ticket *VSPTicket
 	policy *VSPPolicy
 
+	// procMu serializes fee processing: a scheduled attempt and a Process
+	// call for the same ticket must not build or submit fee txs at once.
+	procMu sync.Mutex
+
 	// Requires locking for all access outside of Client.feePayment
 	mu      sync.Mutex
 	fee     dcrutil.Amount
@@ -219,7 +223,9 @@ func (fp *vspFeePayment) next() time.Duration {
 // in an errored state and may require manual processing.
 func (fp *vspFeePayment) task(name string, method func() error) func() {
 	return func() {
+		fp.procMu.Lock()
 		err := method()
+		fp.procMu.Unlock()
 		fp.mu.Lock()
 		fp.err = err
 		fp.mu.Unlock()
@@ -464,7 +470,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 		switch apiErr.Code {
 		case types.ErrFeeAlreadyReceived:
 			// The VSP may still be holding the fee tx unbroadcast, so it
-			// stays unpublished until confirmPayment sees it broadcast.
+			// stays unpublished until confirmPayment sees it broadcast or,
+			// in SPV mode, a peer relays it.
 			err = nil
 		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee:
 			err := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey)
