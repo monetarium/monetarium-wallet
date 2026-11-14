@@ -1700,6 +1700,14 @@ func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsReques
 
 var errVSPFeeRequiresUTXOSplit = errors.New("paying VSP fee requires UTXO split")
 
+// ErrVSPFeeNotPaid is joined into the error PurchaseTickets returns when the
+// tickets were published but the VSP fee for one or more of them was not paid
+// by that call.  The response is non-nil and holds every published ticket
+// hash, and each fee error joined with it names its ticket hash.  The fee may
+// still be paid: the wallet can have scheduled a retry, or the VSP may have
+// received it.
+var ErrVSPFeeNotPaid = errors.New("tickets published but VSP fee not paid")
+
 // purchaseTickets indicates to the wallet that a ticket should be purchased
 // using all currently available funds.   Also, when the spend limit in the
 // request is greater than or equal to 0, tickets that cost more than that limit
@@ -2193,6 +2201,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		return purchaseTicketsResponse, nil
 	}
 
+	var feeErrs []error
 	for i, ticket := range tickets {
 		// Check for request context cancellation while waiting for
 		// trickle time if this was a mixed buy.
@@ -2250,21 +2259,27 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		ticket, err := w.NewVSPTicket(ctx, ticketHash)
 		if err != nil {
 			unlock()
+			log.Errorf("VSP ticket record for published %v failed: %v", ticketHash, err)
+			feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
 			continue
 		}
 
 		err = w.payPurchaseFee(ctx, req.VSPClient, ticket, feeTx, vspFeeCredits[i])
-		if err != nil || len(feeTx.TxOut) == 0 {
-			continue
-		}
-		// watch for outpoints change.
-		_, err = udb.NewTxRecordFromMsgTx(feeTx, time.Now())
 		if err != nil {
-			return nil, err
+			// The ticket is already published. Keep publishing the
+			// rest; the wallet may retry the fee itself, or it can be
+			// paid with processunmanagedticket.
+			log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
+			feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
+			continue
 		}
 	}
 
-	return purchaseTicketsResponse, err
+	if len(feeErrs) > 0 {
+		feeErrs = append([]error{ErrVSPFeeNotPaid}, feeErrs...)
+		return purchaseTicketsResponse, errors.E(op, errors.Join(feeErrs...))
+	}
+	return purchaseTicketsResponse, nil
 }
 
 // payPurchaseFee has c process the fee of a ticket just purchased, offering
