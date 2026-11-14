@@ -606,3 +606,306 @@ func TestVSPFeeWorkHoldsProcessingLock(t *testing.T) {
 	}
 	check("Process of a paid ticket", func() { _ = c.Process(ctx, ticket, nil) })
 }
+
+func managed(c *VSPClient, ticket *VSPTicket) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.jobs[*ticket.Hash()]
+	return ok
+}
+
+// prunedTicket returns kept's ticket data under a hash the wallet does not have.
+func prunedTicket(c *VSPClient, kept *VSPTicket) *VSPTicket {
+	h := chainhash.Hash{0xdd}
+	return &VSPTicket{
+		hash:           &h,
+		rawTx:          kept.rawTx,
+		parentTx:       kept.parentTx,
+		commitmentAddr: kept.commitmentAddr,
+		votingAddr:     kept.votingAddr,
+		wallet:         c.wallet,
+	}
+}
+
+// TestVSPFeeTooHighStopsRetries checks that a fee above the configured maximum
+// is not retried every few minutes but marked errored for the next Process
+// call.
+func TestVSPFeeTooHighStopsRetries(t *testing.T) {
+	// The job may start with no fee hash, or keep the hash of an earlier
+	// fee tx, as after an expired fee.
+	for name, start := range map[string]chainhash.Hash{
+		"no fee hash":      {},
+		"earlier fee hash": {0xab},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var ticket *VSPTicket
+			c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+				if path != "/api/v3/feeaddress" {
+					return apiError(types.ErrInternalError)
+				}
+				return http.StatusOK, types.FeeAddressResponse{
+					Timestamp:  time.Now().Unix(),
+					FeeAddress: ticket.votingAddr.String(),
+					FeeAmount:  2e8, // above the client's 1e8 MaxFee
+					Expiration: time.Now().Add(time.Hour).Unix(),
+					Request:    body,
+				}
+			})
+			ticket = testVSPTicket(ctx, t, c, 1)
+			if err := ticket.UpdateFeeStarted(ctx, start, c.URL, c.PubKey); err != nil {
+				t.Fatal(err)
+			}
+			fp := &vspFeePayment{
+				client:  c,
+				ctx:     ctx,
+				ticket:  ticket,
+				feeHash: start,
+				policy:  c.policy,
+				params:  c.wallet.chainParams,
+			}
+			c.jobs[*ticket.Hash()] = fp
+
+			if err := fp.reconcilePayment(); !errors.Is(err, errFeeTooHigh) {
+				t.Fatalf("reconcilePayment: want errFeeTooHigh, got %v", err)
+			}
+			if timerSet(fp) {
+				t.Fatal("a fee above the maximum was scheduled for another attempt")
+			}
+			if managed(c, ticket) {
+				t.Fatal("a fee above the maximum left the ticket managed by the client")
+			}
+			if got := feeStatus(ctx, t, ticket); got != udb.VSPFeeProcessErrored {
+				t.Fatalf("fee status = %v, want errored", got)
+			}
+		})
+	}
+}
+
+// TestVSPFeeTooHighKeepsConcurrentPayment checks that a quote above the maximum
+// does not mark errored or remove a payment that a concurrent Process call
+// made while the attempt waited for the quote.
+func TestVSPFeeTooHighKeepsConcurrentPayment(t *testing.T) {
+	ctx := context.Background()
+	var ticket *VSPTicket
+	var fp *vspFeePayment
+	paid := chainhash.Hash{0xfe}
+	c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+		if path != "/api/v3/feeaddress" {
+			return apiError(types.ErrInternalError)
+		}
+		// A concurrent Process call makes and records a fee tx.
+		fp.mu.Lock()
+		fp.feeHash = paid
+		fp.mu.Unlock()
+		if err := ticket.UpdateFeePaid(ctx, paid, fp.client.URL, fp.client.PubKey); err != nil {
+			t.Error(err)
+		}
+		return http.StatusOK, types.FeeAddressResponse{
+			Timestamp:  time.Now().Unix(),
+			FeeAddress: ticket.votingAddr.String(),
+			FeeAmount:  2e8, // above the client's 1e8 MaxFee
+			Expiration: time.Now().Add(time.Hour).Unix(),
+			Request:    body,
+		}
+	})
+	ticket = testVSPTicket(ctx, t, c, 1)
+	fp = &vspFeePayment{
+		client: c,
+		ctx:    ctx,
+		ticket: ticket,
+		policy: c.policy,
+		params: c.wallet.chainParams,
+	}
+	c.jobs[*ticket.Hash()] = fp
+
+	if err := fp.reconcilePayment(); !errors.Is(err, errFeeTooHigh) {
+		t.Fatalf("reconcilePayment: want errFeeTooHigh, got %v", err)
+	}
+	if !managed(c, ticket) {
+		t.Fatal("the concurrent payment's job was removed")
+	}
+	if !timerSet(fp) {
+		t.Fatal("the concurrent payment's job has nothing scheduled")
+	}
+	fp.stop()
+	if got := feeStatus(ctx, t, ticket); got != udb.VSPFeeProcessPaid {
+		t.Fatalf("fee status = %v, want paid", got)
+	}
+}
+
+// TestVSPPrunedTicketIsRemoved checks that a ticket the wallet no longer has
+// is dropped from the client instead of being retried, with its VSP record
+// kept, and that an unmined ticket the wallet still has keeps its job.
+func TestVSPPrunedTicketIsRemoved(t *testing.T) {
+	ctx := context.Background()
+	c := testVSPClient(ctx, t, func(string, []byte) (int, any) {
+		return apiError(types.ErrInternalError)
+	})
+	kept := testVSPTicket(ctx, t, c, 1) // unmined, in the wallet
+	pruned := prunedTicket(c, kept)
+	jobs := make(map[*VSPTicket]*vspFeePayment)
+	for _, ticket := range []*VSPTicket{kept, pruned} {
+		if err := ticket.UpdateFeeStarted(ctx, chainhash.Hash{}, c.URL, c.PubKey); err != nil {
+			t.Fatal(err)
+		}
+		fp := &vspFeePayment{
+			client: c,
+			ctx:    ctx,
+			ticket: ticket,
+			policy: c.policy,
+			params: c.wallet.chainParams,
+		}
+		c.jobs[*ticket.Hash()] = fp
+		jobs[ticket] = fp
+	}
+
+	if err := jobs[pruned].reconcilePayment(); !errors.Is(err, errStopped) {
+		t.Fatalf("pruned ticket: reconcilePayment: want errStopped, got %v", err)
+	}
+	if managed(c, pruned) {
+		t.Fatal("the pruned ticket is still managed by the client")
+	}
+	if timerSet(jobs[pruned]) {
+		t.Fatal("the pruned ticket was scheduled for another attempt")
+	}
+	if _, err := pruned.VSPTicketInfo(ctx); err != nil {
+		t.Fatalf("the pruned ticket's VSP record is gone: %v", err)
+	}
+
+	// The fake VSP fails the quote, so the unmined ticket is retried.
+	if err := jobs[kept].reconcilePayment(); err == nil || errors.Is(err, errStopped) {
+		t.Fatalf("unmined ticket: reconcilePayment: want the VSP error, got %v", err)
+	}
+	if !managed(c, kept) {
+		t.Fatal("the unmined ticket was removed from the client")
+	}
+	if !timerSet(jobs[kept]) {
+		t.Fatal("the unmined ticket was not scheduled for another attempt")
+	}
+	if got := feeStatus(ctx, t, kept); got != udb.VSPFeeProcessStarted {
+		t.Fatalf("unmined ticket fee status = %v, want started", got)
+	}
+
+	// A database that cannot be read says nothing about the ticket.
+	jobs[kept].stop()
+	if err := c.wallet.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := jobs[kept].reconcilePayment(); errors.Is(err, errStopped) {
+		t.Fatal("a database error was taken for a pruned ticket")
+	}
+	jobs[kept].stop()
+}
+
+// TestVSPPrunedTicketStopsBeforeVSPRequests checks that a pruned ticket's
+// payment stops before any VSP request on each path into it: Process of an
+// unpaid ticket (fee address), Process of a paid one (status), and a scheduled
+// attempt whose job already holds a fee tx (fee submission).
+func TestVSPPrunedTicketStopsBeforeVSPRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(ctx context.Context, t *testing.T, c *VSPClient, ticket *VSPTicket) error
+	}{{
+		name: "Process, fee not paid",
+		run: func(ctx context.Context, t *testing.T, c *VSPClient, ticket *VSPTicket) error {
+			return c.Process(ctx, ticket, nil)
+		},
+	}, {
+		name: "Process, fee paid",
+		run: func(ctx context.Context, t *testing.T, c *VSPClient, ticket *VSPTicket) error {
+			if err := ticket.UpdateFeePaid(ctx, chainhash.Hash{0xee}, c.URL, c.PubKey); err != nil {
+				t.Fatal(err)
+			}
+			return c.Process(ctx, ticket, nil)
+		},
+	}, {
+		name: "scheduled attempt with a fee tx",
+		run: func(ctx context.Context, t *testing.T, c *VSPClient, ticket *VSPTicket) error {
+			feeTx := wire.NewMsgTx()
+			feeTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{0xef}}, 1e7, nil))
+			feeTx.AddTxOut(&wire.TxOut{Value: 1e7})
+			fp := &vspFeePayment{client: c, ctx: ctx, ticket: ticket, feeTx: feeTx}
+			c.jobs[*ticket.Hash()] = fp
+			err := fp.reconcilePayment()
+			if timerSet(fp) {
+				t.Fatal("the removed job was scheduled for another attempt")
+			}
+			return err
+		},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var requests atomic.Int32
+			c := testVSPClient(ctx, t, func(string, []byte) (int, any) {
+				requests.Add(1)
+				return apiError(types.ErrInternalError)
+			})
+			pruned := prunedTicket(c, testVSPTicket(ctx, t, c, 1))
+
+			if err := tc.run(ctx, t, c, pruned); !errors.Is(err, errStopped) {
+				t.Fatalf("want errStopped, got %v", err)
+			}
+			if n := requests.Load(); n != 0 {
+				t.Fatalf("%d requests sent to the VSP for a pruned ticket", n)
+			}
+			if managed(c, pruned) {
+				t.Fatal("the pruned ticket is still managed by the client")
+			}
+		})
+	}
+}
+
+// TestVSPTicketPrunedDuringProcessStops checks that a ticket the wallet drops
+// while Process waits for the fee address is not paid for: submitPayment
+// stops before the payfee request.
+func TestVSPTicketPrunedDuringProcessStops(t *testing.T) {
+	ctx := context.Background()
+	var c *VSPClient
+	var ticket *VSPTicket
+	var payfee atomic.Int32
+	c = testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+		switch path {
+		case "/api/v3/feeaddress":
+			if err := c.wallet.AbandonTransaction(ctx, ticket.Hash()); err != nil {
+				t.Error(err)
+			}
+			return http.StatusOK, types.FeeAddressResponse{
+				Timestamp:  time.Now().Unix(),
+				FeeAddress: ticket.votingAddr.String(),
+				FeeAmount:  1e7,
+				Expiration: time.Now().Add(time.Hour).Unix(),
+				Request:    body,
+			}
+		case "/api/v3/payfee":
+			payfee.Add(1)
+		}
+		return apiError(types.ErrInternalError)
+	})
+	ticket = testVSPTicket(ctx, t, c, 1)
+
+	// Fund the fee tx with a wallet output.
+	addr, err := c.wallet.NewInternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ver, script := addr.(Address).PaymentScript()
+	fund := wire.NewMsgTx()
+	fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{2}}, 1e8, nil))
+	fund.AddTxOut(&wire.TxOut{Value: 1e8, Version: ver, PkScript: script})
+	if err := c.wallet.AddTransaction(ctx, fund, nil); err != nil {
+		t.Fatal(err)
+	}
+	feeTx := wire.NewMsgTx()
+	feeTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: fund.TxHash()}, 1e8, nil))
+
+	if err := c.Process(ctx, ticket, feeTx); !errors.Is(err, errStopped) {
+		t.Fatalf("Process: want errStopped, got %v", err)
+	}
+	if n := payfee.Load(); n != 0 {
+		t.Fatalf("%d payfee requests for a ticket pruned during Process", n)
+	}
+	if managed(c, ticket) {
+		t.Fatal("the pruned ticket is still managed by the client")
+	}
+}
