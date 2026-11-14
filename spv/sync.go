@@ -787,10 +787,10 @@ func (s *Syncer) waitForRemote(ctx context.Context, isEligible func(rp *p2p.Remo
 	}
 }
 
-// receiveGetData handles all received getdata requests from peers.  An inv
-// message declaring knowledge of the data must have been previously sent to the
-// peer, or a notfound message reports the data as missing.  Only transactions
-// may be queried by a peer.
+// receiveGetData handles all received getdata requests from peers.  The data
+// must have been announced to the peer by an inv or pushed to it (InvsSent),
+// or a notfound message reports the data as missing.  Only transactions may be
+// queried by a peer.
 func (s *Syncer) receiveGetData(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for {
@@ -1940,10 +1940,13 @@ func (s *Syncer) peerStartup(ctx context.Context, rp *p2p.RemotePeer) error {
 		return nil
 	}
 	if len(unminedTxs) > 0 {
-		err = rp.PublishTransactions(ctx, unminedTxs...)
-		if err != nil {
+		err = pushTransactions(ctx, rp, unminedTxs)
+		switch {
+		case errors.Is(err, context.Canceled):
+			// Shutdown; the caller logs it.
+		case err != nil:
 			// TODO: Transactions should be removed if this is a double spend.
-			log.Errorf("Failed to resent one or more unmined transactions: %v", err)
+			log.Warnf("Failed to resend unmined transactions to %v: %v", rp, err)
 		}
 	}
 
