@@ -2400,11 +2400,11 @@ func (s *Store) Rollback(dbtx walletdb.ReadWriteTx, height int32) error {
 					return err
 				}
 
-				// If the credit was previously removed in the
-				// rollback, the credit amount is zero.  Only
-				// mark the previously spent credit as unspent
-				// if it still exists.
-				if amt == 0 {
+				// If the credit was removed earlier in this rollback, it
+				// no longer exists and is not put back.  An SKA credit
+				// stores 0 as its amount, so test whether the credit
+				// exists, not the amount.
+				if existsRawCredit(ns, credKey) == nil {
 					continue
 				}
 				unspentVal, err := fetchRawCreditUnspentValue(credKey)
