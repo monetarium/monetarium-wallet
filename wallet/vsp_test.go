@@ -481,3 +481,70 @@ func TestVSPFeeChangeSpendableOnceBroadcast(t *testing.T) {
 		})
 	}
 }
+
+// TestVSPSetVoteChoiceTreasuryPolicy checks that SetVoteChoice compares the
+// wallet's treasury policy against the VSP's treasury policy map (not the
+// tspend policy map, whose keys are tspend hashes rather than treasury
+// pubkeys), and only signs a setvotechoices request when the two differ.
+func TestVSPSetVoteChoiceTreasuryPolicy(t *testing.T) {
+	// A treasury policy key is the hex of a 33-byte treasury pubkey.
+	const pubkey = "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122"
+	walletPolicy := map[string]string{pubkey: "yes"}
+
+	tests := []struct {
+		name     string
+		vspHas   map[string]string
+		wantSets int32
+	}{
+		{"policy already in sync", walletPolicy, 0},
+		{"policy differs", map[string]string{pubkey: "no"}, 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var statuses, sets atomic.Int32
+			c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+				switch path {
+				case "/api/v3/ticketstatus":
+					statuses.Add(1)
+					return http.StatusOK, types.TicketStatusResponse{
+						TreasuryPolicy: tc.vspHas,
+						Request:        body,
+					}
+				case "/api/v3/setvotechoices":
+					sets.Add(1)
+					var req types.SetVoteChoicesRequest
+					if err := json.Unmarshal(body, &req); err != nil {
+						t.Errorf("setvotechoices body: %v", err)
+					}
+					if len(req.TreasuryPolicy) != len(walletPolicy) ||
+						req.TreasuryPolicy[pubkey] != walletPolicy[pubkey] {
+						t.Errorf("setvotechoices treasury policy = %v, want the "+
+							"wallet's %v", req.TreasuryPolicy, walletPolicy)
+					}
+					return http.StatusOK, types.SetVoteChoicesResponse{Request: body}
+				}
+				return apiError(types.ErrInternalError)
+			})
+			ticket := testVSPTicket(ctx, t, c, 1)
+
+			// Empty, not nil, vote choices: a real VSP rejects
+			// "votechoices": null.
+			err := c.SetVoteChoice(ctx, ticket, map[string]string{}, nil, walletPolicy)
+			if err != nil {
+				t.Fatalf("SetVoteChoice: %v", err)
+			}
+
+			// SetVoteChoice returns nil even when the status check fails, so
+			// require exactly one ticketstatus call to catch a broken fake
+			// reply making the in-sync case pass vacuously.
+			if n := statuses.Load(); n != 1 {
+				t.Fatalf("made %d ticketstatus requests, want 1", n)
+			}
+			if n := sets.Load(); n != tc.wantSets {
+				t.Fatalf("made %d setvotechoices requests, want %d", n, tc.wantSets)
+			}
+		})
+	}
+}

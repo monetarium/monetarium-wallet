@@ -334,7 +334,7 @@ func (c *VSPClient) SetVoteChoice(ctx context.Context, ticket *VSPTicket,
 
 	// Check treasury policies.
 	for newKey, newChoice := range treasuryPolicy {
-		vspChoice, ok := status.TSpendPolicy[newKey]
+		vspChoice, ok := status.TreasuryPolicy[newKey]
 		if !ok {
 			update = true
 			break
