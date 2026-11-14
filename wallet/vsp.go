@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/slog"
+	"github.com/decred/vspd/types/v3"
 	vspd "github.com/decred/vspd/client/v4"
 	mondstdaddr "github.com/decred/dcrd/txscript/v4/stdaddr"
 )
@@ -54,7 +55,51 @@ type VSPClient struct {
 	mu   sync.Mutex
 	jobs map[chainhash.Hash]*vspFeePayment
 
+	// lifetime is the context of background fee work. It is
+	// context.Background until SetLifetime replaces it. Guarded by mu, as is
+	// policy.MaxFee.
+	lifetime context.Context
+
 	log slog.Logger
+}
+
+// SetLifetime sets the context that fee jobs started after this call make
+// their VSP requests under, in place of context.Background. Canceling it makes
+// those requests fail; it does not remove the jobs. A request context would
+// fail them too soon. Jobs already started keep their context.
+func (c *VSPClient) SetLifetime(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	c.mu.Lock()
+	c.lifetime = ctx
+	c.mu.Unlock()
+}
+
+// UpdateMaxFee raises the fee cap to fee if fee is higher. The VSP quotes its
+// fee from the current ticket price, so the cap of a long-lived client can fall
+// behind it. A job still running uses the new cap from its next quote; a job
+// that stopped on a fee above the cap does not restart, and its ticket needs a
+// new Process call. The cap is stored in the policy the client was created
+// with.
+func (c *VSPClient) UpdateMaxFee(fee dcrutil.Amount) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fee > c.policy.MaxFee {
+		c.policy.MaxFee = fee
+	}
+}
+
+func (c *VSPClient) maxFee() dcrutil.Amount {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.policy.MaxFee
+}
+
+func (c *VSPClient) lifetimeCtx() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lifetime
 }
 
 type VSPClientConfig struct {
@@ -98,11 +143,12 @@ func (w *Wallet) NewVSPClient(cfg VSPClientConfig, log slog.Logger, dialer DialF
 	}
 
 	v := &VSPClient{
-		wallet: w,
-		policy: cfg.Policy,
-		Client: client,
-		jobs:   make(map[chainhash.Hash]*vspFeePayment),
-		log:    log,
+		wallet:   w,
+		policy:   cfg.Policy,
+		Client:   client,
+		jobs:     make(map[chainhash.Hash]*vspFeePayment),
+		lifetime: context.Background(),
+		log:      log,
 	}
 	return v, nil
 }
@@ -212,10 +258,10 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // feeTx may be nil or may point to an empty transaction. It is modified with
 // the inputs and the fee and change outputs before returning without an error.
 // The fee transaction is also recorded as unpublised in the wallet, and the fee
-// hash is associated with the ticket.  On error the caller should unlock the
-// inputs of feeTx.  The fee payment keeps feeTx only if a scheduled attempt
-// made its own fee tx in it meanwhile, which the wallet records as spending
-// those inputs.
+// hash is associated with the ticket.  If getting the fee address or making the
+// fee tx fails, the caller should unlock the inputs of feeTx, and the fee
+// payment does not keep it.  If only submitting it fails, the wallet keeps the
+// fee tx and the fee payment retries it.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -238,11 +284,17 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 			}
 			return fmt.Errorf("fee payment cannot be processed")
 		}
+		// Read the hash before waiting for a scheduled attempt on this
+		// ticket to finish: a fee tx it makes meanwhile is the attempt's.
+		fp.mu.Lock()
+		startHash := fp.feeHash
+		fp.mu.Unlock()
+		fp.procMu.Lock()
+		defer fp.procMu.Unlock()
 		fp.mu.Lock()
 		if fp.feeTx == nil {
 			fp.feeTx = feeTx
 		}
-		startHash := fp.feeHash
 		fp.mu.Unlock()
 		feeErr := fp.receiveFeeAddress()
 		if feeErr == nil {
@@ -251,13 +303,13 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		if feeErr != nil {
 			// On failure the caller unlocks the inputs of feeTx, and a
 			// later purchase may spend them; after a failed makeFeeTx it
-			// may also have outputs but no signatures.  The scheduled
-			// attempt must not build on it, unless it made its own fee tx
-			// meanwhile (new hash); that attempt also owns the recorded
-			// status, which marking it errored would erase.
+			// may also have outputs but no signatures, so the job must
+			// not keep it.  A scheduled attempt that changed the fee hash
+			// while Process waited owns the recorded status, which
+			// marking it errored would erase.
 			fp.mu.Lock()
 			madeMeanwhile := fp.feeHash != startHash
-			if fp.feeTx == feeTx && !madeMeanwhile {
+			if fp.feeTx == feeTx {
 				fp.feeTx = nil
 			}
 			fp.mu.Unlock()
@@ -272,7 +324,7 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		return fp.submitPayment()
 	case udb.VSPFeeProcessPaid:
 		// If a VSP ticket has been paid, but confirm payment.
-		if len(vspTicket.Host) > 0 && vspTicket.Host != c.Client.URL {
+		if len(vspTicket.Host) > 0 && !SameVSPHost(vspTicket.Host, c.Client.URL) {
 			// Cannot confirm a paid ticket that is already with another VSP.
 			return fmt.Errorf("ticket already paid or confirmed with another vsp")
 		}
@@ -283,6 +335,8 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 			return fmt.Errorf("fee payment cannot be processed")
 		}
 
+		fp.procMu.Lock()
+		defer fp.procMu.Unlock()
 		return fp.confirmPayment()
 	case udb.VSPFeeProcessConfirmed:
 		// VSPTicket has already been confirmed, there is nothing to process.
@@ -301,11 +355,15 @@ func (c *VSPClient) SetVoteChoice(ctx context.Context, ticket *VSPTicket,
 	// Retrieve current voting preferences from VSP.
 	status, err := c.status(ctx, ticket)
 	if err != nil {
-		if errors.Is(err, errors.Locked) {
-			return err
+		// A ticket the VSP does not know has no choices there to update.
+		// Otherwise the VSP keeps the previous choices, so this is not a
+		// success.
+		var apiErr types.ErrorResponse
+		if errors.As(err, &apiErr) && apiErr.Code == types.ErrUnknownTicket {
+			c.log.Warnf("VSP %s does not know ticket %s", c.Client.URL, ticket)
+			return nil
 		}
-		c.log.Errorf("Could not check status of VSP ticket %s: %v", ticket, err)
-		return nil
+		return fmt.Errorf("status of ticket %s at VSP %s: %w", ticket, c.Client.URL, err)
 	}
 
 	// Check for any mismatch between the provided voting preferences and the
@@ -340,7 +398,7 @@ func (c *VSPClient) SetVoteChoice(ctx context.Context, ticket *VSPTicket,
 
 	// Check treasury policies.
 	for newKey, newChoice := range treasuryPolicy {
-		vspChoice, ok := status.TSpendPolicy[newKey]
+		vspChoice, ok := status.TreasuryPolicy[newKey]
 		if !ok {
 			update = true
 			break
