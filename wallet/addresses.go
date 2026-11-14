@@ -460,7 +460,7 @@ type addressBuffer struct {
 	lastWatched uint32
 	// current is the child getaccountaddress returned, kept in memory
 	// only.  It is valid while haveCurrent and unused, and
-	// NewExternalAddress clears it.
+	// NewExternalAddress and a SyncLastReturnedAddress reaching it clear it.
 	current     uint32
 	haveCurrent bool
 }
@@ -857,6 +857,12 @@ func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, c
 		lastUsed   uint32
 	)
 	err := func() error {
+		// getaccountaddress remembers its address only after taking it,
+		// so a sync of its branch between the two would miss it.
+		if branch == udb.ExternalBranch {
+			w.currentAddressMu.Lock()
+			defer w.currentAddressMu.Unlock()
+		}
 		defer w.addressBuffersMu.Unlock()
 		w.addressBuffersMu.Lock()
 
@@ -886,6 +892,11 @@ func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, c
 			if next := child - lastUsed; next > alb.cursor {
 				alb.cursor = next
 			}
+		}
+		// Another wallet on the same seed may have handed out every
+		// child up to child, so getaccountaddress must not return one.
+		if branch == udb.ExternalBranch && alb.haveCurrent && child >= alb.current {
+			alb.haveCurrent = false
 		}
 		return nil
 	}()

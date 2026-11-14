@@ -10,12 +10,14 @@ import (
 	"encoding/hex"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/hdkeychain"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
@@ -714,5 +716,150 @@ func TestCurrentAddressAndPersistVotingAccount(t *testing.T) {
 	_, err = w.CurrentAddressAndPersist(ctx, acct)
 	if !errors.Is(err, errors.Invalid) {
 		t.Fatalf("got error %v, want Invalid", err)
+	}
+}
+
+// childOf returns the BIP0044 child index of a wallet address, looked up
+// in the wallet: getaccountaddress may return a plain address.
+func childOf(t *testing.T, w *Wallet, addr stdaddr.Address) uint32 {
+	t.Helper()
+	ka, err := w.KnownAddress(context.Background(), addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, ok := ka.(BIP0044Address)
+	if !ok {
+		t.Fatalf("%v is not a BIP0044 address", addr)
+	}
+	_, _, child := a.Path()
+	return child
+}
+
+// TestCurrentAddressAndPersistSync checks that accountsyncaddressindex past
+// the address getaccountaddress returns makes it return a new one: another
+// wallet on the same seed may have handed out every child up to the synced
+// one. A sync below it, or of the internal branch, leaves it alone.
+func TestCurrentAddressAndPersistSync(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	current := func(want uint32) {
+		t.Helper()
+		addr, err := w.CurrentAddressAndPersist(ctx, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if child := childOf(t, w, addr); child != want {
+			t.Fatalf("getaccountaddress returned child %d, want %d", child, want)
+		}
+	}
+	syncTo := func(branch, child uint32) {
+		t.Helper()
+		if err := w.SyncLastReturnedAddress(ctx, 0, branch, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	current(0)
+	syncTo(udb.ExternalBranch, 5)
+	current(6)
+	next, err := w.NewExternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child := childOf(t, w, next); child != 7 {
+		t.Fatalf("getnewaddress returned child %d, want 7", child)
+	}
+
+	current(8)
+	syncTo(udb.ExternalBranch, 7)
+	current(8)
+	syncTo(udb.InternalBranch, 20)
+	current(8)
+	syncTo(udb.ExternalBranch, 8)
+	current(9)
+}
+
+// TestCurrentAddressAndPersistConcurrentSync checks that a sync waits for a
+// getaccountaddress in progress: one landing after it took a new address and
+// before it remembers it would leave it returning a child the sync declared
+// handed out.
+func TestCurrentAddressAndPersistConcurrentSync(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	// Stand in for getaccountaddress between taking child 0 and
+	// remembering it: hold its lock, sync, then remember.
+	if _, err := w.NewExternalAddress(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	const synced = 5
+	w.currentAddressMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- w.SyncLastReturnedAddress(ctx, 0, udb.ExternalBranch, synced)
+	}()
+	// Without the lock the sync finishes here, before the address is
+	// remembered; the wait only gives it the time to.
+	select {
+	case err := <-done:
+		done <- err
+	case <-time.After(200 * time.Millisecond):
+	}
+	w.addressBuffersMu.Lock()
+	w.addressBuffers[0].albExternal.current = 0
+	w.addressBuffers[0].albExternal.haveCurrent = true
+	w.addressBuffersMu.Unlock()
+	w.currentAddressMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	addr, err := w.CurrentAddressAndPersist(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child := childOf(t, w, addr); child <= synced {
+		t.Fatalf("getaccountaddress returned child %d after a sync to %d", child, synced)
+	}
+}
+
+// TestCurrentAddressAndPersistSyncAccounts checks that a sync of one
+// account's external branch leaves the address getaccountaddress returns on
+// another account alone.
+func TestCurrentAddressAndPersistSyncAccounts(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	cfg.AccountGapLimit = 2
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+	if err := w.Unlock(ctx, testPrivPass, nil); err != nil {
+		t.Fatal(err)
+	}
+	acct, err := w.NextAccount(ctx, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := w.CurrentAddressAndPersist(ctx, acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.CurrentAddressAndPersist(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.SyncLastReturnedAddress(ctx, 0, udb.ExternalBranch, 5); err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.CurrentAddressAndPersist(ctx, acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("account %d address moved from %v to %v after a sync of account 0", acct, want, got)
 	}
 }

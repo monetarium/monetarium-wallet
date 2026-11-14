@@ -227,7 +227,8 @@ type Wallet struct {
 	addressBuffersMu sync.Mutex
 
 	// currentAddressMu serializes CurrentAddressAndPersist, so concurrent
-	// calls take one new address.  It is taken before addressBuffersMu.
+	// calls take one new address, and orders SyncLastReturnedAddress against
+	// it.  It is taken before addressBuffersMu.
 	currentAddressMu sync.Mutex
 
 	// Passphrase unlock
@@ -2862,12 +2863,16 @@ func (w *Wallet) CurrentAddressAndPersist(ctx context.Context, account uint32) (
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
-	w.addressBuffersMu.Lock()
-	if data, ok := w.addressBuffers[account]; ok {
-		data.albExternal.current = addr.(*xpubAddress).child
-		data.albExternal.haveCurrent = true
+	// An address without a BIP0044 path is returned but not remembered.
+	if a, ok := addr.(BIP0044Address); ok {
+		_, _, child := a.Path()
+		w.addressBuffersMu.Lock()
+		if data, ok := w.addressBuffers[account]; ok {
+			data.albExternal.current = child
+			data.albExternal.haveCurrent = true
+		}
+		w.addressBuffersMu.Unlock()
 	}
-	w.addressBuffersMu.Unlock()
 
 	return addr, nil
 }
