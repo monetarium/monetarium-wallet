@@ -261,7 +261,8 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // hash is associated with the ticket.  If getting the fee address or making the
 // fee tx fails, the caller should unlock the inputs of feeTx, and the fee
 // payment does not keep it.  If only submitting it fails, the wallet keeps the
-// fee tx and the fee payment retries it.
+// fee tx and the fee payment retries it.  If the VSP already holds a fee tx for
+// the ticket, that one is recorded and confirmed, and feeTx is left unused.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -297,6 +298,9 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		}
 		fp.mu.Unlock()
 		feeErr := fp.receiveFeeAddress()
+		if isFeeAlreadyReceived(feeErr) {
+			return fp.recordReceivedFee()
+		}
 		if feeErr == nil {
 			feeErr = fp.makeFeeTx(feeTx)
 		}
