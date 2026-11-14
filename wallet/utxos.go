@@ -135,9 +135,10 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 
 // creditSpendable reports whether a credit may be spent by a regular
 // transaction mined after tipHeight.  The rules are those of
-// MakeInputSourceWithCoinType, plus the node's coinbase maturity for any output
-// of a transaction with an expiry.  stakeGenMatured decides OP_SSGEN credits,
-// whose maturity depends on whether they are vote or SSFee outputs.
+// MakeInputSourceWithCoinType, including the node's coinbase maturity for an
+// output of a transaction with an expiry, which this also applies to ticket
+// change.  stakeGenMatured decides OP_SSGEN credits, whose maturity depends on
+// whether they are vote or SSFee outputs.
 func creditSpendable(params *chaincfg.Params, output *udb.Credit, tipHeight int32,
 	stakeGenMatured func(*udb.Credit) bool) bool {
 	txHeight := output.Height
