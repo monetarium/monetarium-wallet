@@ -2344,7 +2344,9 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 				continue
 			}
 		case stdscript.STPubKeyHashEcdsaSecp256k1:
-			if output.FromCoinBase {
+			// Outputs of a transaction with an expiry are spendable only
+			// after coinbase maturity, like coinbase outputs.
+			if output.FromCoinBase || output.HasExpiry {
 				if !coinbaseMatured(w.chainParams, output.Height, currentHeight) {
 					continue
 				}
@@ -2471,7 +2473,9 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 				return true
 			}
 		case stdscript.STPubKeyHashEcdsaSecp256k1:
-			if output.FromCoinBase {
+			// Outputs of a transaction with an expiry are spendable only
+			// after coinbase maturity, like coinbase outputs.
+			if output.FromCoinBase || output.HasExpiry {
 				if !coinbaseMatured(w.chainParams, output.Height, currentHeight) {
 					return true
 				}
