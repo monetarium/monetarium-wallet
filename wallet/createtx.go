@@ -1901,6 +1901,15 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		}
 		return
 	}
+	// Each ticket's VSPTicket needs its voting key. Fail before the split is
+	// published when the voting account cannot give one up (locked, or
+	// imported from an xpub): a ticket buyer retries every block, and each
+	// split published only to abandon its tickets costs a miner fee.
+	if req.VSPClient != nil && !req.DontSignTx {
+		if _, err := w.AccountXpriv(ctx, req.VotingAccount); err != nil {
+			return nil, errors.E(op, errors.Errorf("voting account %d: %w", req.VotingAccount, err))
+		}
+	}
 	if req.VSPClient != nil {
 		feePrice, err := req.VSPClient.FeePercentage(ctx)
 		if err != nil {
@@ -2193,6 +2202,20 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	// Create each ticket.
 	ticketHashes := make([]*chainhash.Hash, 0, req.Count)
 	tickets := make([]*wire.MsgTx, 0, req.Count)
+	// unpublished drops the tickets from the first not published on,
+	// which a later rebroadcast of unmined txs would otherwise send, and
+	// reports only the published ones.  A ticket the wallet does not hold
+	// (unsigned, or its record failed) needs nothing.
+	unpublished := func(published int) {
+		for _, h := range ticketHashes[published:] {
+			abandonErr := w.AbandonTransaction(ctx, h)
+			if abandonErr != nil && !errors.Is(abandonErr, errors.NotExist) {
+				log.Errorf("Cannot abandon unpublished ticket %v: %v", h, abandonErr)
+			}
+		}
+		purchaseTicketsResponse.Tickets = tickets[:published]
+		purchaseTicketsResponse.TicketHashes = ticketHashes[:published]
+	}
 	splitOutpoint := wire.OutPoint{Hash: splitTx.TxHash()}
 	for _, index := range splitOutputIndexes {
 		// Generate the extended outpoint that we need to use for ticket
@@ -2206,23 +2229,27 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			PrevOut:  *txOut,
 		}
 
-		addrVote, idx, err := stakeAddrFunc(op, req.VotingAccount, 1)
+		addrVote, addrSubsidy, err := func() (vote, subsidy stdaddr.StakeAddress, err error) {
+			vote, idx, err := stakeAddrFunc(op, req.VotingAccount, 1)
+			if err != nil {
+				return nil, nil, err
+			}
+			_, err = w.signingAddressAtIdx(ctx, op, w.persistReturnedChild(ctx, nil),
+				req.VotingAccount, idx)
+			if err != nil {
+				return nil, nil, err
+			}
+			subsidyAccount := req.SourceAccount
+			var branch uint32 = 1
+			if req.Mixing {
+				subsidyAccount = req.MixedAccount
+				branch = req.MixedAccountBranch
+			}
+			subsidy, _, err = stakeAddrFunc(op, subsidyAccount, branch)
+			return vote, subsidy, err
+		}()
 		if err != nil {
-			return nil, err
-		}
-		_, err = w.signingAddressAtIdx(ctx, op, w.persistReturnedChild(ctx, nil),
-			req.VotingAccount, idx)
-		if err != nil {
-			return nil, err
-		}
-		subsidyAccount := req.SourceAccount
-		var branch uint32 = 1
-		if req.Mixing {
-			subsidyAccount = req.MixedAccount
-			branch = req.MixedAccountBranch
-		}
-		addrSubsidy, _, err := stakeAddrFunc(op, subsidyAccount, branch)
-		if err != nil {
+			unpublished(0)
 			return nil, err
 		}
 
@@ -2285,6 +2312,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		})
 		w.lockedOutpointMu.Unlock()
 		if err != nil {
+			unpublished(0)
 			return purchaseTicketsResponse, errors.E(op, err)
 		}
 	}
@@ -2293,10 +2321,28 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		return purchaseTicketsResponse, nil
 	}
 
+	// Build the VSPTicket of every ticket before publishing any.  It needs
+	// the voting key, which a wallet locked meanwhile (say during a mixed
+	// buy's trickle wait) cannot read, and a ticket published without one
+	// gets no fee job, so nothing would pay its fee.
+	var vspTickets []*VSPTicket
+	if req.VSPClient != nil {
+		vspTickets = make([]*VSPTicket, len(ticketHashes))
+		for i, hash := range ticketHashes {
+			vspTickets[i], err = w.NewVSPTicket(ctx, hash)
+			if err != nil {
+				unpublished(0)
+				return nil, errors.E(op, errors.Errorf("VSP ticket record for %v: %w", hash, err))
+			}
+		}
+	}
+
 	var feeErrs []error
 	// stopped returns the error of a purchase that stops before publishing
-	// every ticket, keeping the fee errors of the tickets it published.
-	stopped := func(err error) (*PurchaseTicketsResponse, error) {
+	// ticket i, keeping the fee errors of the tickets it published, and
+	// drops ticket i and every later one.
+	stopped := func(i int, err error) (*PurchaseTicketsResponse, error) {
+		unpublished(i)
 		if len(feeErrs) != 0 {
 			// The fee errors as text only: their kinds must not stand for
 			// the stop's, which sets the RPC error code.
@@ -2317,25 +2363,18 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				if !timer.Stop() {
 					<-timer.C
 				}
-				return stopped(ctx.Err())
+				return stopped(i, ctx.Err())
 			case <-timer.C:
 			}
 		} else if err := ctx.Err(); err != nil {
-			return stopped(err)
+			return stopped(i, err)
 		}
 
 		// Publish transaction
 		err = n.PublishTransactions(ctx, ticket)
 		if err != nil {
-			// The ticket was already recorded locally before publish;
-			// abandon it so wallet state stays consistent with the
-			// network. Mirrors publishAndWatch.
-			hash := ticket.TxHash()
-			log.Errorf("Abandoning ticket %v which failed to publish", &hash)
-			if abandonErr := w.AbandonTransaction(ctx, &hash); abandonErr != nil {
-				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
-			}
-			return stopped(err)
+			log.Errorf("Ticket %v failed to publish: %v", ticket.TxHash(), err)
+			return stopped(i, err)
 		}
 		log.Infof("Published ticket purchase %v", ticket.TxHash())
 
@@ -2357,23 +2396,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		}
 		ticketHash := purchaseTicketsResponse.TicketHashes[i]
 
-		// Unlock outpoints in case of error.
-		unlock := func() {
-			for _, outpoint := range reserved {
-				w.UnlockOutpoint(&outpoint.OutPoint.Hash,
-					outpoint.OutPoint.Index)
-			}
-		}
-
-		ticket, err := w.NewVSPTicket(ctx, ticketHash)
-		if err != nil {
-			unlock()
-			log.Errorf("VSP ticket record for published %v failed: %v", ticketHash, err)
-			feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
-			continue
-		}
-
-		err = w.payPurchaseFee(ctx, req.VSPClient, ticket, feeTx, reserved)
+		err = w.payPurchaseFee(ctx, req.VSPClient, vspTickets[i], feeTx, reserved)
 		if err != nil {
 			// The ticket is already published. Keep publishing the
 			// rest; the wallet may retry the fee itself, or it can be
